@@ -4,7 +4,14 @@
   "description": "API REST de SIGECOM",
   "main": "src/server.js",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test tests/health.test.js tests/database/*.test.js",
+    "test:integration": "node --env-file=.env --test tests/integration/*.test.js",
+    "db:provision": "node --env-file=.env scripts/provision-databases.js",
+    "db:migrate:test": "node --env-file=.env scripts/migrate.js test",
+    "db:migrate:dev": "node --env-file=.env scripts/migrate.js development",
+    "db:grant:test": "node --env-file=.env scripts/grant-application.js test",
+    "db:grant:dev": "node --env-file=.env scripts/grant-application.js development",
+    "db:admin:create": "node --env-file=.env scripts/create-initial-admin.js",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "lint": "eslint .",
@@ -18,15 +25,14 @@
   "type": "module",
   "private": true,
   "dependencies": {
-    "express": "^5.3.0"
+    "bcrypt": "^6.0.0",
+    "express": "^5.3.0",
+    "mysql2": "^3.24.6"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "eslint": "^10.13.0",
     "globals": "^17.13.0",
     "prettier": "^3.9.10"
-  },
-  "engines": {
-    "node": ">=24"
   }
 }
