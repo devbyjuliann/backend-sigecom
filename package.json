@@ -12,8 +12,8 @@
     "db:grant:test": "node --env-file=.env scripts/grant-application.js test",
     "db:grant:dev": "node --env-file=.env scripts/grant-application.js development",
     "db:admin:create": "node --env-file=.env scripts/create-initial-admin.js",
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "dev": "node --watch --env-file=.env src/server.js",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
@@ -26,13 +26,20 @@
   "private": true,
   "dependencies": {
     "bcrypt": "^6.0.0",
+    "cors": "^2.8.6",
     "express": "^5.3.0",
-    "mysql2": "^3.24.6"
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.24.6",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "eslint": "^10.13.0",
     "globals": "^17.13.0",
-    "prettier": "^3.9.10"
+    "prettier": "^3.9.10",
+    "supertest": "^7.3.1"
   }
 }
