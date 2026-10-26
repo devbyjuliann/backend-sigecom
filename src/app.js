@@ -5,6 +5,7 @@ import helmet from "helmet";
 import { createAuthRouter } from "./modules/auth/auth-routes.js";
 import { createProfileRouter } from "./modules/profile/profile-routes.js";
 import { createCategoryRouter } from "./modules/categories/category-routes.js";
+import { createWarehouseRouter } from "./modules/warehouses/warehouse-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -56,6 +57,7 @@ export function createApp({
     apiRouter.use("/auth", createAuthRouter({ dbPool, authConfig }));
     apiRouter.use("/profile", createProfileRouter({ dbPool, authConfig }));
     apiRouter.use("/categories", createCategoryRouter({ dbPool, authConfig }));
+    apiRouter.use("/warehouses", createWarehouseRouter({ dbPool, authConfig }));
     app.use("/api/v1", apiRouter);
   }
 

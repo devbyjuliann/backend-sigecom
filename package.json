@@ -11,6 +11,8 @@
     "db:migrate:dev": "node --env-file=.env scripts/migrate.js development",
     "db:grant:test": "node --env-file=.env scripts/grant-application.js test",
     "db:grant:dev": "node --env-file=.env scripts/grant-application.js development",
+    "db:grant:migrator:test": "node --env-file=.env scripts/grant-migrator.js test",
+    "db:grant:migrator:dev": "node --env-file=.env scripts/grant-migrator.js development",
     "db:admin:create": "node --env-file=.env scripts/create-initial-admin.js",
     "start": "node --env-file=.env src/server.js",
     "dev": "node --watch --env-file=.env src/server.js",

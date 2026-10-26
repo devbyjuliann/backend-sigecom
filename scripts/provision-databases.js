@@ -143,6 +143,9 @@ try {
       await connection.query(
         `GRANT SELECT, INSERT, UPDATE, CREATE, ALTER, INDEX, REFERENCES ON ${quoteIdentifier(database)}.* TO '${user}'@'127.0.0.1'`,
       );
+      await connection.query(
+        `GRANT DELETE ON ${quoteIdentifier(database)}.role_permissions TO '${user}'@'127.0.0.1'`,
+      );
     }
   }
 
