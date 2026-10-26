@@ -42,6 +42,7 @@ try {
     "user_sessions",
     "warehouses",
     "user_warehouses",
+    "categories",
   ];
 
   for (const table of applicationTables) {

@@ -4,6 +4,7 @@ import express from "express";
 import helmet from "helmet";
 import { createAuthRouter } from "./modules/auth/auth-routes.js";
 import { createProfileRouter } from "./modules/profile/profile-routes.js";
+import { createCategoryRouter } from "./modules/categories/category-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -32,7 +33,7 @@ export function createApp({
       cors({
         origin: authConfig.allowedOrigins,
         credentials: true,
-        methods: ["GET", "HEAD", "POST", "OPTIONS"],
+        methods: ["GET", "HEAD", "POST", "PATCH", "OPTIONS"],
         allowedHeaders: ["Content-Type", "X-CSRF-Token"],
         maxAge: 600,
       }),
@@ -54,6 +55,7 @@ export function createApp({
     const apiRouter = express.Router();
     apiRouter.use("/auth", createAuthRouter({ dbPool, authConfig }));
     apiRouter.use("/profile", createProfileRouter({ dbPool, authConfig }));
+    apiRouter.use("/categories", createCategoryRouter({ dbPool, authConfig }));
     app.use("/api/v1", apiRouter);
   }
 
