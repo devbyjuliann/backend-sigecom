@@ -2,7 +2,11 @@ import { readCookie } from "./csrf.js";
 import { createAuthService } from "./auth-service.js";
 import { HttpError } from "../../shared/http-error.js";
 
-export function authenticate({ dbPool, authConfig }) {
+export function authenticate({
+  dbPool,
+  authConfig,
+  allowPasswordChangePending = false,
+}) {
   const service = createAuthService({ dbPool, config: authConfig });
 
   return async (request, _response, next) => {
@@ -19,6 +23,16 @@ export function authenticate({ dbPool, authConfig }) {
 
     try {
       request.auth = await service.authenticateToken(token);
+      if (
+        request.auth.user.passwordChangeRequired &&
+        !allowPasswordChangePending
+      ) {
+        throw new HttpError(
+          403,
+          "PASSWORD_CHANGE_REQUIRED",
+          "Debes cambiar tu contraseña antes de continuar.",
+        );
+      }
       return next();
     } catch (error) {
       return next(error);
@@ -34,6 +48,15 @@ export function requirePermission(permission) {
           401,
           "AUTHENTICATION_REQUIRED",
           "Inicia sesión para continuar.",
+        ),
+      );
+    }
+    if (request.auth.user.passwordChangeRequired) {
+      return next(
+        new HttpError(
+          403,
+          "PASSWORD_CHANGE_REQUIRED",
+          "Debes cambiar tu contraseña antes de continuar.",
         ),
       );
     }
@@ -58,6 +81,15 @@ export function requireWarehouseAccess({ param = "warehouseId" } = {}) {
           401,
           "AUTHENTICATION_REQUIRED",
           "Inicia sesión para continuar.",
+        ),
+      );
+    }
+    if (request.auth.user.passwordChangeRequired) {
+      return next(
+        new HttpError(
+          403,
+          "PASSWORD_CHANGE_REQUIRED",
+          "Debes cambiar tu contraseña antes de continuar.",
         ),
       );
     }

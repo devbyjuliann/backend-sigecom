@@ -3,6 +3,7 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 import { createAuthRouter } from "./modules/auth/auth-routes.js";
+import { createProfileRouter } from "./modules/profile/profile-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -52,6 +53,7 @@ export function createApp({
   if (dbPool && authConfig) {
     const apiRouter = express.Router();
     apiRouter.use("/auth", createAuthRouter({ dbPool, authConfig }));
+    apiRouter.use("/profile", createProfileRouter({ dbPool, authConfig }));
     app.use("/api/v1", apiRouter);
   }
 
