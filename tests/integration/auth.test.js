@@ -64,8 +64,11 @@ function submitLogin(
     .send({ email, password });
 }
 
-function makeApp(logger = createLogger({ level: "silent" })) {
-  return createApp({ dbPool: pool, authConfig, logger });
+function makeApp(
+  logger = createLogger({ level: "silent" }),
+  config = authConfig,
+) {
+  return createApp({ dbPool: pool, authConfig: config, logger });
 }
 
 function makeAuthorizationProbe(permission) {
@@ -495,6 +498,22 @@ test("login rate limiting returns 429 after the configured failed attempts", asy
     ...Array(authConfig.loginAttemptLimit).fill(401),
     429,
   ]);
+});
+
+test("successful logins do not consume the failed-attempt rate-limit budget", async () => {
+  const limitedConfig = getAuthConfig({
+    JWT_SECRET: randomBytes(48).toString("base64url"),
+    FRONTEND_ORIGIN: origin,
+    AUTH_RATE_LIMIT_MAX: "2",
+  });
+  const limitedApp = makeApp(createLogger({ level: "silent" }), limitedConfig);
+  const csrf = await obtainCsrf(limitedApp);
+
+  await submitLogin(limitedApp, csrf).expect(200);
+  await submitLogin(limitedApp, csrf, "incorrecta-primera").expect(401);
+  await submitLogin(limitedApp, csrf).expect(200);
+  await submitLogin(limitedApp, csrf, "incorrecta-segunda").expect(401);
+  await submitLogin(limitedApp, csrf, "incorrecta-tercera").expect(429);
 });
 
 test("request logs never contain login passwords, JWTs, or cookies", async () => {

@@ -7,6 +7,8 @@ import { createProfileRouter } from "./modules/profile/profile-routes.js";
 import { createCategoryRouter } from "./modules/categories/category-routes.js";
 import { createWarehouseRouter } from "./modules/warehouses/warehouse-routes.js";
 import { createProductRouter } from "./modules/products/product-routes.js";
+import { createCustomerRouter } from "./modules/customers/customer-routes.js";
+import { createSupplierRouter } from "./modules/suppliers/supplier-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -60,6 +62,8 @@ export function createApp({
     apiRouter.use("/categories", createCategoryRouter({ dbPool, authConfig }));
     apiRouter.use("/warehouses", createWarehouseRouter({ dbPool, authConfig }));
     apiRouter.use("/products", createProductRouter({ dbPool, authConfig }));
+    apiRouter.use("/customers", createCustomerRouter({ dbPool, authConfig }));
+    apiRouter.use("/suppliers", createSupplierRouter({ dbPool, authConfig }));
     app.use("/api/v1", apiRouter);
   }
 

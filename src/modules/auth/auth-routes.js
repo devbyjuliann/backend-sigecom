@@ -62,6 +62,7 @@ export function createAuthRouter({ dbPool, authConfig }) {
   const loginLimiter = rateLimit({
     windowMs: authConfig.loginWindowMs,
     limit: authConfig.loginAttemptLimit,
+    skipSuccessfulRequests: true,
     standardHeaders: true,
     legacyHeaders: false,
     handler: (_request, response) => {

@@ -8,12 +8,14 @@ import { applyMigrations } from "../../src/db/migrations.js";
 const expectedTables = [
   "audit_events",
   "categories",
+  "customers",
   "inventory_balances",
   "permissions",
   "products",
   "roles",
   "role_permissions",
   "schema_migrations",
+  "suppliers",
   "users",
   "user_sessions",
   "user_warehouses",
@@ -60,7 +62,7 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   assert.equal(Number(roles.count), 4);
   assert.ok(Number(permissions.count) >= 35);
   assert.ok(Number(rolePermissions.count) >= Number(permissions.count));
-  assert.equal(Number(versions.count), 5);
+  assert.equal(Number(versions.count), 6);
 
   const [categoryAssignments] = await pool.execute(
     `SELECT r.code AS role_code, p.code AS permission_code
@@ -101,6 +103,30 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
       "auditor:warehouses.read",
       "seller:warehouses.read",
       "warehouse:warehouses.read",
+    ],
+  );
+
+  const [partnerPermissions] = await pool.execute(
+    `SELECT r.code AS role_code, p.code AS permission_code
+     FROM role_permissions rp
+     JOIN roles r ON r.id = rp.role_id
+     JOIN permissions p ON p.id = rp.permission_id
+     WHERE p.module IN ('customers', 'suppliers')
+     ORDER BY p.module, r.code, p.code`,
+  );
+  assert.deepEqual(
+    partnerPermissions.map(
+      ({ role_code, permission_code }) => `${role_code}:${permission_code}`,
+    ),
+    [
+      "administrator:customers.manage",
+      "administrator:customers.read",
+      "auditor:customers.read",
+      "seller:customers.manage",
+      "seller:customers.read",
+      "administrator:suppliers.manage",
+      "administrator:suppliers.read",
+      "auditor:suppliers.read",
     ],
   );
 });
@@ -262,6 +288,39 @@ test("products and balances use fixed precision and grant no balance writes to t
   );
 });
 
+test("customer and supplier identity keys are normalized, unique and optional contacts stay nullable", async () => {
+  for (const table of ["customers", "suppliers"]) {
+    const [columns] = await migratorPool.execute(
+      `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, EXTRA
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = 'sigecom_test' AND TABLE_NAME = ?`,
+      [table],
+    );
+    const byName = new Map(
+      columns.map((column) => [column.COLUMN_NAME, column]),
+    );
+    assert.equal(byName.get("identification_number").IS_NULLABLE, "NO");
+    assert.match(byName.get("identification_key").EXTRA, /STORED GENERATED/i);
+    assert.equal(byName.get("phone").IS_NULLABLE, "YES");
+    assert.equal(byName.get("email").IS_NULLABLE, "YES");
+    assert.equal(byName.get("address").IS_NULLABLE, "YES");
+    const [[uniqueKey]] = await migratorPool.execute(
+      `SELECT COUNT(*) AS count FROM information_schema.STATISTICS
+       WHERE TABLE_SCHEMA = 'sigecom_test' AND TABLE_NAME = ?
+         AND INDEX_NAME = ? AND NON_UNIQUE = 0`,
+      [table, `uq_${table}_identification_key`],
+    );
+    assert.equal(Number(uniqueKey.count), 1);
+    const [[engine]] = await migratorPool.execute(
+      `SELECT ENGINE, TABLE_COLLATION FROM information_schema.TABLES
+       WHERE TABLE_SCHEMA = 'sigecom_test' AND TABLE_NAME = ?`,
+      [table],
+    );
+    assert.equal(engine.ENGINE, "InnoDB");
+    assert.match(engine.TABLE_COLLATION, /^utf8mb4_/);
+  }
+});
+
 test("migration account can read schema but cannot drop existing tables", async () => {
   const migrator = await createConnection(
     getDatabaseConfig("test", process.env, "MIGRATOR"),
@@ -271,7 +330,7 @@ test("migration account can read schema but cannot drop existing tables", async 
     const [[row]] = await migrator.query(
       "SELECT COUNT(*) AS count FROM schema_migrations",
     );
-    assert.equal(Number(row.count), 5);
+    assert.equal(Number(row.count), 6);
     await assert.rejects(
       migrator.query("DROP TABLE sigecom_test.schema_migrations"),
       (error) =>

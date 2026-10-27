@@ -44,6 +44,8 @@ try {
     "user_warehouses",
     "categories",
     "products",
+    "customers",
+    "suppliers",
   ];
 
   for (const table of applicationTables) {
