@@ -322,11 +322,13 @@ test("dashboard metrics are independently unavailable without their module permi
   const response = await getDashboard(sessions.limited).expect(200);
   assert.deepEqual(response.body.indicators.activeProducts, {
     available: true,
-    value: (
-      await pool.execute(
-        "SELECT COUNT(*) AS total FROM products WHERE is_active = 1",
-      )
-    )[0][0].total,
+    value: Number(
+      (
+        await pool.execute(
+          "SELECT COUNT(*) AS total FROM products WHERE is_active = 1",
+        )
+      )[0][0].total,
+    ),
   });
   assert.deepEqual(response.body.indicators.customers, {
     available: false,

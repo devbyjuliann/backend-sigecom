@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
-import { createConnection } from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
@@ -310,32 +309,46 @@ test("product readers cannot mutate and inventory queries are warehouse-scoped",
   assert.ok(item);
   assert.equal(item.hasBalance, false);
   assert.equal(item.quantity, null);
-  const privileged = await createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: process.env.XAMPP_ADMIN_USER || "root",
-    password: process.env.XAMPP_ADMIN_PASSWORD || "",
-    database: "sigecom_test",
-  });
-  try {
-    await privileged.execute(
-      `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)
-       VALUES (?, ?, 0)`,
-      [product.body.id, warehouseId],
-    );
-    const registeredZero = await get(
-      `/api/v1/products/${product.body.id}/balances?warehouseId=${warehouseId}`,
-      sellerSession,
-    ).expect(200);
-    assert.equal(registeredZero.body.items[0].hasBalance, true);
-    assert.equal(registeredZero.body.items[0].quantity, 0);
-    await privileged.execute(
-      "DELETE FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
-      [product.body.id, warehouseId],
-    );
-  } finally {
-    await privileged.end();
-  }
+  const scopedBalances = await get(
+    `/api/v1/inventory/balances?warehouseId=${warehouseId}&q=${encodeURIComponent(`BAL-${suffix}`)}`,
+    sellerSession,
+  ).expect(200);
+  assert.ok(
+    scopedBalances.body.items.some(
+      ({ productId }) => productId === product.body.id,
+    ),
+  );
+  await get("/api/v1/inventory/movements", sellerSession).expect(403);
+  await get(
+    `/api/v1/inventory/movements?warehouseId=${warehouseId}`,
+    adminSession,
+  ).expect(200);
+  await get("/api/v1/inventory/operations", adminSession).expect(200);
+  await get("/api/v1/inventory/balances?unexpected=true", adminSession).expect(
+    400,
+  );
+  await mutate(
+    "post",
+    "/api/v1/inventory/initialize",
+    {
+      productId: product.body.id,
+      warehouseId,
+      quantity: 1,
+      reason: "No debe publicarse",
+    },
+    adminSession,
+  ).expect(404);
+  await pool.execute(
+    `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)
+     VALUES (?, ?, 0)`,
+    [product.body.id, warehouseId],
+  );
+  const registeredZero = await get(
+    `/api/v1/products/${product.body.id}/balances?warehouseId=${warehouseId}`,
+    sellerSession,
+  ).expect(200);
+  assert.equal(registeredZero.body.items[0].hasBalance, true);
+  assert.equal(registeredZero.body.items[0].quantity, 0);
   await get(
     `/api/v1/products/${product.body.id}/balances?warehouseId=${warehouseId}`,
     unassignedSession,
@@ -347,14 +360,6 @@ test("product readers cannot mutate and inventory queries are warehouse-scoped",
   await get(`/api/v1/products/${product.body.id}/balances`, {
     cookie: "",
   }).expect(401);
-
-  await assert.rejects(
-    pool.execute(
-      "INSERT INTO inventory_balances (product_id, warehouse_id, quantity) VALUES (?, ?, 0)",
-      [product.body.id, warehouseId],
-    ),
-    (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
-  );
 });
 
 test("categories with active products cannot be deactivated", async () => {

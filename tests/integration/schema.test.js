@@ -10,6 +10,8 @@ const expectedTables = [
   "categories",
   "customers",
   "inventory_balances",
+  "inventory_movements",
+  "inventory_operations",
   "permissions",
   "products",
   "roles",
@@ -62,7 +64,7 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   assert.equal(Number(roles.count), 4);
   assert.ok(Number(permissions.count) >= 35);
   assert.ok(Number(rolePermissions.count) >= Number(permissions.count));
-  assert.equal(Number(versions.count), 6);
+  assert.equal(Number(versions.count), 9);
 
   const [categoryAssignments] = await pool.execute(
     `SELECT r.code AS role_code, p.code AS permission_code
@@ -106,6 +108,26 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
     ],
   );
 
+  const [inventoryPermissions] = await pool.execute(
+    `SELECT r.code AS role_code, p.code AS permission_code
+     FROM role_permissions rp
+     JOIN roles r ON r.id = rp.role_id
+     JOIN permissions p ON p.id = rp.permission_id
+     WHERE p.code IN ('inventory.movements.read', 'inventory.initialize')
+     ORDER BY p.code, r.code`,
+  );
+  assert.deepEqual(
+    inventoryPermissions.map(
+      ({ role_code, permission_code }) => `${role_code}:${permission_code}`,
+    ),
+    [
+      "administrator:inventory.initialize",
+      "administrator:inventory.movements.read",
+      "auditor:inventory.movements.read",
+      "warehouse:inventory.movements.read",
+    ],
+  );
+
   const [partnerPermissions] = await pool.execute(
     `SELECT r.code AS role_code, p.code AS permission_code
      FROM role_permissions rp
@@ -143,7 +165,7 @@ test("all phase 1 tables use InnoDB and declared foreign keys", async () => {
     `SELECT COUNT(*) AS count FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = 'sigecom_test' AND REFERENCED_TABLE_NAME IS NOT NULL`,
   );
-  assert.equal(Number(constraints.count), 13);
+  assert.equal(Number(constraints.count), 21);
 });
 
 test("database connections use UTC sessions without changing MariaDB global settings", async () => {
@@ -153,9 +175,11 @@ test("database connections use UTC sessions without changing MariaDB global sett
   const [[server]] = await pool.query(
     "SELECT @@global.time_zone AS global_time_zone",
   );
+  const [[sqlMode]] = await pool.query("SELECT @@session.sql_mode AS mode");
 
   assert.equal(session.session_time_zone, "+00:00");
   assert.equal(server.global_time_zone, "SYSTEM");
+  assert.match(sqlMode.mode, /STRICT_TRANS_TABLES/);
 });
 
 test("unique and foreign-key constraints reject invalid users without persisting probes", async () => {
@@ -233,7 +257,7 @@ test("audit details reject invalid JSON", async () => {
   );
 });
 
-test("products and balances use fixed precision and grant no balance writes to the app account", async () => {
+test("products and ledger balances use integer precision and restricted history grants", async () => {
   const [productColumns] = await migratorPool.execute(
     `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE
      FROM information_schema.COLUMNS
@@ -265,6 +289,7 @@ test("products and balances use fixed precision and grant no balance writes to t
     balanceColumns.map((column) => [column.COLUMN_NAME, column.COLUMN_TYPE]),
   );
   assert.equal(balanceColumnMap.get("quantity"), "int(10) unsigned");
+  assert.equal(balanceColumnMap.get("version"), "bigint(20) unsigned");
 
   const [[uniqueBalancePair]] = await migratorPool.execute(
     `SELECT COUNT(*) AS count FROM information_schema.STATISTICS
@@ -276,16 +301,27 @@ test("products and balances use fixed precision and grant no balance writes to t
   await pool.execute(
     "SELECT product_id, warehouse_id, quantity FROM inventory_balances LIMIT 0",
   );
-  await assert.rejects(
-    pool.execute(
-      "INSERT INTO inventory_balances (product_id, warehouse_id, quantity) VALUES (0, 0, 1)",
-    ),
-    (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
+  await pool.execute(
+    "UPDATE inventory_balances SET quantity = quantity WHERE 1 = 0",
+  );
+  await pool.execute(
+    "INSERT INTO inventory_balances (product_id, warehouse_id, quantity) SELECT 0, 0, 0 WHERE 1 = 0",
   );
   await assert.rejects(
-    pool.execute("UPDATE inventory_balances SET quantity = 0 WHERE 1 = 0"),
+    pool.execute("DELETE FROM inventory_balances WHERE 1 = 0"),
     (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
   );
+  for (const table of ["inventory_operations", "inventory_movements"]) {
+    await pool.execute(`SELECT id FROM ${table} LIMIT 0`);
+    await assert.rejects(
+      pool.execute(`UPDATE ${table} SET id = id WHERE 1 = 0`),
+      (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
+    );
+    await assert.rejects(
+      pool.execute(`DELETE FROM ${table} WHERE 1 = 0`),
+      (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
+    );
+  }
 });
 
 test("customer and supplier identity keys are normalized, unique and optional contacts stay nullable", async () => {
@@ -330,7 +366,7 @@ test("migration account can read schema but cannot drop existing tables", async 
     const [[row]] = await migrator.query(
       "SELECT COUNT(*) AS count FROM schema_migrations",
     );
-    assert.equal(Number(row.count), 6);
+    assert.equal(Number(row.count), 9);
     await assert.rejects(
       migrator.query("DROP TABLE sigecom_test.schema_migrations"),
       (error) =>

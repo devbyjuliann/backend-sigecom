@@ -55,8 +55,14 @@ try {
   }
 
   await connection.query(
-    `GRANT SELECT ON \`${target.database}\`.\`inventory_balances\` TO '${appUser}'@'127.0.0.1'`,
+    `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`inventory_balances\` TO '${appUser}'@'127.0.0.1'`,
   );
+
+  for (const table of ["inventory_operations", "inventory_movements"]) {
+    await connection.query(
+      `GRANT SELECT, INSERT ON \`${target.database}\`.\`${table}\` TO '${appUser}'@'127.0.0.1'`,
+    );
+  }
 
   await connection.query(
     `GRANT SELECT, INSERT ON \`${target.database}\`.\`audit_events\` TO '${appUser}'@'127.0.0.1'`,

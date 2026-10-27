@@ -6,6 +6,7 @@ import { createConnection } from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
+import { getDatabaseConfig } from "../../src/db/config.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 
@@ -399,15 +400,15 @@ test("only administrators may create, edit, or change warehouse status", async (
   await get("/api/v1/warehouses", { cookie: "" }).expect(401);
 });
 
-test("warehouse API gains only the balances table in this delivery", async () => {
+test("warehouse API gains inventory ledger tables without operational write endpoints", async () => {
   const [tables] = await pool.execute(
     `SELECT TABLE_NAME FROM information_schema.TABLES
      WHERE TABLE_SCHEMA = 'sigecom_test'
-       AND TABLE_NAME IN ('inventory_balances', 'inventory_movements', 'purchase_orders', 'sales')`,
+       AND TABLE_NAME IN ('inventory_balances', 'inventory_movements', 'inventory_operations', 'purchase_orders', 'sales')`,
   );
   assert.deepEqual(
     tables.map(({ TABLE_NAME }) => TABLE_NAME),
-    ["inventory_balances"],
+    ["inventory_balances", "inventory_movements", "inventory_operations"],
   );
 });
 
@@ -424,13 +425,9 @@ test("warehouse with positive stock cannot be deactivated", async () => {
     [`STK-${suffix}`, `Producto saldo ${suffix}`],
   );
   const productId = String(product[0].insertId);
-  const privileged = await createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: process.env.XAMPP_ADMIN_USER || "root",
-    password: process.env.XAMPP_ADMIN_PASSWORD || "",
-    database: "sigecom_test",
-  });
+  const privileged = await createConnection(
+    getDatabaseConfig("test", process.env, "MIGRATOR"),
+  );
   try {
     await privileged.execute(
       `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)

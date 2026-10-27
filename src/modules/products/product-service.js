@@ -234,6 +234,27 @@ export function createProductService({ dbPool }) {
           "No se encontró el producto.",
         );
       }
+      if (current.unit !== input.unit) {
+        const [[inventory]] = await connection.execute(
+          `SELECT (
+             EXISTS (
+               SELECT 1 FROM inventory_balances
+               WHERE product_id = ? AND quantity > 0
+             )
+             OR EXISTS (
+               SELECT 1 FROM inventory_movements WHERE product_id = ?
+             )
+           ) AS has_inventory_history`,
+          [id, id],
+        );
+        if (inventory.has_inventory_history) {
+          throw new HttpError(
+            409,
+            "PRODUCT_UNIT_HAS_INVENTORY_HISTORY",
+            "No puedes cambiar la unidad comercial cuando el producto tiene existencias o movimientos registrados.",
+          );
+        }
+      }
       await ensureCategory(connection, input.categoryId, input.isActive);
       const changedFields = [
         ...(current.sku !== input.sku ? ["sku"] : []),
