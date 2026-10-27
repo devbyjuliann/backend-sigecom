@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
+import { createConnection } from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
@@ -398,11 +399,63 @@ test("only administrators may create, edit, or change warehouse status", async (
   await get("/api/v1/warehouses", { cookie: "" }).expect(401);
 });
 
-test("warehouse API exposes no inventory balances or pending-document checks yet", async () => {
+test("warehouse API gains only the balances table in this delivery", async () => {
   const [tables] = await pool.execute(
     `SELECT TABLE_NAME FROM information_schema.TABLES
      WHERE TABLE_SCHEMA = 'sigecom_test'
        AND TABLE_NAME IN ('inventory_balances', 'inventory_movements', 'purchase_orders', 'sales')`,
   );
-  assert.deepEqual(tables, []);
+  assert.deepEqual(
+    tables.map(({ TABLE_NAME }) => TABLE_NAME),
+    ["inventory_balances"],
+  );
+});
+
+test("warehouse with positive stock cannot be deactivated", async () => {
+  const created = await createWarehouse({
+    code: `STK-${suffix}`,
+    name: `Bodega con saldo ${suffix}`,
+  }).expect(201);
+  const product = await pool.execute(
+    `INSERT INTO products
+       (sku, name, category_id, unit, purchase_price, sale_price)
+     SELECT ?, ?, id, 'unidad', 1.00, 2.00
+     FROM categories WHERE is_active = 1 ORDER BY id LIMIT 1`,
+    [`STK-${suffix}`, `Producto saldo ${suffix}`],
+  );
+  const productId = String(product[0].insertId);
+  const privileged = await createConnection({
+    host: "127.0.0.1",
+    port: 3306,
+    user: process.env.XAMPP_ADMIN_USER || "root",
+    password: process.env.XAMPP_ADMIN_PASSWORD || "",
+    database: "sigecom_test",
+  });
+  try {
+    await privileged.execute(
+      `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)
+       VALUES (?, ?, 7)`,
+      [productId, created.body.id],
+    );
+    const blocked = await mutate(
+      "patch",
+      `/api/v1/warehouses/${created.body.id}/status`,
+      { isActive: false },
+    ).expect(409);
+    assert.equal(blocked.body.error.code, "WAREHOUSE_HAS_STOCK");
+
+    await privileged.execute(
+      `UPDATE inventory_balances SET quantity = 0
+       WHERE product_id = ? AND warehouse_id = ?`,
+      [productId, created.body.id],
+    );
+    const zeroStock = await mutate(
+      "patch",
+      `/api/v1/warehouses/${created.body.id}/status`,
+      { isActive: false },
+    ).expect(200);
+    assert.equal(zeroStock.body.isActive, false);
+  } finally {
+    await privileged.end();
+  }
 });

@@ -8,7 +8,9 @@ import { applyMigrations } from "../../src/db/migrations.js";
 const expectedTables = [
   "audit_events",
   "categories",
+  "inventory_balances",
   "permissions",
+  "products",
   "roles",
   "role_permissions",
   "schema_migrations",
@@ -58,7 +60,7 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   assert.equal(Number(roles.count), 4);
   assert.ok(Number(permissions.count) >= 35);
   assert.ok(Number(rolePermissions.count) >= Number(permissions.count));
-  assert.equal(Number(versions.count), 4);
+  assert.equal(Number(versions.count), 5);
 
   const [categoryAssignments] = await pool.execute(
     `SELECT r.code AS role_code, p.code AS permission_code
@@ -115,7 +117,7 @@ test("all phase 1 tables use InnoDB and declared foreign keys", async () => {
     `SELECT COUNT(*) AS count FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = 'sigecom_test' AND REFERENCED_TABLE_NAME IS NOT NULL`,
   );
-  assert.equal(Number(constraints.count), 10);
+  assert.equal(Number(constraints.count), 13);
 });
 
 test("database connections use UTC sessions without changing MariaDB global settings", async () => {
@@ -205,6 +207,61 @@ test("audit details reject invalid JSON", async () => {
   );
 });
 
+test("products and balances use fixed precision and grant no balance writes to the app account", async () => {
+  const [productColumns] = await migratorPool.execute(
+    `SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = 'sigecom_test' AND TABLE_NAME = 'products'`,
+  );
+  const productColumnMap = new Map(
+    productColumns.map((column) => [column.COLUMN_NAME, column]),
+  );
+  assert.equal(
+    productColumnMap.get("purchase_price").COLUMN_TYPE,
+    "decimal(15,2)",
+  );
+  assert.equal(productColumnMap.get("sale_price").COLUMN_TYPE, "decimal(15,2)");
+  assert.equal(
+    productColumnMap.get("minimum_stock").COLUMN_TYPE,
+    "int(10) unsigned",
+  );
+  assert.equal(
+    productColumnMap.get("minimum_sale_quantity").COLUMN_TYPE,
+    "int(10) unsigned",
+  );
+
+  const [balanceColumns] = await migratorPool.execute(
+    `SELECT COLUMN_NAME, COLUMN_TYPE
+     FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = 'sigecom_test' AND TABLE_NAME = 'inventory_balances'`,
+  );
+  const balanceColumnMap = new Map(
+    balanceColumns.map((column) => [column.COLUMN_NAME, column.COLUMN_TYPE]),
+  );
+  assert.equal(balanceColumnMap.get("quantity"), "int(10) unsigned");
+
+  const [[uniqueBalancePair]] = await migratorPool.execute(
+    `SELECT COUNT(*) AS count FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = 'sigecom_test' AND TABLE_NAME = 'inventory_balances'
+       AND INDEX_NAME = 'uq_inventory_balances_product_warehouse' AND NON_UNIQUE = 0`,
+  );
+  assert.equal(Number(uniqueBalancePair.count), 2);
+
+  await pool.execute(
+    "SELECT product_id, warehouse_id, quantity FROM inventory_balances LIMIT 0",
+  );
+  await assert.rejects(
+    pool.execute(
+      "INSERT INTO inventory_balances (product_id, warehouse_id, quantity) VALUES (0, 0, 1)",
+    ),
+    (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
+  );
+  await assert.rejects(
+    pool.execute("UPDATE inventory_balances SET quantity = 0 WHERE 1 = 0"),
+    (error) => error.code === "ER_TABLEACCESS_DENIED_ERROR",
+  );
+});
+
 test("migration account can read schema but cannot drop existing tables", async () => {
   const migrator = await createConnection(
     getDatabaseConfig("test", process.env, "MIGRATOR"),
@@ -214,7 +271,7 @@ test("migration account can read schema but cannot drop existing tables", async 
     const [[row]] = await migrator.query(
       "SELECT COUNT(*) AS count FROM schema_migrations",
     );
-    assert.equal(Number(row.count), 4);
+    assert.equal(Number(row.count), 5);
     await assert.rejects(
       migrator.query("DROP TABLE sigecom_test.schema_migrations"),
       (error) =>

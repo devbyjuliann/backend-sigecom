@@ -320,6 +320,19 @@ export function createWarehouseService({ dbPool }) {
       await connection.beginTransaction();
       const current = await lockAssignedWarehouse(connection, id, userId);
       if (Boolean(current.is_active) !== isActive) {
+        if (!isActive) {
+          const [[stock]] = await connection.execute(
+            "SELECT EXISTS(SELECT 1 FROM inventory_balances WHERE warehouse_id = ? AND quantity > 0) AS has_stock",
+            [id],
+          );
+          if (stock.has_stock) {
+            throw new HttpError(
+              409,
+              "WAREHOUSE_HAS_STOCK",
+              "No puedes desactivar una bodega que conserva existencias.",
+            );
+          }
+        }
         await connection.execute(
           "UPDATE warehouses SET is_active = ? WHERE id = ?",
           [Number(isActive), id],

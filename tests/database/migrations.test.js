@@ -7,7 +7,7 @@ test("loads versioned migrations in order with stable checksums", async () => {
 
   assert.deepEqual(
     migrations.map(({ version }) => version),
-    ["0001", "0002", "0003", "0004"],
+    ["0001", "0002", "0003", "0004", "0005"],
   );
   for (const migration of migrations) {
     assert.match(migration.name, /^[a-z0-9-]+$/);

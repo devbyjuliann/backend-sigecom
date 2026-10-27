@@ -214,6 +214,19 @@ export function createCategoryService({ dbPool }) {
         );
       }
       if (Boolean(current.is_active) !== isActive) {
+        if (!isActive) {
+          const [[activeProducts]] = await connection.execute(
+            "SELECT COUNT(*) AS total FROM products WHERE category_id = ? AND is_active = 1",
+            [id],
+          );
+          if (Number(activeProducts.total) > 0) {
+            throw new HttpError(
+              409,
+              "CATEGORY_HAS_ACTIVE_PRODUCTS",
+              "No puedes desactivar una categoría que tiene productos activos.",
+            );
+          }
+        }
         await connection.execute(
           "UPDATE categories SET is_active = ? WHERE id = ?",
           [Number(isActive), id],
