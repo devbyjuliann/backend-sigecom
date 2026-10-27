@@ -516,6 +516,27 @@ test("successful logins do not consume the failed-attempt rate-limit budget", as
   await submitLogin(limitedApp, csrf, "incorrecta-tercera").expect(429);
 });
 
+test("failed attempts are limited per account and origin without blocking another account", async () => {
+  const limitedConfig = getAuthConfig({
+    JWT_SECRET: randomBytes(48).toString("base64url"),
+    FRONTEND_ORIGIN: origin,
+    AUTH_RATE_LIMIT_MAX: "20",
+    AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX: "2",
+  });
+  const limitedApp = makeApp(createLogger({ level: "silent" }), limitedConfig);
+  const csrf = await obtainCsrf(limitedApp);
+
+  await submitLogin(limitedApp, csrf, "incorrecta-uno").expect(401);
+  await submitLogin(limitedApp, csrf, "incorrecta-dos").expect(401);
+  await submitLogin(limitedApp, csrf, "incorrecta-tres").expect(429);
+  await submitLogin(
+    limitedApp,
+    csrf,
+    "incorrecta-otro-usuario",
+    `otro-${randomBytes(4).toString("hex")}@sigecom.invalid`,
+  ).expect(401);
+});
+
 test("request logs never contain login passwords, JWTs, or cookies", async () => {
   let output = "";
   const destination = new Writable({

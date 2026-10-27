@@ -14,6 +14,25 @@ test("builds local auth configuration with a non-secure loopback cookie", () => 
   assert.equal(config.cookieSameSite, "strict");
   assert.equal(config.cookiePath, "/api/v1");
   assert.equal(config.allowedOrigins[0], "http://127.0.0.1:5173");
+  assert.equal(config.loginAccountAttemptLimit, 5);
+});
+
+test("validates the failed-login budget per account and origin", () => {
+  assert.equal(
+    getAuthConfig({
+      ...validEnvironment,
+      AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX: "3",
+    }).loginAccountAttemptLimit,
+    3,
+  );
+  assert.throws(
+    () =>
+      getAuthConfig({
+        ...validEnvironment,
+        AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX: "0",
+      }),
+    /AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX/,
+  );
 });
 
 test("rejects missing or weak JWT secrets", () => {

@@ -71,6 +71,19 @@ export function getAuthConfig(env = process.env) {
     throw new Error("AUTH_RATE_LIMIT_MAX debe estar entre 1 y 20.");
   }
 
+  const loginAccountAttemptLimit = Number(
+    env.AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX || 5,
+  );
+  if (
+    !Number.isInteger(loginAccountAttemptLimit) ||
+    loginAccountAttemptLimit < 1 ||
+    loginAccountAttemptLimit > 20
+  ) {
+    throw new Error(
+      "AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX debe estar entre 1 y 20.",
+    );
+  }
+
   return {
     jwtSecret,
     jwtIssuer: env.JWT_ISSUER || "sigecom",
@@ -83,6 +96,7 @@ export function getAuthConfig(env = process.env) {
     cookiePath: "/api/v1",
     allowedOrigins: readOrigins(env.FRONTEND_ORIGIN),
     loginAttemptLimit,
+    loginAccountAttemptLimit,
     loginWindowMs: 15 * 60 * 1000,
   };
 }

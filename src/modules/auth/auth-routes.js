@@ -1,5 +1,6 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
+import { createHash } from "node:crypto";
+import { ipKeyGenerator, rateLimit } from "express-rate-limit";
 import { z } from "zod";
 import { createAuthService } from "./auth-service.js";
 import { createCsrfToken, readCookie, setCsrfCookie } from "./csrf.js";
@@ -59,20 +60,37 @@ export function createAuthRouter({ dbPool, authConfig }) {
     authConfig,
     allowPasswordChangePending: true,
   });
-  const loginLimiter = rateLimit({
+  const loginRateLimitResponse = (_request, response) => {
+    response.status(429).json({
+      error: {
+        code: "LOGIN_RATE_LIMITED",
+        message: "Se alcanzó el límite de intentos. Inténtalo más tarde.",
+      },
+    });
+  };
+  const loginOriginLimiter = rateLimit({
     windowMs: authConfig.loginWindowMs,
     limit: authConfig.loginAttemptLimit,
     skipSuccessfulRequests: true,
     standardHeaders: true,
     legacyHeaders: false,
-    handler: (_request, response) => {
-      response.status(429).json({
-        error: {
-          code: "LOGIN_RATE_LIMITED",
-          message: "Se alcanzó el límite de intentos. Inténtalo más tarde.",
-        },
-      });
+    handler: loginRateLimitResponse,
+  });
+  const loginAccountOriginLimiter = rateLimit({
+    windowMs: authConfig.loginWindowMs,
+    limit: authConfig.loginAccountAttemptLimit,
+    skipSuccessfulRequests: true,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (request) => {
+      const account =
+        typeof request.body?.email === "string"
+          ? request.body.email.trim().toLowerCase().slice(0, 254)
+          : "<missing-account>";
+      const accountHash = createHash("sha256").update(account).digest("hex");
+      return `${ipKeyGenerator(request.ip)}:${accountHash}`;
     },
+    handler: loginRateLimitResponse,
   });
 
   router.get("/csrf", (_request, response) => {
@@ -82,27 +100,32 @@ export function createAuthRouter({ dbPool, authConfig }) {
     response.json({ csrfToken });
   });
 
-  router.post("/login", loginLimiter, async (request, response) => {
-    const parsed = loginSchema.safeParse(request.body);
-    if (!parsed.success) {
-      throw new HttpError(
-        400,
-        "INVALID_REQUEST",
-        "Indica un correo y una contraseña válidos.",
-      );
-    }
+  router.post(
+    "/login",
+    loginOriginLimiter,
+    loginAccountOriginLimiter,
+    async (request, response) => {
+      const parsed = loginSchema.safeParse(request.body);
+      if (!parsed.success) {
+        throw new HttpError(
+          400,
+          "INVALID_REQUEST",
+          "Indica un correo y una contraseña válidos.",
+        );
+      }
 
-    const result = await service.login({ ...parsed.data, request });
-    const csrfToken = createCsrfToken();
-    response.cookie(authConfig.cookieName, result.token, {
-      ...cookieOptions(authConfig),
-      httpOnly: true,
-      maxAge: authConfig.ttlSeconds * 1000,
-    });
-    setCsrfCookie(response, csrfToken, authConfig);
-    response.set("Cache-Control", "no-store");
-    response.json({ user: result.user, csrfToken });
-  });
+      const result = await service.login({ ...parsed.data, request });
+      const csrfToken = createCsrfToken();
+      response.cookie(authConfig.cookieName, result.token, {
+        ...cookieOptions(authConfig),
+        httpOnly: true,
+        maxAge: authConfig.ttlSeconds * 1000,
+      });
+      setCsrfCookie(response, csrfToken, authConfig);
+      response.set("Cache-Control", "no-store");
+      response.json({ user: result.user, csrfToken });
+    },
+  );
 
   router.get("/me", requireSessionWithPendingPassword, (request, response) => {
     response.set("Cache-Control", "no-store");
