@@ -320,6 +320,14 @@ test("product readers cannot mutate and inventory queries are warehouse-scoped",
   );
   await get("/api/v1/inventory/movements", sellerSession).expect(403);
   await get(
+    "/api/v1/inventory/movements?dateFrom=2026-02-30",
+    adminSession,
+  ).expect(400);
+  await get(
+    "/api/v1/inventory/operations?dateFrom=2026-10-29&dateTo=2026-10-28",
+    adminSession,
+  ).expect(400);
+  await get(
     `/api/v1/inventory/movements?warehouseId=${warehouseId}`,
     adminSession,
   ).expect(200);

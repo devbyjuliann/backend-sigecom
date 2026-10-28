@@ -180,7 +180,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     const [permissions] = await connection.execute(
       `SELECT p.code FROM role_permissions rp
        JOIN permissions p ON p.id = rp.permission_id
-       WHERE rp.role_id = ? AND p.code = ? FOR UPDATE`,
+       WHERE rp.role_id = ? AND p.code = ? LOCK IN SHARE MODE`,
       [user.role_id, permission],
     );
     if (!permissions.length) {
@@ -202,10 +202,10 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     for (const warehouseId of warehouseIds) {
       const [rows] = await connection.execute(
         `SELECT w.id, w.is_active
-         FROM user_warehouses uw
-         JOIN warehouses w ON w.id = uw.warehouse_id
-         WHERE uw.user_id = ? AND uw.warehouse_id = ?
-         FOR UPDATE`,
+          FROM user_warehouses uw
+          JOIN warehouses w ON w.id = uw.warehouse_id
+          WHERE uw.user_id = ? AND uw.warehouse_id = ?
+          LOCK IN SHARE MODE`,
         [userId, warehouseId],
       );
       if (!rows[0]) {
@@ -383,6 +383,64 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
       ]),
     );
 
+    for (const { warehouseId, productId } of pairs) {
+      const key = `${productId}:${warehouseId}`;
+      const balance = balances.get(key);
+      const [historyRows] = await connection.execute(
+        `SELECT balance_after, balance_version, unit_snapshot
+         FROM inventory_movements
+         WHERE product_id = ? AND warehouse_id = ?
+         ORDER BY balance_version DESC LIMIT 1 FOR UPDATE`,
+        [productId, warehouseId],
+      );
+      const latestMovement = historyRows[0];
+      if (!latestMovement) {
+        if (
+          payload.type === "initial_stock" &&
+          warehouseId === payload.sourceWarehouseId &&
+          (balance.version !== 0n || balance.quantity !== 0)
+        ) {
+          throw new HttpError(
+            409,
+            "INITIAL_STOCK_ALREADY_REGISTERED",
+            "Ya existe un saldo previo para este producto en la bodega.",
+          );
+        }
+        if (balance.version !== 0n || balance.quantity !== 0) {
+          throw new HttpError(
+            409,
+            "INVENTORY_HISTORY_INCONSISTENT",
+            "El saldo no tiene un movimiento histórico que lo respalde.",
+          );
+        }
+        if (
+          payload.type !== "initial_stock" &&
+          !(
+            payload.type === "transfer" &&
+            warehouseId === payload.destinationWarehouseId
+          )
+        ) {
+          throw new HttpError(
+            409,
+            "INVENTORY_HISTORY_INCONSISTENT",
+            "No se puede modificar un saldo sin historial de inventario.",
+          );
+        }
+        continue;
+      }
+      if (
+        BigInt(latestMovement.balance_version) !== balance.version ||
+        Number(latestMovement.balance_after) !== balance.quantity ||
+        latestMovement.unit_snapshot !== productsById.get(productId).unit
+      ) {
+        throw new HttpError(
+          409,
+          "INVENTORY_HISTORY_INCONSISTENT",
+          "El saldo no coincide con el último movimiento del inventario.",
+        );
+      }
+    }
+
     const movements = [];
     for (const line of payload.lines) {
       const sourceKey = `${line.productId}:${payload.sourceWarehouseId}`;
@@ -399,14 +457,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
         );
       }
       if (payload.type === "initial_stock") {
-        const [[history]] = await connection.execute(
-          `SELECT EXISTS(
-             SELECT 1 FROM inventory_movements
-             WHERE product_id = ? AND warehouse_id = ?
-           ) AS has_history`,
-          [line.productId, payload.sourceWarehouseId],
-        );
-        if (source.version !== 0n || history.has_history) {
+        if (source.version !== 0n || source.quantity !== 0) {
           throw new HttpError(
             409,
             "INITIAL_STOCK_ALREADY_REGISTERED",

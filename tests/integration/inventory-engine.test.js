@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
+import mysql from "mysql2/promise";
+import { getDatabaseConfig } from "../../src/db/config.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
 import { createInventoryService } from "../../src/modules/inventory/inventory-service.js";
@@ -140,6 +142,313 @@ test("internal ledger operations are atomic, versioned and idempotent", async ()
     [productId, warehouseId],
   );
   assert.equal(Number(count.total), 2);
+});
+
+test("inventory writes reject legacy balances and adjustment-based openings", async () => {
+  const [product] = await pool.execute(
+    `INSERT INTO products
+      (sku, name, category_id, unit, purchase_price, sale_price)
+     VALUES (?, ?, ?, 'unidad', 10.00, 20.00)`,
+    [`LEGACY-${suffix}`, `Saldo legado ${suffix}`, categoryId],
+  );
+  const legacyProductId = String(product.insertId);
+  await pool.execute(
+    `INSERT INTO inventory_balances (product_id, warehouse_id, quantity, version)
+     VALUES (?, ?, 4, 0)`,
+    [legacyProductId, warehouseId],
+  );
+
+  await assert.rejects(
+    engine.createOperation({
+      userId,
+      idempotencyKey: `legacy-adjustment-${suffix}`,
+      payload: {
+        type: "adjustment_in",
+        sourceWarehouseId: warehouseId,
+        destinationWarehouseId: null,
+        reason: "El ajuste no puede crear una apertura encubierta",
+        reference: null,
+        lines: [
+          { productId: legacyProductId, quantity: 1, expectedVersion: "0" },
+        ],
+      },
+    }),
+    (error) => error.code === "INVENTORY_HISTORY_INCONSISTENT",
+  );
+
+  await assert.rejects(
+    engine.createOperation({
+      userId,
+      idempotencyKey: `legacy-opening-${suffix}`,
+      payload: {
+        ...initialPayload(5),
+        lines: [{ productId: legacyProductId, quantity: 5 }],
+      },
+    }),
+    (error) => error.code === "INITIAL_STOCK_ALREADY_REGISTERED",
+  );
+  const [[counts]] = await pool.execute(
+    `SELECT ib.quantity, ib.version,
+            (SELECT COUNT(*) FROM inventory_movements im
+             WHERE im.product_id = ib.product_id AND im.warehouse_id = ib.warehouse_id) AS movements
+     FROM inventory_balances ib WHERE ib.product_id = ? AND ib.warehouse_id = ?`,
+    [legacyProductId, warehouseId],
+  );
+  assert.deepEqual(
+    [counts.quantity, String(counts.version), Number(counts.movements)],
+    [4, "0", 0],
+  );
+  const reconciliation = await createInventoryService({
+    dbPool: pool,
+  }).reconcile({
+    userId,
+    warehouseId,
+  });
+  assert.ok(
+    reconciliation.items.some((row) => row.productId === legacyProductId),
+  );
+  await pool.execute(
+    `UPDATE inventory_balances SET quantity = 0
+     WHERE product_id = ? AND warehouse_id = ?`,
+    [legacyProductId, warehouseId],
+  );
+  await assert.rejects(
+    engine.createOperation({
+      userId,
+      idempotencyKey: `blank-adjustment-${suffix}`,
+      payload: {
+        type: "adjustment_in",
+        sourceWarehouseId: warehouseId,
+        destinationWarehouseId: null,
+        reason: "Un saldo vacío requiere una apertura autorizada",
+        reference: null,
+        lines: [
+          { productId: legacyProductId, quantity: 1, expectedVersion: "0" },
+        ],
+      },
+    }),
+    (error) => error.code === "INVENTORY_HISTORY_INCONSISTENT",
+  );
+});
+
+test("inventory writes and reconciliation detect a balance diverging from its latest movement", async () => {
+  const [product] = await pool.execute(
+    `INSERT INTO products
+      (sku, name, category_id, unit, purchase_price, sale_price)
+     VALUES (?, ?, ?, 'unidad', 10.00, 20.00)`,
+    [`DRIFT-${suffix}`, `Saldo discrepante ${suffix}`, categoryId],
+  );
+  const driftProductId = String(product.insertId);
+  await engine.createOperation({
+    userId,
+    idempotencyKey: `drift-init-${suffix}`,
+    payload: {
+      ...initialPayload(6),
+      lines: [{ productId: driftProductId, quantity: 6 }],
+    },
+  });
+  await pool.execute(
+    `UPDATE inventory_balances SET quantity = 5
+     WHERE product_id = ? AND warehouse_id = ?`,
+    [driftProductId, warehouseId],
+  );
+
+  const service = createInventoryService({ dbPool: pool });
+  const reconciliation = await service.reconcile({ userId, warehouseId });
+  assert.equal(reconciliation.consistent, false);
+  assert.ok(
+    reconciliation.items.some((row) => row.productId === driftProductId),
+  );
+  await assert.rejects(
+    engine.createOperation({
+      userId,
+      idempotencyKey: `drift-adjust-${suffix}`,
+      payload: {
+        type: "adjustment_out",
+        sourceWarehouseId: warehouseId,
+        destinationWarehouseId: null,
+        reason: "Debe rechazarse el saldo divergente",
+        reference: null,
+        lines: [
+          { productId: driftProductId, quantity: 1, expectedVersion: "1" },
+        ],
+      },
+    }),
+    (error) => error.code === "INVENTORY_HISTORY_INCONSISTENT",
+  );
+  const [[after]] = await pool.execute(
+    `SELECT ib.quantity, ib.version,
+            (SELECT COUNT(*) FROM inventory_movements im
+             WHERE im.product_id = ib.product_id AND im.warehouse_id = ib.warehouse_id) AS movement_count
+     FROM inventory_balances ib WHERE ib.product_id = ? AND ib.warehouse_id = ?`,
+    [driftProductId, warehouseId],
+  );
+  assert.deepEqual(
+    [after.quantity, String(after.version), Number(after.movement_count)],
+    [5, "1", 1],
+  );
+  const [[rejectedOperation]] = await pool.execute(
+    `SELECT COUNT(*) AS total FROM inventory_operations
+     WHERE created_by = ? AND idempotency_key = ?`,
+    [userId, `drift-adjust-${suffix}`],
+  );
+  assert.equal(Number(rejectedOperation.total), 0);
+  await pool.execute(
+    `UPDATE inventory_balances SET quantity = 6
+     WHERE product_id = ? AND warehouse_id = ?`,
+    [driftProductId, warehouseId],
+  );
+});
+
+test("movement date filters use inclusive Bogota days over UTC timestamps", async () => {
+  const fixtureOperations = [];
+  for (const index of [0, 1, 2]) {
+    const [product] = await pool.execute(
+      `INSERT INTO products
+        (sku, name, category_id, unit, purchase_price, sale_price)
+       VALUES (?, ?, ?, 'unidad', 10.00, 20.00)`,
+      [`DATE-${index}-${suffix}`, `Fecha ${index} ${suffix}`, categoryId],
+    );
+    const id = String(product.insertId);
+    const operation = await engine.createOperation({
+      userId,
+      idempotencyKey: `date-${index}-${suffix}`,
+      payload: {
+        ...initialPayload(1),
+        lines: [{ productId: id, quantity: 1 }],
+      },
+    });
+    const [[original]] = await pool.execute(
+      "SELECT created_at FROM inventory_operations WHERE id = ?",
+      [operation.operationId],
+    );
+    fixtureOperations.push({
+      id: operation.operationId,
+      productId: id,
+      originalCreatedAt: original.created_at,
+    });
+  }
+
+  const migrator = await mysql.createConnection(
+    getDatabaseConfig("test", process.env, "MIGRATOR"),
+  );
+  try {
+    await migrator.query("SET time_zone = '+00:00'");
+    const [[database]] = await migrator.query("SELECT DATABASE() AS name");
+    assert.equal(database.name, "sigecom_test");
+    for (const [index, createdAt] of [
+      "2024-03-01 05:00:00.000",
+      "2024-03-02 04:59:59.999",
+      "2024-03-02 05:00:00.000",
+    ].entries()) {
+      await migrator.execute(
+        "UPDATE inventory_operations SET created_at = ? WHERE id = ? AND created_by = ?",
+        [createdAt, fixtureOperations[index].id, userId],
+      );
+    }
+    const results = await createInventoryService({
+      dbPool: pool,
+    }).listMovements({
+      userId,
+      page: 1,
+      pageSize: 20,
+      warehouseId,
+      dateFrom: "2024-03-01",
+      dateTo: "2024-03-01",
+      sortBy: "createdAt",
+      sortOrder: "asc",
+    });
+    assert.deepEqual(
+      results.items.map(({ productId }) => productId).sort(),
+      fixtureOperations
+        .slice(0, 2)
+        .map(({ productId }) => productId)
+        .sort(),
+    );
+  } finally {
+    for (const operation of fixtureOperations) {
+      await migrator.execute(
+        "UPDATE inventory_operations SET created_at = ? WHERE id = ? AND created_by = ?",
+        [operation.originalCreatedAt, operation.id, userId],
+      );
+    }
+    await migrator.end();
+  }
+});
+
+test("movement history hides the other side of a transfer from single-warehouse users", async () => {
+  const [product] = await pool.execute(
+    `INSERT INTO products
+      (sku, name, category_id, unit, purchase_price, sale_price)
+     VALUES (?, ?, ?, 'unidad', 10.00, 20.00)`,
+    [`PRIVATE-${suffix}`, `Traslado privado ${suffix}`, categoryId],
+  );
+  const privateProductId = String(product.insertId);
+  const [destination] = await pool.execute(
+    "INSERT INTO warehouses (code, name) VALUES (?, ?)",
+    [`PRIV-${suffix}`, `Destino privado ${suffix}`],
+  );
+  const destinationId = String(destination.insertId);
+  await pool.execute(
+    "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
+    [userId, destinationId],
+  );
+  await engine.createOperation({
+    userId,
+    idempotencyKey: `private-init-${suffix}`,
+    payload: {
+      ...initialPayload(5),
+      lines: [{ productId: privateProductId, quantity: 5 }],
+    },
+  });
+  const transfer = await engine.createOperation({
+    userId,
+    idempotencyKey: `private-transfer-${suffix}`,
+    payload: {
+      type: "transfer",
+      sourceWarehouseId: warehouseId,
+      destinationWarehouseId: destinationId,
+      reason: "Traslado con consulta restringida",
+      reference: null,
+      lines: [
+        { productId: privateProductId, quantity: 2, expectedVersion: "1" },
+      ],
+    },
+  });
+
+  const [reader] = await pool.execute(
+    `INSERT INTO users (role_id, email, password_hash)
+     SELECT role_id, ?, password_hash FROM users WHERE id = ?`,
+    [`inventory-private-reader-${suffix}@sigecom.invalid`, userId],
+  );
+  const sourceOnlyUserId = String(reader.insertId);
+  await pool.execute(
+    "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
+    [sourceOnlyUserId, warehouseId],
+  );
+
+  const service = createInventoryService({ dbPool: pool });
+  const movements = await service.listMovements({
+    userId: sourceOnlyUserId,
+    page: 1,
+    pageSize: 20,
+    warehouseId,
+    sortBy: "createdAt",
+    sortOrder: "desc",
+  });
+  const transferMovement = movements.items.find(
+    ({ operationId }) => operationId === transfer.operationId,
+  );
+  assert.ok(transferMovement);
+  assert.equal(transferMovement.sourceWarehouseId, null);
+  assert.equal(transferMovement.destinationWarehouseId, null);
+  await assert.rejects(
+    service.getOperation({
+      id: transfer.operationId,
+      userId: sourceOnlyUserId,
+    }),
+    (error) => error.code === "OPERATION_NOT_FOUND",
+  );
 });
 
 test("an outer transaction remains owned by its caller", async () => {
@@ -282,6 +591,70 @@ test("a product unit cannot change after inventory history exists", async () => 
   );
 });
 
+test("inventory engine rejects new writes when the historical unit differs from the product unit", async () => {
+  const [product] = await pool.execute(
+    `INSERT INTO products
+      (sku, name, category_id, unit, purchase_price, sale_price)
+     VALUES (?, ?, ?, 'unidad', 10.00, 20.00)`,
+    [`UNIT-HISTORY-${suffix}`, `Unidad histórica ${suffix}`, categoryId],
+  );
+  const unitProductId = String(product.insertId);
+  const opening = await engine.createOperation({
+    userId,
+    idempotencyKey: `unit-history-init-${suffix}`,
+    payload: {
+      ...initialPayload(4),
+      lines: [{ productId: unitProductId, quantity: 4 }],
+    },
+  });
+
+  const migrator = await mysql.createConnection(
+    getDatabaseConfig("test", process.env, "MIGRATOR"),
+  );
+  try {
+    await migrator.query("SET time_zone = '+00:00'");
+    const [[database]] = await migrator.query("SELECT DATABASE() AS name");
+    assert.equal(database.name, "sigecom_test");
+    const [changed] = await migrator.execute(
+      `UPDATE inventory_movements SET unit_snapshot = 'caja'
+       WHERE operation_id = ? AND product_id = ? AND warehouse_id = ?`,
+      [opening.operationId, unitProductId, warehouseId],
+    );
+    assert.equal(changed.affectedRows, 1);
+
+    await assert.rejects(
+      engine.createOperation({
+        userId,
+        idempotencyKey: `unit-history-adjust-${suffix}`,
+        payload: {
+          type: "adjustment_out",
+          sourceWarehouseId: warehouseId,
+          destinationWarehouseId: null,
+          reason: "No modificar un historial con unidad discordante",
+          reference: null,
+          lines: [
+            { productId: unitProductId, quantity: 1, expectedVersion: "1" },
+          ],
+        },
+      }),
+      (error) => error.code === "INVENTORY_HISTORY_INCONSISTENT",
+    );
+    const [[balance]] = await pool.execute(
+      `SELECT quantity, version FROM inventory_balances
+       WHERE product_id = ? AND warehouse_id = ?`,
+      [unitProductId, warehouseId],
+    );
+    assert.deepEqual([balance.quantity, String(balance.version)], [4, "1"]);
+  } finally {
+    await migrator.execute(
+      `UPDATE inventory_movements SET unit_snapshot = 'unidad'
+       WHERE operation_id = ? AND product_id = ? AND warehouse_id = ?`,
+      [opening.operationId, unitProductId, warehouseId],
+    );
+    await migrator.end();
+  }
+});
+
 test("simultaneous operations use independent connections and reject a stale version", async () => {
   const [product] = await pool.execute(
     `INSERT INTO products
@@ -299,8 +672,25 @@ test("simultaneous operations use independent connections and reject a stale ver
     },
   });
 
+  const [independentUser] = await pool.execute(
+    `INSERT INTO users (role_id, email, password_hash)
+     SELECT role_id, ?, password_hash FROM users WHERE id = ?`,
+    [`inventory-racer-${suffix}@sigecom.invalid`, userId],
+  );
+  const secondUserId = String(independentUser.insertId);
+  await pool.execute(
+    "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
+    [secondUserId, warehouseId],
+  );
+
   const baseGetConnection = pool.getConnection.bind(pool);
   let checkedOut = 0;
+  const connectionIds = [];
+  let productLockAttempts = 0;
+  let releaseProductLockBarrier;
+  const productLockBarrier = new Promise((resolve) => {
+    releaseProductLockBarrier = resolve;
+  });
   let releaseBarrier;
   const barrier = new Promise((resolve) => {
     releaseBarrier = resolve;
@@ -309,6 +699,22 @@ test("simultaneous operations use independent connections and reject a stale ver
     getConnection: async () => {
       const connection = await baseGetConnection();
       checkedOut += 1;
+      const [[identity]] = await connection.query(
+        "SELECT CONNECTION_ID() AS id",
+      );
+      connectionIds.push(String(identity.id));
+      const execute = connection.execute.bind(connection);
+      connection.execute = async (sql, values) => {
+        if (
+          String(sql).includes("FROM products") &&
+          String(sql).includes("FOR UPDATE")
+        ) {
+          productLockAttempts += 1;
+          if (productLockAttempts === 2) releaseProductLockBarrier();
+          await productLockBarrier;
+        }
+        return execute(sql, values);
+      };
       if (checkedOut === 2) releaseBarrier();
       await barrier;
       return connection;
@@ -323,19 +729,18 @@ test("simultaneous operations use independent connections and reject a stale ver
     reference: null,
     lines: [{ productId: raceProductId, quantity: 5, expectedVersion: "1" }],
   });
-  const outcomes = await Promise.allSettled([
-    concurrentEngine.createOperation({
-      userId,
-      idempotencyKey: `race-a-${suffix}`,
-      payload: makePayload(),
-    }),
-    concurrentEngine.createOperation({
-      userId,
-      idempotencyKey: `race-b-${suffix}`,
-      payload: makePayload(),
-    }),
-  ]);
+  const outcomes = await Promise.allSettled(
+    [userId, secondUserId].map((actorId, index) =>
+      concurrentEngine.createOperation({
+        userId: actorId,
+        idempotencyKey: `race-${index}-${suffix}`,
+        payload: makePayload(),
+      }),
+    ),
+  );
   assert.equal(checkedOut, 2);
+  assert.equal(new Set(connectionIds).size, 2);
+  assert.equal(productLockAttempts, 2);
   assert.equal(
     outcomes.filter(({ status }) => status === "fulfilled").length,
     1,
@@ -437,6 +842,7 @@ test("inventory reads are assignment-scoped and distinguish missing from zero ba
     page: 1,
     pageSize: 20,
     query: suffix,
+    warehouseId,
     sortBy: "createdAt",
     sortOrder: "desc",
   });

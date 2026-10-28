@@ -6,6 +6,18 @@ import { createInventoryService } from "./inventory-service.js";
 
 const idPattern = /^[1-9]\d{0,19}$/;
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+const dateSchema = z
+  .string()
+  .regex(datePattern)
+  .refine((value) => {
+    const [year, month, day] = value.split("-").map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return (
+      date.getUTCFullYear() === year &&
+      date.getUTCMonth() === month - 1 &&
+      date.getUTCDate() === day
+    );
+  });
 const pageSchema = {
   page: z.coerce.number().int().min(1).max(1_000_000).default(1),
   pageSize: z.coerce.number().int().min(1).max(100).default(20),
@@ -51,8 +63,8 @@ const movementSchema = z
       ])
       .optional(),
     direction: z.enum(["IN", "OUT"]).optional(),
-    dateFrom: z.string().regex(datePattern).optional(),
-    dateTo: z.string().regex(datePattern).optional(),
+    dateFrom: dateSchema.optional(),
+    dateTo: dateSchema.optional(),
     sortBy: z
       .enum(["createdAt", "product", "warehouse", "quantity", "type"])
       .default("createdAt"),
@@ -64,8 +76,8 @@ const operationSchema = z
     ...pageSchema,
     warehouseId: z.string().regex(idPattern).optional(),
     operationType: movementSchema.shape.operationType,
-    dateFrom: z.string().regex(datePattern).optional(),
-    dateTo: z.string().regex(datePattern).optional(),
+    dateFrom: dateSchema.optional(),
+    dateTo: dateSchema.optional(),
   })
   .strict();
 const warehouseSchema = z

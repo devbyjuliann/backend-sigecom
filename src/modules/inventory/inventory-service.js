@@ -24,6 +24,17 @@ function pagination(page, pageSize, total) {
   return { page, pageSize, total, pageCount: Math.ceil(total / pageSize) };
 }
 
+function bogotaDayStartUtc(date) {
+  return `${date} 05:00:00.000`;
+}
+
+function bogotaDayAfterUtc(date) {
+  const [year, month, day] = date.split("-").map(Number);
+  const nextDay = new Date(Date.UTC(year, month - 1, day + 1));
+  const nextDate = `${nextDay.getUTCFullYear()}-${String(nextDay.getUTCMonth() + 1).padStart(2, "0")}-${String(nextDay.getUTCDate()).padStart(2, "0")}`;
+  return bogotaDayStartUtc(nextDate);
+}
+
 function balanceFromRow(row) {
   const hasBalance = row.balance_id !== null;
   const quantity = hasBalance ? Number(row.quantity) : null;
@@ -312,11 +323,11 @@ export function createInventoryService({ dbPool }) {
     }
     if (dateFrom) {
       clauses.push("io.created_at >= ?");
-      values.push(`${dateFrom} 00:00:00.000`);
+      values.push(bogotaDayStartUtc(dateFrom));
     }
     if (dateTo) {
-      clauses.push("io.created_at < DATE_ADD(?, INTERVAL 1 DAY)");
-      values.push(dateTo);
+      clauses.push("io.created_at < ?");
+      values.push(bogotaDayAfterUtc(dateTo));
     }
     if (query) {
       const term = `%${escapeLike(query)}%`;
@@ -404,11 +415,11 @@ export function createInventoryService({ dbPool }) {
     }
     if (dateFrom) {
       clauses.push("io.created_at >= ?");
-      values.push(`${dateFrom} 00:00:00.000`);
+      values.push(bogotaDayStartUtc(dateFrom));
     }
     if (dateTo) {
-      clauses.push("io.created_at < DATE_ADD(?, INTERVAL 1 DAY)");
-      values.push(dateTo);
+      clauses.push("io.created_at < ?");
+      values.push(bogotaDayAfterUtc(dateTo));
     }
     if (query) {
       clauses.push(
@@ -596,8 +607,9 @@ export function createInventoryService({ dbPool }) {
        GROUP BY ib.product_id, p.sku, p.name, ib.warehouse_id,
                 w.name, ib.quantity, ib.version, history.movement_count,
                 history.latest_version, latest.balance_after
-       HAVING (ib.version = 0 AND COALESCE(history.movement_count, 0) > 0)
-          OR (ib.version > 0 AND (
+        HAVING (ib.version = 0 AND COALESCE(history.movement_count, 0) > 0)
+           OR (ib.version = 0 AND ib.quantity <> 0 AND COALESCE(history.movement_count, 0) = 0)
+           OR (ib.version > 0 AND (
                 COALESCE(history.movement_count, 0) <> ib.version
                 OR history.latest_version <> ib.version
                 OR latest.balance_after <> ib.quantity
