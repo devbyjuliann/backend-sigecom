@@ -97,7 +97,7 @@ before(async () => {
   const testSecret = randomBytes(48).toString("base64url");
   authConfig = getAuthConfig({
     JWT_SECRET: testSecret,
-    FRONTEND_ORIGIN: origin,
+    FRONTEND_ORIGIN: `${origin},http://localhost:5173`,
     JWT_TTL_SECONDS: "900",
   });
 
@@ -474,6 +474,39 @@ test("CSRF and origin checks protect login and logout mutations", async () => {
     .get("/api/v1/auth/me")
     .set("Cookie", `sigecom_session=${token}`)
     .expect(200);
+});
+
+test("the explicit localhost development alias passes CORS and origin checks", async () => {
+  const app = makeApp();
+  const csrf = await obtainCsrf(app);
+  const localOrigin = "http://localhost:5173";
+
+  const preflight = await request(app)
+    .options("/api/v1/auth/login")
+    .set("Origin", localOrigin)
+    .set("Access-Control-Request-Method", "POST")
+    .set("Access-Control-Request-Headers", "content-type,x-csrf-token")
+    .expect(204);
+  assert.equal(preflight.headers["access-control-allow-origin"], localOrigin);
+  assert.equal(preflight.headers["access-control-allow-credentials"], "true");
+
+  const acceptedOrigin = await request(app)
+    .post("/api/v1/auth/login")
+    .set("Origin", localOrigin)
+    .set("Cookie", csrf.cookie)
+    .set("X-CSRF-Token", csrf.token)
+    .send({ email: testEmail, password: "invalid-local-diagnostic-password" })
+    .expect(401);
+  assert.equal(acceptedOrigin.body.error.code, "INVALID_CREDENTIALS");
+
+  const rejectedOrigin = await request(app)
+    .post("/api/v1/auth/login")
+    .set("Origin", "https://untrusted.invalid")
+    .set("Cookie", csrf.cookie)
+    .set("X-CSRF-Token", csrf.token)
+    .send({ email: testEmail, password: "invalid-local-diagnostic-password" })
+    .expect(403);
+  assert.equal(rejectedOrigin.body.error.code, "ORIGIN_NOT_ALLOWED");
 });
 
 test("login rate limiting returns 429 after the configured failed attempts", async () => {
