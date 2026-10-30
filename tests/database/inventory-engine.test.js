@@ -51,3 +51,30 @@ test("inventory versions remain exact decimal strings across the unsigned BIGINT
     (error) => error.code === "INVALID_INVENTORY_OPERATION",
   );
 });
+
+test("purchase receipt ledger operations preserve their commercial source association", () => {
+  const input = {
+    type: "purchase_receipt",
+    sourceWarehouseId: "17",
+    destinationWarehouseId: null,
+    sourceType: "purchase_receipt",
+    sourceId: "9007199254740993",
+    reason: "Recepción de orden OC-000042",
+    reference: "REM-42",
+    lines: [
+      { productId: "9007199254740995", quantity: 6, expectedVersion: "0" },
+    ],
+  };
+  assert.throws(
+    () => inventoryEngineValidation.normalizePayload(input),
+    /no está habilitado/i,
+  );
+  const payload = inventoryEngineValidation.normalizePayload(input, {
+    allowPurchaseReceipt: true,
+  });
+
+  assert.equal(payload.type, "purchase_receipt");
+  assert.equal(payload.sourceType, "purchase_receipt");
+  assert.equal(payload.sourceId, "9007199254740993");
+  assert.equal(payload.lines[0].expectedVersion, "0");
+});

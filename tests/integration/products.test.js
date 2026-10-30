@@ -299,6 +299,14 @@ test("product readers cannot mutate and inventory queries are warehouse-scoped",
     sellerSession,
   ).expect(403);
 
+  const [[beforeInventoryReads]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_balances WHERE product_id = ?) AS balances,
+       (SELECT COUNT(*) FROM inventory_movements WHERE product_id = ?) AS movements,
+       (SELECT COUNT(*) FROM inventory_operations WHERE source_warehouse_id = ? AND created_by = ?) AS operations`,
+    [product.body.id, product.body.id, warehouseId, userIds.administrator],
+  );
+
   const balances = await get(
     `/api/v1/products/${product.body.id}/balances`,
     sellerSession,
@@ -318,6 +326,29 @@ test("product readers cannot mutate and inventory queries are warehouse-scoped",
       ({ productId }) => productId === product.body.id,
     ),
   );
+  const [[beforeRetiredRoute]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_balances WHERE product_id = ?) AS balances,
+       (SELECT COUNT(*) FROM inventory_movements WHERE product_id = ?) AS movements,
+       (SELECT COUNT(*) FROM inventory_operations WHERE source_warehouse_id = ? AND created_by = ?) AS operations`,
+    [product.body.id, product.body.id, warehouseId, userIds.administrator],
+  );
+  await mutate("post", "/api/v1/inventory/initial-stocks", {
+    warehouseId,
+    reason: "Ruta retirada: no debe escribir",
+    reference: `RETIRED-${suffix}`,
+    lines: [{ productId: product.body.id, quantity: 5 }],
+  })
+    .set("Idempotency-Key", `retired-${suffix}`)
+    .expect(404);
+  const [[afterRetiredRoute]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_balances WHERE product_id = ?) AS balances,
+       (SELECT COUNT(*) FROM inventory_movements WHERE product_id = ?) AS movements,
+       (SELECT COUNT(*) FROM inventory_operations WHERE source_warehouse_id = ? AND created_by = ?) AS operations`,
+    [product.body.id, product.body.id, warehouseId, userIds.administrator],
+  );
+  assert.deepEqual(afterRetiredRoute, beforeRetiredRoute);
   await get("/api/v1/inventory/movements", sellerSession).expect(403);
   await get(
     "/api/v1/inventory/movements?dateFrom=2026-02-30",
@@ -346,6 +377,14 @@ test("product readers cannot mutate and inventory queries are warehouse-scoped",
     },
     adminSession,
   ).expect(404);
+  const [[afterInventoryReads]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_balances WHERE product_id = ?) AS balances,
+       (SELECT COUNT(*) FROM inventory_movements WHERE product_id = ?) AS movements,
+       (SELECT COUNT(*) FROM inventory_operations WHERE source_warehouse_id = ? AND created_by = ?) AS operations`,
+    [product.body.id, product.body.id, warehouseId, userIds.administrator],
+  );
+  assert.deepEqual(afterInventoryReads, beforeInventoryReads);
   await pool.execute(
     `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)
      VALUES (?, ?, 0)`,

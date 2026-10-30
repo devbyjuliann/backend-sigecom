@@ -11,6 +11,7 @@ import { createCustomerRouter } from "./modules/customers/customer-routes.js";
 import { createSupplierRouter } from "./modules/suppliers/supplier-routes.js";
 import { createDashboardRouter } from "./modules/dashboard/dashboard-routes.js";
 import { createInventoryRouter } from "./modules/inventory/inventory-routes.js";
+import { createPurchaseRouter } from "./modules/purchases/purchase-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -40,7 +41,7 @@ export function createApp({
         origin: authConfig.allowedOrigins,
         credentials: true,
         methods: ["GET", "HEAD", "POST", "PATCH", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "X-CSRF-Token"],
+        allowedHeaders: ["Content-Type", "X-CSRF-Token", "Idempotency-Key"],
         maxAge: 600,
       }),
       requireTrustedOriginAndCsrf(authConfig),
@@ -68,6 +69,10 @@ export function createApp({
     apiRouter.use("/suppliers", createSupplierRouter({ dbPool, authConfig }));
     apiRouter.use("/dashboard", createDashboardRouter({ dbPool, authConfig }));
     apiRouter.use("/inventory", createInventoryRouter({ dbPool, authConfig }));
+    apiRouter.use(
+      "/purchase-orders",
+      createPurchaseRouter({ dbPool, authConfig }),
+    );
     app.use("/api/v1", apiRouter);
   }
 

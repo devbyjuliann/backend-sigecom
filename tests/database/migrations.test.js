@@ -7,7 +7,20 @@ test("loads versioned migrations in order with stable checksums", async () => {
 
   assert.deepEqual(
     migrations.map(({ version }) => version),
-    ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"],
+    [
+      "0001",
+      "0002",
+      "0003",
+      "0004",
+      "0005",
+      "0006",
+      "0007",
+      "0008",
+      "0009",
+      "0010",
+      "0011",
+      "0012",
+    ],
   );
   for (const migration of migrations) {
     assert.match(migration.name, /^[a-z0-9-]+$/);
@@ -39,4 +52,38 @@ test("loads versioned migrations in order with stable checksums", async () => {
     /DROP FOREIGN KEY fk_inventory_movements_balance_version/i,
   );
   assert.match(history, /FOREIGN KEY \(product_id, warehouse_id\)/i);
+
+  const purchases = migrations.find(({ version }) => version === "0010").sql;
+  for (const table of [
+    "purchase_orders",
+    "purchase_order_lines",
+    "purchase_receipts",
+    "purchase_receipt_lines",
+  ]) {
+    assert.match(
+      purchases,
+      new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`, "i"),
+    );
+  }
+  assert.match(purchases, /DECIMAL\(15,2\)/i);
+  assert.match(purchases, /source_operation_id/i);
+
+  const purchasePermissions = migrations.find(
+    ({ version }) => version === "0011",
+  ).sql;
+  assert.match(purchasePermissions, /purchases\.receive/i);
+  assert.match(purchasePermissions, /warehouse/i);
+
+  const purchaseCommercialCode = migrations.find(
+    ({ version }) => version === "0012",
+  ).sql;
+  assert.match(
+    purchaseCommercialCode,
+    /ADD COLUMN commercial_code VARCHAR\(40\)/i,
+  );
+  assert.match(purchaseCommercialCode, /CONCAT\('OC-', LPAD/i);
+  assert.match(
+    purchaseCommercialCode,
+    /UNIQUE KEY uq_purchase_orders_commercial_code/i,
+  );
 });

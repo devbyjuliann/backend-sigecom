@@ -408,7 +408,12 @@ test("warehouse API gains inventory ledger tables without operational write endp
   );
   assert.deepEqual(
     tables.map(({ TABLE_NAME }) => TABLE_NAME),
-    ["inventory_balances", "inventory_movements", "inventory_operations"],
+    [
+      "inventory_balances",
+      "inventory_movements",
+      "inventory_operations",
+      "purchase_orders",
+    ],
   );
 });
 

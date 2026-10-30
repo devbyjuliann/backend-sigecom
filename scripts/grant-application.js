@@ -46,6 +46,10 @@ try {
     "products",
     "customers",
     "suppliers",
+    "purchase_orders",
+    "purchase_order_lines",
+    "purchase_receipts",
+    "purchase_receipt_lines",
   ];
 
   for (const table of applicationTables) {

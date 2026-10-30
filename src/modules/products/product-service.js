@@ -254,6 +254,25 @@ export function createProductService({ dbPool }) {
             "No puedes cambiar la unidad comercial cuando el producto tiene existencias o movimientos registrados.",
           );
         }
+        const [[purchases]] = await connection.execute(
+          `SELECT EXISTS (
+             SELECT 1
+             FROM purchase_order_lines AS line
+             JOIN purchase_orders AS purchase_order
+               ON purchase_order.id = line.purchase_order_id
+             WHERE line.product_id = ?
+               AND line.is_active = 1
+               AND purchase_order.confirmed_at IS NOT NULL
+           ) AS has_purchase_history`,
+          [id],
+        );
+        if (purchases.has_purchase_history) {
+          throw new HttpError(
+            409,
+            "PRODUCT_UNIT_HAS_PURCHASE_HISTORY",
+            "No puedes cambiar la unidad comercial de un producto incluido en una orden confirmada.",
+          );
+        }
       }
       await ensureCategory(connection, input.categoryId, input.isActive);
       const changedFields = [

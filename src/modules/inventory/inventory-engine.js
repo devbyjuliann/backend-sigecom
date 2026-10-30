@@ -8,12 +8,14 @@ const movementTypes = new Set([
   "adjustment_in",
   "adjustment_out",
   "transfer",
+  "purchase_receipt",
 ]);
 const requiredPermissions = {
   initial_stock: "inventory.initialize",
   adjustment_in: "inventory.adjust",
   adjustment_out: "inventory.adjust",
   transfer: "inventory.transfer",
+  purchase_receipt: "purchases.receive",
 };
 
 function invalidRequest(
@@ -42,8 +44,11 @@ function normalizeVersion(value) {
   return value;
 }
 
-function normalizePayload(payload) {
+function normalizePayload(payload, { allowPurchaseReceipt = false } = {}) {
   if (!payload || !movementTypes.has(payload.type)) {
+    throw invalidRequest("El tipo de operación no está habilitado.");
+  }
+  if (payload.type === "purchase_receipt" && !allowPurchaseReceipt) {
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   const sourceWarehouseId = normalizeId(payload.sourceWarehouseId, "bodega");
@@ -59,6 +64,27 @@ function normalizePayload(payload) {
   }
   if (payload.type !== "transfer" && payload.destinationWarehouseId != null) {
     throw invalidRequest("Esta operación no admite una bodega destino.");
+  }
+  const sourceType = payload.sourceType ?? null;
+  const sourceId = payload.sourceId ?? null;
+  if (
+    payload.type === "purchase_receipt" &&
+    (sourceType !== "purchase_receipt" ||
+      typeof sourceId !== "string" ||
+      !sourceId.trim() ||
+      sourceId.length > 128)
+  ) {
+    throw invalidRequest(
+      "La recepción requiere una referencia comercial válida.",
+    );
+  }
+  if (
+    payload.type !== "purchase_receipt" &&
+    (sourceType !== null || sourceId !== null)
+  ) {
+    throw invalidRequest(
+      "La asociación comercial no corresponde a esta operación.",
+    );
   }
   if (typeof payload.reason !== "string" || !payload.reason.trim()) {
     throw invalidRequest("El motivo es obligatorio.");
@@ -109,6 +135,8 @@ function normalizePayload(payload) {
     type: payload.type,
     sourceWarehouseId,
     destinationWarehouseId,
+    sourceType,
+    sourceId,
     reason,
     reference: reference || null,
     lines,
@@ -249,6 +277,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     idempotencyKey: rawIdempotencyKey,
     payload: rawPayload,
     request,
+    internal = false,
   }) {
     if (!connection || typeof connection.execute !== "function") {
       throw new TypeError(
@@ -269,7 +298,9 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
       throw invalidRequest("Indica una clave de idempotencia válida.");
     }
     const idempotencyKey = rawIdempotencyKey.trim();
-    const payload = normalizePayload(rawPayload);
+    const payload = normalizePayload(rawPayload, {
+      allowPurchaseReceipt: internal,
+    });
     const requestHash = hashRequest(userId, payload);
     const { assignments } = await validateActorAndWarehouses(
       connection,
@@ -320,8 +351,9 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     await connection.execute(
       `INSERT INTO inventory_operations
         (operation_type, source_warehouse_id, destination_warehouse_id,
-         created_by, reason, reference, idempotency_key, request_hash)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         created_by, reason, reference, source_type, source_id,
+         idempotency_key, request_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         payload.type,
         payload.sourceWarehouseId,
@@ -329,6 +361,8 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
         userId,
         payload.reason,
         payload.reference,
+        payload.sourceType,
+        payload.sourceId,
         idempotencyKey,
         requestHash,
       ],
@@ -414,7 +448,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
           );
         }
         if (
-          payload.type !== "initial_stock" &&
+          !["initial_stock", "purchase_receipt"].includes(payload.type) &&
           !(
             payload.type === "transfer" &&
             warehouseId === payload.destinationWarehouseId
