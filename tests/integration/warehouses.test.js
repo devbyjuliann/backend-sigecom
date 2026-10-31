@@ -400,11 +400,12 @@ test("only administrators may create, edit, or change warehouse status", async (
   await get("/api/v1/warehouses", { cookie: "" }).expect(401);
 });
 
-test("warehouse API gains inventory ledger tables without operational write endpoints", async () => {
+test("inventory and sales schemas exist without exposing inventory write endpoints", async () => {
   const [tables] = await pool.execute(
     `SELECT TABLE_NAME FROM information_schema.TABLES
      WHERE TABLE_SCHEMA = 'sigecom_test'
-       AND TABLE_NAME IN ('inventory_balances', 'inventory_movements', 'inventory_operations', 'purchase_orders', 'sales')`,
+       AND TABLE_NAME IN ('inventory_balances', 'inventory_movements', 'inventory_operations', 'purchase_orders', 'sale_lines', 'sale_requests', 'sales')
+     ORDER BY TABLE_NAME`,
   );
   assert.deepEqual(
     tables.map(({ TABLE_NAME }) => TABLE_NAME),
@@ -413,6 +414,9 @@ test("warehouse API gains inventory ledger tables without operational write endp
       "inventory_movements",
       "inventory_operations",
       "purchase_orders",
+      "sales",
+      "sale_lines",
+      "sale_requests",
     ],
   );
 });

@@ -12,6 +12,7 @@ import { createSupplierRouter } from "./modules/suppliers/supplier-routes.js";
 import { createDashboardRouter } from "./modules/dashboard/dashboard-routes.js";
 import { createInventoryRouter } from "./modules/inventory/inventory-routes.js";
 import { createPurchaseRouter } from "./modules/purchases/purchase-routes.js";
+import { createSaleRouter } from "./modules/sales/sale-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -73,6 +74,7 @@ export function createApp({
       "/purchase-orders",
       createPurchaseRouter({ dbPool, authConfig }),
     );
+    apiRouter.use("/sales", createSaleRouter({ dbPool, authConfig }));
     app.use("/api/v1", apiRouter);
   }
 

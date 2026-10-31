@@ -61,6 +61,19 @@ try {
   }
 
   await connection.query(
+    `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`sales\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `GRANT SELECT, INSERT, UPDATE, DELETE ON \`${target.database}\`.\`sale_lines\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `GRANT SELECT, INSERT ON \`${target.database}\`.\`sale_requests\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `REVOKE UPDATE, DELETE ON \`${target.database}\`.\`sale_requests\` FROM '${appUser}'@'127.0.0.1'`,
+  );
+
+  await connection.query(
     `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`inventory_balances\` TO '${appUser}'@'127.0.0.1'`,
   );
 

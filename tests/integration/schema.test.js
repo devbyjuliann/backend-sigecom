@@ -20,6 +20,9 @@ const expectedTables = [
   "purchase_receipt_lines",
   "roles",
   "role_permissions",
+  "sales",
+  "sale_lines",
+  "sale_requests",
   "schema_migrations",
   "suppliers",
   "supplier_returns",
@@ -70,7 +73,7 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   assert.equal(Number(roles.count), 4);
   assert.ok(Number(permissions.count) >= 35);
   assert.ok(Number(rolePermissions.count) >= Number(permissions.count));
-  assert.equal(Number(versions.count), 14);
+  assert.equal(Number(versions.count), 15);
 
   const [closurePermission] = await pool.execute(
     `SELECT r.code AS role_code
@@ -195,7 +198,7 @@ test("all phase 1 tables use InnoDB and declared foreign keys", async () => {
     `SELECT COUNT(*) AS count FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = 'sigecom_test' AND REFERENCED_TABLE_NAME IS NOT NULL`,
   );
-  assert.equal(Number(constraints.count), 51);
+  assert.equal(Number(constraints.count), 61);
 });
 
 test("database connections use UTC sessions without changing MariaDB global settings", async () => {
@@ -396,7 +399,7 @@ test("migration account can read schema but cannot drop existing tables", async 
     const [[row]] = await migrator.query(
       "SELECT COUNT(*) AS count FROM schema_migrations",
     );
-    assert.equal(Number(row.count), 14);
+    assert.equal(Number(row.count), 15);
     await assert.rejects(
       migrator.query("DROP TABLE sigecom_test.schema_migrations"),
       (error) =>

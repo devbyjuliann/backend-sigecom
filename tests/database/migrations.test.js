@@ -22,6 +22,7 @@ test("loads versioned migrations in order with stable checksums", async () => {
       "0012",
       "0013",
       "0014",
+      "0015",
     ],
   );
   for (const migration of migrations) {
@@ -111,4 +112,16 @@ test("loads versioned migrations in order with stable checksums", async () => {
   assert.match(supplierReturns, /uq_supplier_returns_actor_idempotency/i);
   assert.match(supplierReturns, /source_operation_id/i);
   assert.match(supplierReturns, /purchase_receipt_line_id/i);
+
+  const sales = migrations.find(({ version }) => version === "0015").sql;
+  for (const table of ["sales", "sale_lines", "sale_requests"]) {
+    assert.match(sales, new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`, "i"));
+  }
+  assert.match(sales, /ENUM\('draft', 'confirmed', 'cancelled'\)/i);
+  assert.match(sales, /customer_name_snapshot/i);
+  assert.match(sales, /product_name_snapshot/i);
+  assert.match(sales, /DECIMAL\(22,2\)/i);
+  assert.match(sales, /UNIQUE KEY uq_sale_lines_product/i);
+  assert.match(sales, /UNIQUE KEY uq_sale_requests_actor_key/i);
+  assert.doesNotMatch(sales, /CREATE TABLE IF NOT EXISTS inventory_/i);
 });

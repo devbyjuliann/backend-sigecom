@@ -10,6 +10,7 @@ const movementTypes = new Set([
   "transfer",
   "purchase_receipt",
   "supplier_return",
+  "sale_issue",
 ]);
 const requiredPermissions = {
   initial_stock: "inventory.initialize",
@@ -18,6 +19,7 @@ const requiredPermissions = {
   transfer: "inventory.transfer",
   purchase_receipt: "purchases.receive",
   supplier_return: "purchases.return",
+  sale_issue: "sales.confirm",
 };
 
 function invalidRequest(
@@ -48,7 +50,11 @@ function normalizeVersion(value) {
 
 function normalizePayload(
   payload,
-  { allowPurchaseReceipt = false, allowSupplierReturn = false } = {},
+  {
+    allowPurchaseReceipt = false,
+    allowSupplierReturn = false,
+    allowSaleIssue = false,
+  } = {},
 ) {
   if (!payload || !movementTypes.has(payload.type)) {
     throw invalidRequest("El tipo de operación no está habilitado.");
@@ -57,6 +63,9 @@ function normalizePayload(
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   if (payload.type === "supplier_return" && !allowSupplierReturn) {
+    throw invalidRequest("El tipo de operación no está habilitado.");
+  }
+  if (payload.type === "sale_issue" && !allowSaleIssue) {
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   const sourceWarehouseId = normalizeId(payload.sourceWarehouseId, "bodega");
@@ -98,7 +107,17 @@ function normalizePayload(
     );
   }
   if (
-    !["purchase_receipt", "supplier_return"].includes(payload.type) &&
+    payload.type === "sale_issue" &&
+    (sourceType !== "sale" ||
+      typeof sourceId !== "string" ||
+      !/^[1-9]\d{0,19}$/.test(sourceId))
+  ) {
+    throw invalidRequest("La venta requiere una referencia comercial válida.");
+  }
+  if (
+    !["purchase_receipt", "supplier_return", "sale_issue"].includes(
+      payload.type,
+    ) &&
     (sourceType !== null || sourceId !== null)
   ) {
     throw invalidRequest(
@@ -297,6 +316,8 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     payload: rawPayload,
     request,
     internal = false,
+    allowSaleIssue = false,
+    validateProducts,
   }) {
     if (!connection || typeof connection.execute !== "function") {
       throw new TypeError(
@@ -320,6 +341,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     const payload = normalizePayload(rawPayload, {
       allowPurchaseReceipt: internal,
       allowSupplierReturn: internal,
+      allowSaleIssue: internal && allowSaleIssue,
     });
     const requestHash = hashRequest(userId, payload);
     const { assignments } = await validateActorAndWarehouses(
@@ -345,7 +367,8 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     }
 
     const [products] = await connection.execute(
-      `SELECT id, unit, is_active FROM products
+      `SELECT id, unit, is_active, minimum_sale_quantity,
+              minimum_sale_enabled FROM products
        WHERE id IN (${payload.lines.map(() => "?").join(",")})
        ORDER BY id FOR UPDATE`,
       payload.lines.map(({ productId }) => productId),
@@ -367,6 +390,20 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     const productsById = new Map(
       products.map((product) => [String(product.id), product]),
     );
+    if (payload.type === "sale_issue") {
+      if (
+        !internal ||
+        !allowSaleIssue ||
+        typeof validateProducts !== "function"
+      ) {
+        throw invalidRequest("La operación comercial no está habilitada.");
+      }
+      await validateProducts({
+        connection,
+        lines: payload.lines,
+        products: productsById,
+      });
+    }
 
     await connection.execute(
       `INSERT INTO inventory_operations
@@ -529,9 +566,11 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
           : [
               {
                 warehouseId: payload.sourceWarehouseId,
-                direction: ["adjustment_out", "supplier_return"].includes(
-                  payload.type,
-                )
+                direction: [
+                  "adjustment_out",
+                  "supplier_return",
+                  "sale_issue",
+                ].includes(payload.type)
                   ? "OUT"
                   : "IN",
               },
