@@ -23,6 +23,7 @@ test("loads versioned migrations in order with stable checksums", async () => {
       "0013",
       "0014",
       "0015",
+      "0016",
     ],
   );
   for (const migration of migrations) {
@@ -124,4 +125,19 @@ test("loads versioned migrations in order with stable checksums", async () => {
   assert.match(sales, /UNIQUE KEY uq_sale_lines_product/i);
   assert.match(sales, /UNIQUE KEY uq_sale_requests_actor_key/i);
   assert.doesNotMatch(sales, /CREATE TABLE IF NOT EXISTS inventory_/i);
+
+  const saleCancellations = migrations.find(
+    ({ version }) => version === "0016",
+  ).sql;
+  assert.match(
+    saleCancellations,
+    /CREATE TABLE IF NOT EXISTS sale_cancellations/i,
+  );
+  assert.match(saleCancellations, /UNIQUE KEY uq_sale_cancellations_sale/i);
+  assert.match(saleCancellations, /source_operation_id/i);
+  assert.match(saleCancellations, /never_dispatched/i);
+  assert.match(saleCancellations, /all_quantities_present/i);
+  assert.match(saleCancellations, /all_products_saleable/i);
+  assert.match(saleCancellations, /ADD COLUMN reversal_id/i);
+  assert.doesNotMatch(saleCancellations, /DROP\s+(?:TABLE|COLUMN)/i);
 });

@@ -9,12 +9,14 @@ import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
+import { createSaleService } from "../../src/modules/sales/sale-service.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
 const password = "Clave-segura-ventas-2026!";
 const roles = {
   administrator: "administrator",
+  unassignedAdmin: "administrator",
   seller: "seller",
   secondSeller: "seller",
   auditor: "auditor",
@@ -39,6 +41,7 @@ let productId;
 let minimumProductId;
 let inactiveProductId;
 let categoryId;
+let reversalFixtureNumber = 0;
 
 async function signIn(email) {
   const csrf = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -84,6 +87,68 @@ function saleInput(overrides = {}) {
       { productId, quantity: 3, unitPrice: "1234.50" },
       { productId: minimumProductId, quantity: 5, unitPrice: "0.10" },
     ],
+    ...overrides,
+  };
+}
+
+async function createConfirmedReversalFixture(quantity = 2) {
+  reversalFixtureNumber += 1;
+  const fixture = `${suffix}-${reversalFixtureNumber}`;
+  const [createdProduct] = await pool.execute(
+    `INSERT INTO products
+       (sku, name, category_id, unit, purchase_price, sale_price)
+     VALUES (?, ?, ?, 'unidad', 1.00, 10.00)`,
+    [`RV-${fixture}`, `Producto anulación ${fixture}`, categoryId],
+  );
+  const fixtureProductId = String(createdProduct.insertId);
+  await inventoryEngine.createOperation({
+    userId: users.administrator,
+    idempotencyKey: `reversal-stock-${fixture}`,
+    payload: {
+      type: "initial_stock",
+      sourceWarehouseId: warehouseId,
+      destinationWarehouseId: null,
+      reason: "Existencia para prueba de anulación",
+      reference: `RV-OPEN-${fixture}`,
+      lines: [{ productId: fixtureProductId, quantity: quantity + 4 }],
+    },
+  });
+  const createdSale = await mutate(
+    "post",
+    "/api/v1/sales",
+    saleInput({
+      lines: [{ productId: fixtureProductId, quantity, unitPrice: "10.00" }],
+    }),
+    sessions.administrator,
+    `reversal-create-${fixture}`,
+  ).expect(201);
+  const confirmationKey = `reversal-confirm-${fixture}`;
+  const confirmedSale = await mutate(
+    "post",
+    `/api/v1/sales/${createdSale.body.id}/confirmation`,
+    { expectedVersion: createdSale.body.version },
+    sessions.administrator,
+    confirmationKey,
+  ).expect(200);
+  return {
+    fixture,
+    productId: fixtureProductId,
+    created: createdSale.body,
+    confirmed: confirmedSale.body,
+    confirmationKey,
+  };
+}
+
+function reversalInput(sale, overrides = {}) {
+  return {
+    expectedVersion: sale.version,
+    reason: "La mercancía permanece completa en la bodega",
+    reference: `VERIFICACION-${sale.id}`,
+    physicalObservation:
+      "Conteo físico cotejado contra las unidades originales.",
+    neverDispatched: true,
+    allQuantitiesPresent: true,
+    allProductsSaleable: true,
     ...overrides,
   };
 }
@@ -462,6 +527,406 @@ test("inactive customers and products invalidate persisted confirmation candidat
       productId,
     ]);
   }
+});
+
+test("reverses a confirmed sale with verified evidence exactly once and preserves its original issue", async () => {
+  const fixture = await createConfirmedReversalFixture(3);
+  const { created, confirmed } = fixture;
+  const confirmationKey = fixture.confirmationKey;
+
+  const input = {
+    expectedVersion: confirmed.version,
+    reason: "La mercancía permanece completa en la bodega",
+    reference: `VERIFICACION-${fixture.fixture}`,
+    physicalObservation: "Conteo físico cotejado contra las tres unidades.",
+    neverDispatched: true,
+    allQuantitiesPresent: true,
+    allProductsSaleable: true,
+  };
+  const reversalKey = `reversal-once-${suffix}`;
+  const reversed = await mutate(
+    "post",
+    `/api/v1/sales/${created.id}/reversal`,
+    input,
+    sessions.administrator,
+    reversalKey,
+  );
+  assert.equal(reversed.status, 200, JSON.stringify(reversed.body));
+
+  assert.equal(reversed.body.sale.status, "cancelled");
+  assert.equal(reversed.body.sale.version, confirmed.version + 1);
+  assert.equal(reversed.body.reversal.saleId, created.id);
+  assert.equal(reversed.body.reversal.verificationReference, input.reference);
+  assert.equal(
+    reversed.body.reversal.physicalObservation,
+    input.physicalObservation,
+  );
+  assert.equal(reversed.body.reversal.neverDispatched, true);
+  assert.equal(reversed.body.reversal.allQuantitiesPresent, true);
+  assert.equal(reversed.body.reversal.allProductsSaleable, true);
+
+  const [[originalOperation]] = await pool.execute(
+    "SELECT id, operation_type FROM inventory_operations WHERE source_type = 'sale' AND source_id = ?",
+    [created.id],
+  );
+  assert.equal(originalOperation.operation_type, "sale_issue");
+  const [originalMovements] = await pool.execute(
+    "SELECT direction, quantity FROM inventory_movements WHERE operation_id = ?",
+    [originalOperation.id],
+  );
+  assert.deepEqual(originalMovements, [{ direction: "OUT", quantity: 3 }]);
+
+  const [[reversalDocument]] = await pool.execute(
+    "SELECT id, sale_id, source_operation_id, verification_reference, never_dispatched, all_quantities_present, all_products_saleable FROM sale_cancellations WHERE sale_id = ?",
+    [created.id],
+  );
+  assert.equal(String(reversalDocument.sale_id), created.id);
+  assert.equal(reversed.body.sale.cancelledBy, users.administrator);
+  assert.equal(reversalDocument.verification_reference, input.reference);
+  assert.equal(Number(reversalDocument.never_dispatched), 1);
+  assert.equal(Number(reversalDocument.all_quantities_present), 1);
+  assert.equal(Number(reversalDocument.all_products_saleable), 1);
+  const [[auditEvent]] = await pool.execute(
+    `SELECT action, entity_type, entity_id, user_id
+     FROM audit_events
+     WHERE action = 'sales.reversed' AND entity_id = ?
+     ORDER BY id DESC LIMIT 1`,
+    [created.id],
+  );
+  assert.equal(auditEvent.action, "sales.reversed");
+  assert.equal(auditEvent.entity_type, "sale");
+  assert.equal(String(auditEvent.user_id), users.administrator);
+
+  const [[compensation]] = await pool.execute(
+    "SELECT id, operation_type, source_type, source_id FROM inventory_operations WHERE id = ?",
+    [reversalDocument.source_operation_id],
+  );
+  assert.equal(compensation.operation_type, "sale_reversal");
+  assert.equal(compensation.source_type, "sale_cancellation");
+  assert.equal(compensation.source_id, String(reversalDocument.id));
+  const [compensatingMovements] = await pool.execute(
+    "SELECT direction, quantity, balance_before, balance_after FROM inventory_movements WHERE operation_id = ?",
+    [compensation.id],
+  );
+  assert.deepEqual(compensatingMovements, [
+    { direction: "IN", quantity: 3, balance_before: 4, balance_after: 7 },
+  ]);
+  const [[balance]] = await pool.execute(
+    "SELECT quantity FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.equal(Number(balance.quantity), 7);
+
+  const replay = await mutate(
+    "post",
+    `/api/v1/sales/${created.id}/reversal`,
+    input,
+    sessions.administrator,
+    reversalKey,
+  ).expect(200);
+  assert.equal(replay.body.reversal.id, reversed.body.reversal.id);
+  await mutate(
+    "post",
+    `/api/v1/sales/${created.id}/reversal`,
+    { ...input, reference: `OTRA-${suffix}` },
+    sessions.administrator,
+    reversalKey,
+  ).expect(409);
+  await mutate(
+    "post",
+    `/api/v1/sales/${created.id}/reversal`,
+    { ...input, expectedVersion: reversed.body.sale.version },
+    sessions.administrator,
+    `reversal-second-${suffix}`,
+  ).expect(409);
+
+  const read = await get(`/api/v1/sales/${created.id}/reversal`).expect(200);
+  assert.equal(read.body.id, reversed.body.reversal.id);
+  const pdf = await get(`/api/v1/sales/${created.id}/reversal/pdf`).expect(200);
+  assert.match(pdf.headers["content-type"], /application\/pdf/);
+  assert.equal(pdf.body.subarray(0, 8).toString("ascii"), "%PDF-1.4");
+
+  const confirmationReplay = await mutate(
+    "post",
+    `/api/v1/sales/${created.id}/confirmation`,
+    { expectedVersion: created.version },
+    sessions.administrator,
+    confirmationKey,
+  ).expect(200);
+  assert.equal(confirmationReplay.body.status, "cancelled");
+  const [[finalBalance]] = await pool.execute(
+    "SELECT quantity FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.equal(Number(finalBalance.quantity), 7);
+});
+
+test("reversal requires every physical declaration and rejects stale versions", async () => {
+  const fixture = await createConfirmedReversalFixture();
+  const base = reversalInput(fixture.confirmed);
+  for (const declaration of [
+    "neverDispatched",
+    "allQuantitiesPresent",
+    "allProductsSaleable",
+  ]) {
+    await mutate(
+      "post",
+      `/api/v1/sales/${fixture.created.id}/reversal`,
+      { ...base, [declaration]: false },
+      sessions.administrator,
+      `reversal-evidence-${declaration}-${fixture.fixture}`,
+    ).expect(400);
+  }
+  const stale = await mutate(
+    "post",
+    `/api/v1/sales/${fixture.created.id}/reversal`,
+    { ...base, expectedVersion: fixture.confirmed.version - 1 },
+    sessions.administrator,
+    `reversal-stale-${fixture.fixture}`,
+  ).expect(409);
+  assert.equal(stale.body.error.code, "SALE_VERSION_CONFLICT");
+  const [[sale]] = await pool.execute(
+    "SELECT status, version FROM sales WHERE id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(sale.status, "confirmed");
+  assert.equal(Number(sale.version), fixture.confirmed.version);
+  const [[documents]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_cancellations WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(Number(documents.count), 0);
+});
+
+test("reversal endpoint enforces trusted origin and CSRF", async () => {
+  const fixture = await createConfirmedReversalFixture();
+  const path = `/api/v1/sales/${fixture.created.id}/reversal`;
+  const input = reversalInput(fixture.confirmed);
+  await request(app)
+    .post(path)
+    .set("Origin", origin)
+    .set("Cookie", sessions.administrator.cookie)
+    .set("Idempotency-Key", `reversal-no-csrf-${fixture.fixture}`)
+    .send(input)
+    .expect(403);
+  await request(app)
+    .post(path)
+    .set("Origin", "https://untrusted.example")
+    .set("Cookie", sessions.administrator.cookie)
+    .set("X-CSRF-Token", sessions.administrator.csrfToken)
+    .set("Idempotency-Key", `reversal-bad-origin-${fixture.fixture}`)
+    .send(input)
+    .expect(403);
+  const [[documentCount]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_cancellations WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(Number(documentCount.count), 0);
+});
+
+test("reversal refuses drafts, cancelled drafts, and users without its permission", async () => {
+  const draft = await mutate(
+    "post",
+    "/api/v1/sales",
+    saleInput(),
+    sessions.administrator,
+    `reversal-draft-${suffix}`,
+  ).expect(201);
+  const draftBody = reversalInput(draft.body);
+  await mutate(
+    "post",
+    `/api/v1/sales/${draft.body.id}/reversal`,
+    draftBody,
+    sessions.administrator,
+    `reversal-not-confirmed-${suffix}`,
+  ).expect(409);
+  await mutate(
+    "post",
+    `/api/v1/sales/${draft.body.id}/cancellation`,
+    { expectedVersion: draft.body.version, reason: "Borrador duplicado" },
+    sessions.administrator,
+    `reversal-cancel-draft-${suffix}`,
+  ).expect(200);
+  await mutate(
+    "post",
+    `/api/v1/sales/${draft.body.id}/reversal`,
+    draftBody,
+    sessions.administrator,
+    `reversal-cancelled-draft-${suffix}`,
+  ).expect(409);
+
+  const fixture = await createConfirmedReversalFixture();
+  const input = reversalInput(fixture.confirmed);
+  for (const account of ["seller", "auditor", "warehouse"])
+    await mutate(
+      "post",
+      `/api/v1/sales/${fixture.created.id}/reversal`,
+      input,
+      sessions[account],
+      `reversal-permission-${account}-${fixture.fixture}`,
+    ).expect(403);
+
+  await mutate(
+    "post",
+    `/api/v1/sales/${fixture.created.id}/reversal`,
+    input,
+    sessions.unassignedAdmin,
+    `reversal-unassigned-${fixture.fixture}`,
+  ).expect(404);
+});
+
+test("reversal rejects inactive products and warehouses without changing the sale or stock", async () => {
+  const inactiveProductFixture = await createConfirmedReversalFixture();
+  const [[beforeInactiveProduct]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [inactiveProductFixture.productId, warehouseId],
+  );
+  await pool.execute("UPDATE products SET is_active = 0 WHERE id = ?", [
+    inactiveProductFixture.productId,
+  ]);
+  try {
+    const response = await mutate(
+      "post",
+      `/api/v1/sales/${inactiveProductFixture.created.id}/reversal`,
+      reversalInput(inactiveProductFixture.confirmed),
+      sessions.administrator,
+      `reversal-inactive-product-${inactiveProductFixture.fixture}`,
+    ).expect(409);
+    assert.equal(response.body.error.code, "INACTIVE_PRODUCT");
+  } finally {
+    await pool.execute("UPDATE products SET is_active = 1 WHERE id = ?", [
+      inactiveProductFixture.productId,
+    ]);
+  }
+  const [[afterInactiveProduct]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [inactiveProductFixture.productId, warehouseId],
+  );
+  assert.deepEqual(afterInactiveProduct, beforeInactiveProduct);
+  const [[noProductCancellation]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_cancellations WHERE sale_id = ?",
+    [inactiveProductFixture.created.id],
+  );
+  assert.equal(Number(noProductCancellation.count), 0);
+
+  const inactiveWarehouseFixture = await createConfirmedReversalFixture();
+  await pool.execute("UPDATE warehouses SET is_active = 0 WHERE id = ?", [
+    warehouseId,
+  ]);
+  try {
+    const response = await mutate(
+      "post",
+      `/api/v1/sales/${inactiveWarehouseFixture.created.id}/reversal`,
+      reversalInput(inactiveWarehouseFixture.confirmed),
+      sessions.administrator,
+      `reversal-inactive-warehouse-${inactiveWarehouseFixture.fixture}`,
+    ).expect(409);
+    assert.equal(response.body.error.code, "INACTIVE_WAREHOUSE");
+  } finally {
+    await pool.execute("UPDATE warehouses SET is_active = 1 WHERE id = ?", [
+      warehouseId,
+    ]);
+  }
+});
+
+test("concurrent reversals create one compensation and no duplicate reintegration", async () => {
+  const fixture = await createConfirmedReversalFixture(3);
+  const race = await Promise.all([
+    mutate(
+      "post",
+      `/api/v1/sales/${fixture.created.id}/reversal`,
+      reversalInput(fixture.confirmed, { reference: "RACE-A" }),
+      sessions.administrator,
+      `reversal-race-a-${fixture.fixture}`,
+    ),
+    mutate(
+      "post",
+      `/api/v1/sales/${fixture.created.id}/reversal`,
+      reversalInput(fixture.confirmed, { reference: "RACE-B" }),
+      sessions.administrator,
+      `reversal-race-b-${fixture.fixture}`,
+    ),
+  ]);
+  assert.deepEqual(race.map(({ status }) => status).sort(), [200, 409]);
+  const [[cancellations]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_cancellations WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(Number(cancellations.count), 1);
+  const [[balances]] = await pool.execute(
+    "SELECT quantity FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.equal(Number(balances.quantity), 7);
+  const [[cancellation]] = await pool.execute(
+    "SELECT id FROM sale_cancellations WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  const [[operations]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM inventory_operations WHERE source_type = 'sale_cancellation' AND source_id = ?",
+    [String(cancellation.id)],
+  );
+  assert.equal(Number(operations.count), 1);
+});
+
+test("an inventory audit failure rolls back the reversal document, stock, and sale state", async () => {
+  const fixture = await createConfirmedReversalFixture();
+  const [[before]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  const failingPool = {
+    async getConnection() {
+      const connection = await pool.getConnection();
+      return new Proxy(connection, {
+        get(target, property) {
+          const value = target[property];
+          if (property === "execute")
+            return async (sql, values) => {
+              if (String(sql).includes("INSERT INTO audit_events"))
+                throw new Error("Injected test-only audit failure");
+              return value.call(target, sql, values);
+            };
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+  const service = createSaleService({ dbPool: failingPool });
+  await assert.rejects(
+    service.reverse({
+      id: fixture.created.id,
+      input: reversalInput(fixture.confirmed),
+      actor: {
+        user: { id: users.administrator },
+        warehouseIds: new Set([warehouseId]),
+      },
+      request: { ip: "127.0.0.1", get: () => "integration-test" },
+      key: `reversal-audit-failure-${fixture.fixture}`,
+    }),
+    /Injected test-only audit failure/,
+  );
+  const [[sale]] = await pool.execute(
+    "SELECT status, version FROM sales WHERE id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(sale.status, "confirmed");
+  assert.equal(Number(sale.version), fixture.confirmed.version);
+  const [[after]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.deepEqual(after, before);
+  const [[documents]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_cancellations WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(Number(documents.count), 0);
+  const [[compensations]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM inventory_operations WHERE idempotency_key = ?",
+    [`reversal-audit-failure-${fixture.fixture}`],
+  );
+  assert.equal(Number(compensations.count), 0);
 });
 
 test("confirmation enforces ownership, permissions, version, and strict request shape", async () => {

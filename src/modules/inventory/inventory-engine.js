@@ -11,6 +11,7 @@ const movementTypes = new Set([
   "purchase_receipt",
   "supplier_return",
   "sale_issue",
+  "sale_reversal",
 ]);
 const requiredPermissions = {
   initial_stock: "inventory.initialize",
@@ -20,6 +21,7 @@ const requiredPermissions = {
   purchase_receipt: "purchases.receive",
   supplier_return: "purchases.return",
   sale_issue: "sales.confirm",
+  sale_reversal: "sales.cancel",
 };
 
 function invalidRequest(
@@ -54,6 +56,7 @@ function normalizePayload(
     allowPurchaseReceipt = false,
     allowSupplierReturn = false,
     allowSaleIssue = false,
+    allowSaleReversal = false,
   } = {},
 ) {
   if (!payload || !movementTypes.has(payload.type)) {
@@ -66,6 +69,9 @@ function normalizePayload(
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   if (payload.type === "sale_issue" && !allowSaleIssue) {
+    throw invalidRequest("El tipo de operación no está habilitado.");
+  }
+  if (payload.type === "sale_reversal" && !allowSaleReversal) {
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   const sourceWarehouseId = normalizeId(payload.sourceWarehouseId, "bodega");
@@ -115,9 +121,22 @@ function normalizePayload(
     throw invalidRequest("La venta requiere una referencia comercial válida.");
   }
   if (
-    !["purchase_receipt", "supplier_return", "sale_issue"].includes(
-      payload.type,
-    ) &&
+    payload.type === "sale_reversal" &&
+    (sourceType !== "sale_cancellation" ||
+      typeof sourceId !== "string" ||
+      !/^[1-9]\d{0,19}$/.test(sourceId))
+  ) {
+    throw invalidRequest(
+      "La anulación requiere un documento comercial válido.",
+    );
+  }
+  if (
+    ![
+      "purchase_receipt",
+      "supplier_return",
+      "sale_issue",
+      "sale_reversal",
+    ].includes(payload.type) &&
     (sourceType !== null || sourceId !== null)
   ) {
     throw invalidRequest(
@@ -317,6 +336,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     request,
     internal = false,
     allowSaleIssue = false,
+    allowSaleReversal = false,
     validateProducts,
   }) {
     if (!connection || typeof connection.execute !== "function") {
@@ -342,6 +362,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
       allowPurchaseReceipt: internal,
       allowSupplierReturn: internal,
       allowSaleIssue: internal && allowSaleIssue,
+      allowSaleReversal: internal && allowSaleReversal,
     });
     const requestHash = hashRequest(userId, payload);
     const { assignments } = await validateActorAndWarehouses(
@@ -390,10 +411,10 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     const productsById = new Map(
       products.map((product) => [String(product.id), product]),
     );
-    if (payload.type === "sale_issue") {
+    if (["sale_issue", "sale_reversal"].includes(payload.type)) {
       if (
         !internal ||
-        !allowSaleIssue ||
+        !(allowSaleIssue || allowSaleReversal) ||
         typeof validateProducts !== "function"
       ) {
         throw invalidRequest("La operación comercial no está habilitada.");

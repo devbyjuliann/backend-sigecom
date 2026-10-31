@@ -78,3 +78,33 @@ test("purchase receipt ledger operations preserve their commercial source associ
   assert.equal(payload.sourceId, "9007199254740993");
   assert.equal(payload.lines[0].expectedVersion, "0");
 });
+
+test("sale reversal inventory operations require an internal cancellation document", () => {
+  const input = {
+    type: "sale_reversal",
+    sourceWarehouseId: "17",
+    destinationWarehouseId: null,
+    sourceType: "sale_cancellation",
+    sourceId: "9007199254740993",
+    reason: "La mercancía no salió físicamente.",
+    reference: "ACTA-42",
+    lines: [
+      { productId: "9007199254740995", quantity: 3, expectedVersion: "8" },
+    ],
+  };
+
+  assert.throws(
+    () => inventoryEngineValidation.normalizePayload(input),
+    /no está habilitado/i,
+  );
+  assert.throws(
+    () => inventoryEngineValidation.normalizePayload(input, { internal: true }),
+    /no está habilitado/i,
+  );
+  const payload = inventoryEngineValidation.normalizePayload(input, {
+    allowSaleReversal: true,
+  });
+  assert.equal(payload.type, "sale_reversal");
+  assert.equal(payload.sourceType, "sale_cancellation");
+  assert.equal(payload.sourceId, "9007199254740993");
+});

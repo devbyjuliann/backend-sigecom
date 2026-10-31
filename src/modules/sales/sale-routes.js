@@ -3,6 +3,7 @@ import { z } from "zod";
 import { authenticate, requirePermission } from "../auth/auth-middleware.js";
 import { HttpError } from "../../shared/http-error.js";
 import { createSaleService } from "./sale-service.js";
+import { createSaleReversalPdf } from "./sale-reversal-pdf.js";
 
 const idPattern = /^[1-9]\d{0,19}$/;
 const moneyPattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/;
@@ -69,6 +70,17 @@ const cancelSchema = z
 const confirmationSchema = z
   .object({
     expectedVersion: z.number().int().min(1).max(2_147_483_647),
+  })
+  .strict();
+const reversalSchema = z
+  .object({
+    expectedVersion: z.number().int().min(1).max(2_147_483_647),
+    reason: z.string().trim().min(3).max(500),
+    reference: z.string().trim().min(1).max(120),
+    physicalObservation: z.string().trim().min(3).max(1000),
+    neverDispatched: z.literal(true),
+    allQuantitiesPresent: z.literal(true),
+    allProductsSaleable: z.literal(true),
   })
   .strict();
 const listSchema = z
@@ -226,6 +238,62 @@ export function createSaleRouter({ dbPool, authConfig }) {
         key: idempotencyKey(request),
       });
       response.json(sale);
+    },
+  );
+
+  router.get(
+    "/:id/reversal",
+    auth,
+    requirePermission("sales.read"),
+    async (request, response) => {
+      if (!idPattern.test(request.params.id))
+        throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
+      response.set("Cache-Control", "no-store").json(
+        await service.getReversal({
+          saleId: request.params.id,
+          warehouseIds: [...request.auth.warehouseIds],
+        }),
+      );
+    },
+  );
+
+  router.get(
+    "/:id/reversal/pdf",
+    auth,
+    requirePermission("sales.read"),
+    async (request, response) => {
+      if (!idPattern.test(request.params.id))
+        throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
+      const reversal = await service.getReversal({
+        saleId: request.params.id,
+        warehouseIds: [...request.auth.warehouseIds],
+      });
+      const pdf = createSaleReversalPdf(reversal);
+      response
+        .set("Cache-Control", "no-store")
+        .type("application/pdf")
+        .attachment(`anulacion-venta-${request.params.id}.pdf`)
+        .send(pdf);
+    },
+  );
+
+  router.post(
+    "/:id/reversal",
+    auth,
+    requirePermission("sales.cancel"),
+    async (request, response) => {
+      if (!idPattern.test(request.params.id))
+        throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
+      const input = parse(reversalSchema, request.body);
+      response.status(200).json(
+        await service.reverse({
+          id: request.params.id,
+          input,
+          actor: request.auth,
+          request,
+          key: idempotencyKey(request),
+        }),
+      );
     },
   );
 

@@ -64,6 +64,9 @@ try {
     `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`sales\` TO '${appUser}'@'127.0.0.1'`,
   );
   await connection.query(
+    `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`sale_cancellations\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
     `GRANT SELECT, INSERT, UPDATE, DELETE ON \`${target.database}\`.\`sale_lines\` TO '${appUser}'@'127.0.0.1'`,
   );
   await connection.query(

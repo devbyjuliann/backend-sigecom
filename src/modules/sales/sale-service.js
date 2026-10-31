@@ -36,6 +36,10 @@ function hashRequest(operation, saleId, input) {
     .digest("hex");
 }
 
+function reversalConflict(code, message) {
+  return new HttpError(409, code, message);
+}
+
 function placeholders(values) {
   return values.map(() => "?").join(", ");
 }
@@ -62,6 +66,7 @@ function toSale(row, lines = []) {
     saleDate: row.sale_date,
     notes: row.notes,
     status: row.status,
+    warehouseIsActive: Boolean(row.sale_warehouse_is_active),
     version: Number(row.version),
     total: money(total),
     lines: lines.map((line) => ({
@@ -100,13 +105,15 @@ const saleSelect = `
          updater.display_name AS updated_by_name,
          canceller.display_name AS cancelled_by_name,
          confirmer.display_name AS confirmed_by_name,
+         sale_warehouse.is_active AS sale_warehouse_is_active,
          operation.id AS source_operation_id
   FROM sales AS s
   JOIN users AS creator ON creator.id = s.created_by
   JOIN users AS updater ON updater.id = s.updated_by
-   LEFT JOIN users AS canceller ON canceller.id = s.cancelled_by
-   LEFT JOIN users AS confirmer ON confirmer.id = s.confirmed_by
-   LEFT JOIN inventory_operations AS operation
+  LEFT JOIN users AS canceller ON canceller.id = s.cancelled_by
+  LEFT JOIN users AS confirmer ON confirmer.id = s.confirmed_by
+  LEFT JOIN warehouses AS sale_warehouse ON sale_warehouse.id = s.warehouse_id
+  LEFT JOIN inventory_operations AS operation
      ON BINARY operation.source_type = BINARY 'sale'
     AND BINARY operation.source_id = BINARY CAST(s.id AS CHAR)`;
 
@@ -141,6 +148,419 @@ async function writeAudit(
 
 export function createSaleService({ dbPool }) {
   const inventoryEngine = createInventoryEngine({ dbPool });
+
+  async function loadReversal(connection, saleId, warehouseIds) {
+    if (!warehouseIds.length)
+      throw new HttpError(
+        404,
+        "SALE_REVERSAL_NOT_FOUND",
+        "No se encontró la anulación disponible.",
+      );
+    const [rows] = await connection.execute(
+      `SELECT sc.id, sc.sale_id, sc.verification_reference,
+              sc.physical_observation, sc.never_dispatched,
+              sc.all_quantities_present, sc.all_products_saleable,
+              sc.source_operation_id, sc.created_at AS document_created_at,
+              s.commercial_code, DATE_FORMAT(s.sale_date, '%Y-%m-%d') AS sale_date,
+              s.customer_name_snapshot, s.warehouse_name_snapshot,
+              s.cancellation_reason, s.cancelled_at,
+              actor.display_name AS cancelled_by_name
+       FROM sale_cancellations sc
+       JOIN sales s ON s.id = sc.sale_id
+       JOIN users actor ON actor.id = s.cancelled_by
+       WHERE sc.sale_id = ?
+         AND s.warehouse_id IN (${placeholders(warehouseIds)})
+       LIMIT 1`,
+      [saleId, ...warehouseIds],
+    );
+    const row = rows[0];
+    if (!row)
+      throw new HttpError(
+        404,
+        "SALE_REVERSAL_NOT_FOUND",
+        "No se encontró la anulación disponible.",
+      );
+    const lines = await getLines(connection, saleId);
+    return {
+      id: String(row.id),
+      saleId: String(row.sale_id),
+      saleNumber: row.commercial_code,
+      saleDate: row.sale_date,
+      customerName: row.customer_name_snapshot,
+      warehouseName: row.warehouse_name_snapshot,
+      reason: row.cancellation_reason,
+      verificationReference: row.verification_reference,
+      physicalObservation: row.physical_observation,
+      neverDispatched: Boolean(row.never_dispatched),
+      allQuantitiesPresent: Boolean(row.all_quantities_present),
+      allProductsSaleable: Boolean(row.all_products_saleable),
+      sourceOperationId:
+        row.source_operation_id === null
+          ? null
+          : String(row.source_operation_id),
+      cancelledByName: row.cancelled_by_name,
+      cancelledAt: row.cancelled_at,
+      createdAt: row.document_created_at,
+      lines: lines.map((line) => ({
+        id: String(line.id),
+        productId: String(line.product_id),
+        sku: line.sku_snapshot,
+        name: line.product_name_snapshot,
+        unit: line.unit_snapshot,
+        quantity: Number(line.quantity),
+        unitPrice: String(line.unit_price),
+        lineTotal: String(line.line_total),
+      })),
+    };
+  }
+
+  async function readReversalReplay(
+    connection,
+    { actorId, key, requestHash, warehouseIds },
+  ) {
+    const [rows] = await connection.execute(
+      `SELECT operation, request_hash, sale_id, reversal_id
+       FROM sale_requests WHERE actor_id = ? AND idempotency_key = ?
+       LIMIT 1 FOR UPDATE`,
+      [actorId, key],
+    );
+    const prior = rows[0];
+    if (!prior) return null;
+    if (
+      prior.operation !== "reversal" ||
+      prior.request_hash !== requestHash ||
+      prior.reversal_id === null
+    )
+      throw reversalConflict(
+        "IDEMPOTENCY_KEY_REUSED",
+        "La clave de idempotencia ya se utilizó con otros datos.",
+      );
+    const sale = await loadSale(connection, prior.sale_id, warehouseIds);
+    const reversal = await loadReversal(
+      connection,
+      prior.sale_id,
+      warehouseIds,
+    );
+    return { sale, reversal };
+  }
+
+  async function assertReversalActor(connection, actorId) {
+    const [users] = await connection.execute(
+      `SELECT u.id, u.is_active, role.code AS role_code
+       FROM users u JOIN roles role ON role.id = u.role_id
+       WHERE u.id = ? FOR UPDATE`,
+      [actorId],
+    );
+    if (!users[0] || !users[0].is_active)
+      throw new HttpError(
+        401,
+        "SESSION_INVALID",
+        "La sesión no es válida o ha vencido.",
+      );
+    if (users[0].role_code !== "administrator")
+      throw new HttpError(
+        403,
+        "PERMISSION_DENIED",
+        "Solo un Administrador puede anular una venta confirmada.",
+      );
+    const [permissions] = await connection.execute(
+      `SELECT 1 FROM role_permissions rp
+       JOIN permissions p ON p.id = rp.permission_id
+       JOIN users u ON u.role_id = rp.role_id
+       WHERE u.id = ? AND p.code = 'sales.cancel'
+       LOCK IN SHARE MODE`,
+      [actorId],
+    );
+    if (!permissions.length)
+      throw new HttpError(
+        403,
+        "PERMISSION_DENIED",
+        "No tienes permiso para anular ventas.",
+      );
+  }
+
+  async function assertReversalWarehouse(connection, actorId, warehouseId) {
+    const [rows] = await connection.execute(
+      `SELECT w.id, w.is_active FROM warehouses w
+       JOIN user_warehouses uw ON uw.warehouse_id = w.id AND uw.user_id = ?
+       WHERE w.id = ? FOR UPDATE`,
+      [actorId, warehouseId],
+    );
+    if (!rows[0])
+      throw new HttpError(
+        404,
+        "SALE_NOT_FOUND",
+        "No se encontró la venta disponible.",
+      );
+    if (!rows[0].is_active)
+      throw reversalConflict(
+        "INACTIVE_WAREHOUSE",
+        "No se puede anular una venta de una bodega inactiva.",
+      );
+  }
+
+  async function getReversal({ saleId, warehouseIds }) {
+    return loadReversal(dbPool, saleId, warehouseIds);
+  }
+
+  async function reverseAttempt({ id, input, actor, request, key }) {
+    const connection = await dbPool.getConnection();
+    const requestHash = hashRequest("reversal", id, input);
+    try {
+      await connection.beginTransaction();
+      await assertReversalActor(connection, actor.user.id);
+      const [sales] = await connection.execute(
+        "SELECT * FROM sales WHERE id = ? FOR UPDATE",
+        [id],
+      );
+      const sale = sales[0];
+      if (!sale)
+        throw new HttpError(
+          404,
+          "SALE_NOT_FOUND",
+          "No se encontró la venta disponible.",
+        );
+      await assertReversalWarehouse(
+        connection,
+        actor.user.id,
+        String(sale.warehouse_id),
+      );
+
+      const replayed = await readReversalReplay(connection, {
+        actorId: actor.user.id,
+        key,
+        requestHash,
+        warehouseIds: [...actor.warehouseIds],
+      });
+      if (replayed) {
+        await connection.commit();
+        return replayed;
+      }
+      if (sale.status !== "confirmed")
+        throw reversalConflict(
+          "SALE_NOT_REVERSIBLE",
+          "Solo se pueden anular ventas confirmadas que no tengan operaciones posteriores.",
+        );
+      if (Number(sale.version) !== input.expectedVersion)
+        throw reversalConflict(
+          "SALE_VERSION_CONFLICT",
+          "La venta cambió. Actualiza el documento antes de anularlo.",
+        );
+
+      const [existingReversals] = await connection.execute(
+        "SELECT id FROM sale_cancellations WHERE sale_id = ? LIMIT 1 FOR UPDATE",
+        [id],
+      );
+      if (existingReversals.length)
+        throw reversalConflict(
+          "SALE_ALREADY_REVERSED",
+          "Esta venta ya tiene una anulación registrada.",
+        );
+
+      const [sourceOperations] = await connection.execute(
+        `SELECT id, operation_type, source_warehouse_id, created_by
+         FROM inventory_operations
+         WHERE source_type = 'sale' AND source_id = ? LIMIT 1 FOR UPDATE`,
+        [id],
+      );
+      const issue = sourceOperations[0];
+      if (
+        !issue ||
+        issue.operation_type !== "sale_issue" ||
+        String(issue.source_warehouse_id) !== String(sale.warehouse_id) ||
+        String(issue.created_by) !== String(sale.confirmed_by)
+      )
+        throw reversalConflict(
+          "SALE_ISSUE_INVALID",
+          "No se encontró una salida de inventario válida para esta venta.",
+        );
+      const lines = await getLines(connection, id);
+      const [issueMovements] = await connection.execute(
+        `SELECT product_id, warehouse_id, direction, quantity, unit_snapshot
+         FROM inventory_movements WHERE operation_id = ? ORDER BY product_id FOR UPDATE`,
+        [issue.id],
+      );
+      if (issueMovements.length !== lines.length)
+        throw reversalConflict(
+          "SALE_ISSUE_INVALID",
+          "La salida de inventario no coincide con las líneas originales de la venta.",
+        );
+      const issuesByProduct = new Map(
+        issueMovements.map((movement) => [
+          String(movement.product_id),
+          movement,
+        ]),
+      );
+      for (const line of lines) {
+        const movement = issuesByProduct.get(String(line.product_id));
+        if (
+          !movement ||
+          movement.direction !== "OUT" ||
+          Number(movement.quantity) !== Number(line.quantity) ||
+          String(movement.warehouse_id) !== String(sale.warehouse_id) ||
+          movement.unit_snapshot !== line.unit_snapshot
+        )
+          throw reversalConflict(
+            "SALE_ISSUE_INVALID",
+            "La salida de inventario no coincide con las líneas originales de la venta.",
+          );
+      }
+
+      const [inserted] = await connection.execute(
+        `INSERT INTO sale_cancellations
+          (sale_id, verification_reference, physical_observation,
+           never_dispatched, all_quantities_present, all_products_saleable)
+         VALUES (?, ?, ?, 1, 1, 1)`,
+        [id, input.reference, input.physicalObservation],
+      );
+      const reversalId = String(inserted.insertId);
+      const inventoryLines = [];
+      for (const line of lines) {
+        const [balances] = await connection.execute(
+          `SELECT CAST(version AS CHAR) AS version
+           FROM inventory_balances
+           WHERE product_id = ? AND warehouse_id = ? FOR UPDATE`,
+          [line.product_id, sale.warehouse_id],
+        );
+        if (!balances[0])
+          throw reversalConflict(
+            "INVENTORY_HISTORY_INCONSISTENT",
+            "No se encontró el saldo de inventario asociado a la venta.",
+          );
+        inventoryLines.push({
+          productId: String(line.product_id),
+          quantity: Number(line.quantity),
+          expectedVersion: String(balances[0].version),
+        });
+      }
+
+      const inventoryResult = await inventoryEngine.applyWithinTransaction({
+        connection,
+        userId: actor.user.id,
+        idempotencyKey: key,
+        payload: {
+          type: "sale_reversal",
+          sourceWarehouseId: String(sale.warehouse_id),
+          destinationWarehouseId: null,
+          sourceType: "sale_cancellation",
+          sourceId: reversalId,
+          reason: input.reason,
+          reference: input.reference,
+          lines: inventoryLines,
+        },
+        internal: true,
+        allowSaleReversal: true,
+        request,
+        validateProducts: async ({ products }) => {
+          for (const line of lines) {
+            const product = products.get(String(line.product_id));
+            if (!product || product.unit !== line.unit_snapshot)
+              throw reversalConflict(
+                "SALE_PRODUCT_CHANGED",
+                `El producto ${line.product_name_snapshot} está inactivo o su unidad cambió; no se puede reintegrar la venta.`,
+              );
+          }
+        },
+      });
+      await connection.execute(
+        "UPDATE sale_cancellations SET source_operation_id = ? WHERE id = ? AND source_operation_id IS NULL",
+        [inventoryResult.operationId, reversalId],
+      );
+      const [updated] = await connection.execute(
+        `UPDATE sales SET status = 'cancelled', cancelled_by = ?,
+           cancelled_at = UTC_TIMESTAMP(3), cancellation_reason = ?,
+           updated_by = ?, version = version + 1
+         WHERE id = ? AND status = 'confirmed' AND version = ?`,
+        [actor.user.id, input.reason, actor.user.id, id, input.expectedVersion],
+      );
+      if (updated.affectedRows !== 1)
+        throw reversalConflict(
+          "SALE_VERSION_CONFLICT",
+          "La venta cambió. Actualiza el documento antes de anularlo.",
+        );
+      await writeAudit(connection, {
+        userId: actor.user.id,
+        action: "sales.reversed",
+        saleId: id,
+        details: {
+          reversalId,
+          expectedVersion: input.expectedVersion,
+          version: input.expectedVersion + 1,
+          sourceIssueOperationId: String(issue.id),
+          sourceOperationId: inventoryResult.operationId,
+          warehouseId: String(sale.warehouse_id),
+          reference: input.reference,
+          physicalObservation: input.physicalObservation,
+          neverDispatched: true,
+          allQuantitiesPresent: true,
+          allProductsSaleable: true,
+          lines: lines.map((line) => ({
+            productId: String(line.product_id),
+            quantity: Number(line.quantity),
+            unit: line.unit_snapshot,
+          })),
+        },
+        request,
+      });
+      const updatedSale = await loadSale(connection, id, [
+        ...actor.warehouseIds,
+      ]);
+      await connection.execute(
+        `INSERT INTO sale_requests
+          (actor_id, idempotency_key, operation, request_hash, sale_id,
+           reversal_id, response_version)
+         VALUES (?, ?, 'reversal', ?, ?, ?, ?)`,
+        [actor.user.id, key, requestHash, id, reversalId, updatedSale.version],
+      );
+      const reversal = await loadReversal(connection, id, [
+        ...actor.warehouseIds,
+      ]);
+      await connection.commit();
+      return { sale: updatedSale, reversal };
+    } catch (error) {
+      try {
+        await connection.rollback();
+      } catch {
+        // Preserve the original transaction error.
+      }
+      if (
+        error.code === "ER_DUP_ENTRY" &&
+        String(error.message).includes("uq_sale_requests_actor_key")
+      ) {
+        const replay = await readReversalReplay(dbPool, {
+          actorId: actor.user.id,
+          key,
+          requestHash,
+          warehouseIds: [...actor.warehouseIds],
+        });
+        if (replay) return replay;
+      }
+      if (
+        error.code === "ER_DUP_ENTRY" &&
+        String(error.message).includes("uq_sale_cancellations_sale")
+      )
+        throw reversalConflict(
+          "SALE_ALREADY_REVERSED",
+          "Esta venta ya tiene una anulación registrada.",
+        );
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  async function reverse(args) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await reverseAttempt(args);
+      } catch (error) {
+        if (![1213, 1205].includes(error.errno) || attempt >= 2) throw error;
+        attempt += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20 * attempt));
+      }
+    }
+  }
   async function assertWriteWarehouse(connection, userId, warehouseId) {
     const [rows] = await connection.execute(
       `SELECT w.id, w.code, w.name, w.location, w.is_active
@@ -777,13 +1197,36 @@ export function createSaleService({ dbPool }) {
           allowSaleIssue: true,
           request,
         });
-        if (sale.status !== "confirmed")
-          throw new HttpError(
-            500,
-            "SALE_INVENTORY_INCONSISTENT",
-            "Existe un descuento de inventario sin confirmación documental.",
-          );
         if (result.replayed) {
+          if (sale.status === "cancelled") {
+            const [reversals] = await connection.execute(
+              `SELECT sc.id FROM sale_cancellations sc
+               JOIN inventory_operations reversal
+                 ON reversal.id = sc.source_operation_id
+               WHERE sc.sale_id = ?
+                 AND reversal.operation_type = 'sale_reversal'
+                 AND reversal.source_type = 'sale_cancellation'
+               LIMIT 1`,
+              [id],
+            );
+            if (!reversals[0])
+              throw new HttpError(
+                500,
+                "SALE_INVENTORY_INCONSISTENT",
+                "Existe un descuento de inventario sin una anulación compensatoria válida.",
+              );
+            const replayed = await loadSale(connection, id, [
+              ...actor.warehouseIds,
+            ]);
+            await connection.commit();
+            return replayed;
+          }
+          if (sale.status !== "confirmed")
+            throw new HttpError(
+              500,
+              "SALE_INVENTORY_INCONSISTENT",
+              "Existe un descuento de inventario sin confirmación documental.",
+            );
           const replayed = await loadSale(connection, id, [
             ...actor.warehouseIds,
           ]);
@@ -946,5 +1389,5 @@ export function createSaleService({ dbPool }) {
     }
   }
 
-  return { list, getById, write, confirm };
+  return { list, getById, getReversal, write, confirm, reverse };
 }
