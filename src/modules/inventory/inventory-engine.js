@@ -9,6 +9,7 @@ const movementTypes = new Set([
   "adjustment_out",
   "transfer",
   "purchase_receipt",
+  "supplier_return",
 ]);
 const requiredPermissions = {
   initial_stock: "inventory.initialize",
@@ -16,6 +17,7 @@ const requiredPermissions = {
   adjustment_out: "inventory.adjust",
   transfer: "inventory.transfer",
   purchase_receipt: "purchases.receive",
+  supplier_return: "purchases.return",
 };
 
 function invalidRequest(
@@ -44,11 +46,17 @@ function normalizeVersion(value) {
   return value;
 }
 
-function normalizePayload(payload, { allowPurchaseReceipt = false } = {}) {
+function normalizePayload(
+  payload,
+  { allowPurchaseReceipt = false, allowSupplierReturn = false } = {},
+) {
   if (!payload || !movementTypes.has(payload.type)) {
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   if (payload.type === "purchase_receipt" && !allowPurchaseReceipt) {
+    throw invalidRequest("El tipo de operación no está habilitado.");
+  }
+  if (payload.type === "supplier_return" && !allowSupplierReturn) {
     throw invalidRequest("El tipo de operación no está habilitado.");
   }
   const sourceWarehouseId = normalizeId(payload.sourceWarehouseId, "bodega");
@@ -79,7 +87,18 @@ function normalizePayload(payload, { allowPurchaseReceipt = false } = {}) {
     );
   }
   if (
-    payload.type !== "purchase_receipt" &&
+    payload.type === "supplier_return" &&
+    (sourceType !== "supplier_return" ||
+      typeof sourceId !== "string" ||
+      !sourceId.trim() ||
+      sourceId.length > 128)
+  ) {
+    throw invalidRequest(
+      "La devolución requiere una referencia comercial válida.",
+    );
+  }
+  if (
+    !["purchase_receipt", "supplier_return"].includes(payload.type) &&
     (sourceType !== null || sourceId !== null)
   ) {
     throw invalidRequest(
@@ -300,6 +319,7 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
     const idempotencyKey = rawIdempotencyKey.trim();
     const payload = normalizePayload(rawPayload, {
       allowPurchaseReceipt: internal,
+      allowSupplierReturn: internal,
     });
     const requestHash = hashRequest(userId, payload);
     const { assignments } = await validateActorAndWarehouses(
@@ -509,7 +529,11 @@ export function createInventoryEngine({ dbPool, retryLimit = 2 }) {
           : [
               {
                 warehouseId: payload.sourceWarehouseId,
-                direction: payload.type === "adjustment_out" ? "OUT" : "IN",
+                direction: ["adjustment_out", "supplier_return"].includes(
+                  payload.type,
+                )
+                  ? "OUT"
+                  : "IN",
               },
             ];
 

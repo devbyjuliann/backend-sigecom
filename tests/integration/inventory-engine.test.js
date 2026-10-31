@@ -144,6 +144,84 @@ test("internal ledger operations are atomic, versioned and idempotent", async ()
   assert.equal(Number(count.total), 2);
 });
 
+test("supplier returns are allowed only internally and create outbound movements", async () => {
+  const [product] = await pool.execute(
+    `INSERT INTO products
+      (sku, name, category_id, unit, purchase_price, sale_price)
+     VALUES (?, ?, ?, 'unidad', 10.00, 20.00)`,
+    [`SUPRET-${suffix}`, `Producto devolución ${suffix}`, categoryId],
+  );
+  const returnProductId = String(product.insertId);
+  await engine.createOperation({
+    userId,
+    idempotencyKey: `supplier-return-opening-${suffix}`,
+    payload: {
+      ...initialPayload(6),
+      lines: [{ productId: returnProductId, quantity: 6 }],
+    },
+  });
+
+  const payload = {
+    type: "supplier_return",
+    sourceWarehouseId: warehouseId,
+    destinationWarehouseId: null,
+    sourceType: "supplier_return",
+    sourceId: `return-${suffix}`,
+    reason: "Devolución de prueba",
+    reference: `DEV-${suffix}`,
+    lines: [{ productId: returnProductId, quantity: 2, expectedVersion: "1" }],
+  };
+  await assert.rejects(
+    engine.createOperation({
+      userId,
+      idempotencyKey: `supplier-return-public-${suffix}`,
+      payload,
+    }),
+    (error) => error.code === "INVALID_INVENTORY_OPERATION",
+  );
+
+  const connection = await pool.getConnection();
+  let returned;
+  try {
+    await connection.beginTransaction();
+    returned = await engine.applyWithinTransaction({
+      connection,
+      userId,
+      idempotencyKey: `supplier-return-internal-${suffix}`,
+      payload,
+      internal: true,
+    });
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+
+  assert.equal(returned.replayed, false);
+  assert.deepEqual(
+    returned.movements.map(
+      ({ direction, quantity, balanceBefore, balanceAfter }) => [
+        direction,
+        quantity,
+        balanceBefore,
+        balanceAfter,
+      ],
+    ),
+    [["OUT", 2, 6, 4]],
+  );
+  const [[operation]] = await pool.execute(
+    `SELECT operation_type, source_type, source_id
+     FROM inventory_operations WHERE id = ?`,
+    [returned.operationId],
+  );
+  assert.deepEqual(
+    [operation.operation_type, operation.source_type, operation.source_id],
+    ["supplier_return", "supplier_return", `return-${suffix}`],
+  );
+});
+
 test("inventory writes reject legacy balances and adjustment-based openings", async () => {
   const [product] = await pool.execute(
     `INSERT INTO products

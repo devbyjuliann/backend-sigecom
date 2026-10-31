@@ -8,6 +8,7 @@ import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { createInventoryService } from "../../src/modules/inventory/inventory-service.js";
+import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -38,6 +39,68 @@ function orderInput(overrides = {}) {
     lines: [{ productId, quantity: 4, unitCost: "100.25" }],
     ...overrides,
   };
+}
+
+async function createReceivedOrder({
+  orderQuantity = 4,
+  receiptQuantity = orderQuantity,
+  selectedProductId = null,
+} = {}) {
+  if (!selectedProductId) {
+    const [product] = await pool.execute(
+      `INSERT INTO products
+        (sku, name, category_id, unit, purchase_price, sale_price)
+       VALUES (?, ?, ?, 'caja', 100.00, 150.00)`,
+      [
+        `RET-${randomBytes(6).toString("hex").toUpperCase()}`,
+        `Producto devolución ${suffix}`,
+        categoryId,
+      ],
+    );
+    selectedProductId = String(product.insertId);
+  }
+  const created = await mutate("post", "/api/v1/purchase-orders", {
+    ...orderInput({
+      lines: [
+        {
+          productId: selectedProductId,
+          quantity: orderQuantity,
+          unitCost: "100.25",
+        },
+      ],
+    }),
+  }).expect(201);
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/confirmation`,
+    { expectedVersion: created.body.version, confirmZeroCost: false },
+  ).expect(200);
+  const receiptRequest = mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/receipts`,
+    {
+      expectedVersion: confirmed.body.version,
+      reference: `REC-${suffix}-${randomBytes(3).toString("hex")}`,
+      lines: [
+        {
+          purchaseOrderLineId: confirmed.body.lines[0].id,
+          quantity: receiptQuantity,
+        },
+      ],
+    },
+  ).set("Idempotency-Key", `return-receipt-${randomBytes(12).toString("hex")}`);
+  const receipt = await receiptRequest;
+  assert.equal(receipt.status, 201);
+  return { created, confirmed, receipt, productId: selectedProductId };
+}
+
+function returnRequest(orderId, receiptId, body, session, key) {
+  return mutate(
+    "post",
+    `/api/v1/purchase-orders/${orderId}/receipts/${receiptId}/returns`,
+    body,
+    session,
+  ).set("Idempotency-Key", key);
 }
 const accountRoles = {
   administrator: "administrator",
@@ -925,6 +988,925 @@ test("a confirmed purchase order records a partial receipt through its inventory
     warehouseId,
   });
   assert.equal(reconciliation.consistent, true);
+});
+
+test("partial purchase closure is idempotent, audited, versioned, and inventory-neutral", async () => {
+  const created = await mutate("post", "/api/v1/purchase-orders", {
+    ...orderInput({
+      lines: [
+        { productId, quantity: 4, unitCost: "100.25" },
+        { productId: zeroCostProductId, quantity: 3, unitCost: "0.00" },
+      ],
+    }),
+  }).expect(201);
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/confirmation`,
+    { expectedVersion: created.body.version, confirmZeroCost: true },
+  ).expect(200);
+  await mutate("post", `/api/v1/purchase-orders/${created.body.id}/receipts`, {
+    expectedVersion: confirmed.body.version,
+    reference: `CIERRE-${suffix}`,
+    lines: [{ purchaseOrderLineId: confirmed.body.lines[0].id, quantity: 1 }],
+  })
+    .set("Idempotency-Key", `closure-receipt-${suffix}`)
+    .expect(201);
+  const beforeOrder = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+  const [[beforeInventory]] = await pool.execute(
+    `SELECT (SELECT COALESCE(SUM(quantity), 0) FROM inventory_balances
+             WHERE warehouse_id = ? AND product_id IN (?, ?)) AS quantity,
+            (SELECT COUNT(*) FROM inventory_movements
+             WHERE warehouse_id = ? AND product_id IN (?, ?)) AS movements`,
+    [
+      warehouseId,
+      productId,
+      zeroCostProductId,
+      warehouseId,
+      productId,
+      zeroCostProductId,
+    ],
+  );
+
+  const input = {
+    expectedVersion: beforeOrder.body.version,
+    reason: "Proveedor no entregará el saldo",
+  };
+  const closed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/closure`,
+    input,
+  )
+    .set("Idempotency-Key", `purchase-closure-${suffix}`)
+    .expect(200);
+  assert.equal(closed.body.closure.reason, input.reason);
+  assert.equal(closed.body.closure.closedBy, users.administrator);
+  assert.equal(closed.body.version, beforeOrder.body.version + 1);
+  assert.deepEqual(
+    closed.body.lines.map(
+      ({ quantity, receivedQuantity, closedQuantity, pendingQuantity }) => [
+        quantity,
+        receivedQuantity,
+        closedQuantity,
+        pendingQuantity,
+      ],
+    ),
+    [
+      [4, 1, 3, 0],
+      [3, 0, 3, 0],
+    ],
+  );
+
+  const replay = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/closure`,
+    input,
+  )
+    .set("Idempotency-Key", `purchase-closure-${suffix}`)
+    .expect(200);
+  assert.equal(replay.body.replayed, true);
+  assert.equal(replay.body.version, closed.body.version);
+  await mutate("post", `/api/v1/purchase-orders/${created.body.id}/closure`, {
+    ...input,
+    reason: "Otro motivo diferente",
+  })
+    .set("Idempotency-Key", `purchase-closure-${suffix}`)
+    .expect(409);
+  await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/closure`,
+    input,
+  )
+    .set("Idempotency-Key", `purchase-closure-otra-${suffix}`)
+    .expect(409);
+  await mutate("post", `/api/v1/purchase-orders/${created.body.id}/receipts`, {
+    expectedVersion: closed.body.version,
+    reference: `POST-CIERRE-${suffix}`,
+    lines: [{ purchaseOrderLineId: confirmed.body.lines[0].id, quantity: 1 }],
+  })
+    .set("Idempotency-Key", `receipt-after-closure-${suffix}`)
+    .expect(409);
+
+  const detail = await get(`/api/v1/purchase-orders/${created.body.id}`).expect(
+    200,
+  );
+  assert.equal(detail.body.closure.reason, input.reason);
+  const listed = await get(
+    `/api/v1/purchase-orders?q=${created.body.number}`,
+  ).expect(200);
+  assert.deepEqual(
+    listed.body.items[0].lines.map(({ closedQuantity, pendingQuantity }) => [
+      closedQuantity,
+      pendingQuantity,
+    ]),
+    [
+      [3, 0],
+      [3, 0],
+    ],
+  );
+  const [[afterInventory]] = await pool.execute(
+    `SELECT (SELECT COALESCE(SUM(quantity), 0) FROM inventory_balances
+             WHERE warehouse_id = ? AND product_id IN (?, ?)) AS quantity,
+            (SELECT COUNT(*) FROM inventory_movements
+             WHERE warehouse_id = ? AND product_id IN (?, ?)) AS movements`,
+    [
+      warehouseId,
+      productId,
+      zeroCostProductId,
+      warehouseId,
+      productId,
+      zeroCostProductId,
+    ],
+  );
+  assert.deepEqual(
+    [afterInventory.quantity, afterInventory.movements],
+    [beforeInventory.quantity, beforeInventory.movements],
+  );
+  const [[audit]] = await pool.execute(
+    "SELECT COUNT(*) AS total FROM audit_events WHERE action = 'purchases.order_closed' AND entity_id = ?",
+    [created.body.id],
+  );
+  assert.equal(Number(audit.total), 1);
+});
+
+test("purchase closure rejects invalid state, version, authorization, and reason", async () => {
+  const draft = await mutate(
+    "post",
+    "/api/v1/purchase-orders",
+    orderInput(),
+  ).expect(201);
+  const path = `/api/v1/purchase-orders/${draft.body.id}/closure`;
+  const closure = (
+    body,
+    session = sessions.administrator,
+    key = `reject-${suffix}`,
+  ) => mutate("post", path, body, session).set("Idempotency-Key", key);
+
+  await closure({
+    expectedVersion: draft.body.version,
+    reason: "No aplica",
+  }).expect(409);
+  await closure({ expectedVersion: draft.body.version, reason: " " }).expect(
+    400,
+  );
+  await closure(
+    { expectedVersion: draft.body.version, reason: "Motivo válido" },
+    sessions.warehouse,
+  ).expect(403);
+  await closure(
+    { expectedVersion: draft.body.version, reason: "Motivo válido" },
+    sessions.auditor,
+  ).expect(403);
+  await closure(
+    { expectedVersion: draft.body.version, reason: "Motivo válido" },
+    sessions.seller,
+  ).expect(403);
+  await closure(
+    { expectedVersion: draft.body.version, reason: "Motivo válido" },
+    sessions.unassignedAdministrator,
+  ).expect(404);
+
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${draft.body.id}/confirmation`,
+    { expectedVersion: draft.body.version, confirmZeroCost: false },
+  ).expect(200);
+  await closure(
+    { expectedVersion: confirmed.body.version + 1, reason: "Motivo válido" },
+    sessions.administrator,
+    `stale-${suffix}`,
+  ).expect(409);
+  await closure(
+    { expectedVersion: confirmed.body.version, reason: "Motivo válido" },
+    sessions.administrator,
+    `empty-${suffix}`,
+  ).expect(409);
+
+  await mutate(
+    "post",
+    `/api/v1/purchase-orders/${draft.body.id}/cancellation`,
+    {
+      expectedVersion: confirmed.body.version,
+      reason: "Cancelación previa",
+    },
+  ).expect(200);
+  await closure(
+    { expectedVersion: confirmed.body.version + 1, reason: "Motivo válido" },
+    sessions.administrator,
+    `cancelled-${suffix}`,
+  ).expect(409);
+});
+
+test("purchase closure rejects an order whose quantities were fully received", async () => {
+  const created = await mutate(
+    "post",
+    "/api/v1/purchase-orders",
+    orderInput({ lines: [{ productId, quantity: 2, unitCost: "100.25" }] }),
+  ).expect(201);
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/confirmation`,
+    { expectedVersion: created.body.version, confirmZeroCost: false },
+  ).expect(200);
+  await mutate("post", `/api/v1/purchase-orders/${created.body.id}/receipts`, {
+    expectedVersion: confirmed.body.version,
+    reference: `FULL-${suffix}`,
+    lines: [{ purchaseOrderLineId: confirmed.body.lines[0].id, quantity: 2 }],
+  })
+    .set("Idempotency-Key", `full-receipt-${suffix}`)
+    .expect(201);
+  const current = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+  await mutate("post", `/api/v1/purchase-orders/${created.body.id}/closure`, {
+    expectedVersion: current.body.version,
+    reason: "No queda saldo",
+  })
+    .set("Idempotency-Key", `full-closure-${suffix}`)
+    .expect(409);
+});
+
+test("receipt and closure serialize on the order and cannot both consume one version", async () => {
+  const created = await mutate(
+    "post",
+    "/api/v1/purchase-orders",
+    orderInput({ lines: [{ productId, quantity: 3, unitCost: "100.25" }] }),
+  ).expect(201);
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/confirmation`,
+    { expectedVersion: created.body.version, confirmZeroCost: false },
+  ).expect(200);
+  const lineId = confirmed.body.lines[0].id;
+  const outcomes = await Promise.all([
+    mutate("post", `/api/v1/purchase-orders/${created.body.id}/closure`, {
+      expectedVersion: confirmed.body.version,
+      reason: "Cierre por carrera",
+    }).set("Idempotency-Key", `race-closure-${suffix}`),
+    mutate("post", `/api/v1/purchase-orders/${created.body.id}/receipts`, {
+      expectedVersion: confirmed.body.version,
+      reference: `RACE-${suffix}`,
+      lines: [{ purchaseOrderLineId: lineId, quantity: 1 }],
+    }).set("Idempotency-Key", `race-receipt-${suffix}`),
+  ]);
+  assert.deepEqual(outcomes.map(({ status }) => status).sort(), [201, 409]);
+  const finalOrder = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+  assert.equal(finalOrder.body.version, confirmed.body.version + 1);
+  assert.ok(
+    finalOrder.body.closure || finalOrder.body.lines[0].receivedQuantity === 1,
+  );
+  if (finalOrder.body.closure)
+    assert.equal(finalOrder.body.lines[0].pendingQuantity, 0);
+});
+
+test("closure audit failure rolls back metadata and document version", async () => {
+  const created = await mutate(
+    "post",
+    "/api/v1/purchase-orders",
+    orderInput({ lines: [{ productId, quantity: 3, unitCost: "100.25" }] }),
+  ).expect(201);
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/confirmation`,
+    { expectedVersion: created.body.version, confirmZeroCost: false },
+  ).expect(200);
+  const receipt = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/receipts`,
+    {
+      expectedVersion: confirmed.body.version,
+      reference: `ROLLBACK-${suffix}`,
+      lines: [{ purchaseOrderLineId: confirmed.body.lines[0].id, quantity: 1 }],
+    },
+  )
+    .set("Idempotency-Key", `rollback-receipt-${suffix}`)
+    .expect(201);
+  const current = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+
+  const failingPool = {
+    execute: pool.execute.bind(pool),
+    query: pool.query.bind(pool),
+    getConnection: async () => {
+      const connection = await pool.getConnection();
+      const execute = connection.execute.bind(connection);
+      connection.execute = (sql, values) => {
+        if (
+          String(sql).includes("INSERT INTO audit_events") &&
+          values?.includes("purchases.order_closed")
+        )
+          throw new Error("Injected purchase closure audit failure.");
+        return execute(sql, values);
+      };
+      return connection;
+    },
+  };
+  const failingApp = createApp({
+    dbPool: failingPool,
+    authConfig,
+    logger: createLogger({ level: "silent" }),
+  });
+  const response = await request(failingApp)
+    .post(`/api/v1/purchase-orders/${created.body.id}/closure`)
+    .set("Origin", origin)
+    .set("Cookie", sessions.administrator.cookie)
+    .set("X-CSRF-Token", sessions.administrator.csrfToken)
+    .set("Idempotency-Key", `rollback-closure-${suffix}`)
+    .send({
+      expectedVersion: current.body.version,
+      reason: "La auditoría debe confirmar",
+    });
+  assert.equal(response.status, 500);
+  const unchanged = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+  assert.equal(unchanged.body.closure, null);
+  assert.equal(unchanged.body.version, current.body.version);
+  const [[audit]] = await pool.execute(
+    "SELECT COUNT(*) AS total FROM audit_events WHERE action = 'purchases.order_closed' AND entity_id = ?",
+    [created.body.id],
+  );
+  assert.equal(Number(audit.total), 0);
+  assert.equal(receipt.status, 201);
+});
+
+test("supplier returns consume only a receipt's received quantity and remain idempotent", async () => {
+  const {
+    created,
+    receipt,
+    productId: returnedProductId,
+  } = await createReceivedOrder({
+    orderQuantity: 6,
+    receiptQuantity: 4,
+  });
+  const receiptLine = receipt.body.lines[0];
+  const requestBody = {
+    reference: `DEV-${suffix}-A`,
+    reason: "Mercancía averiada al llegar",
+    lines: [{ purchaseReceiptLineId: receiptLine.id, quantity: 1 }],
+  };
+  const key = `return-once-${suffix}`;
+  const first = await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    requestBody,
+    sessions.administrator,
+    key,
+  ).expect(201);
+  assert.equal(first.body.reference, requestBody.reference);
+  assert.equal(first.body.reason, requestBody.reason);
+  assert.equal(first.body.purchaseReceiptId, receipt.body.id);
+  assert.equal(first.body.purchaseOrderId, created.body.id);
+  assert.equal(first.body.sourceOperationId !== null, true);
+  assert.equal(first.body.lines[0].quantity, 1);
+
+  const [[balanceAfterFirst]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [returnedProductId, warehouseId],
+  );
+  assert.deepEqual(
+    [balanceAfterFirst.quantity, String(balanceAfterFirst.version)],
+    [3, "2"],
+  );
+  const [[operation]] = await pool.execute(
+    `SELECT io.operation_type, io.source_type, io.source_id,
+            im.direction, im.quantity, im.balance_before, im.balance_after
+     FROM inventory_operations io
+     JOIN inventory_movements im ON im.operation_id = io.id
+     WHERE io.id = ?`,
+    [first.body.sourceOperationId],
+  );
+  assert.deepEqual(
+    [
+      operation.operation_type,
+      operation.source_type,
+      operation.source_id,
+      operation.direction,
+      operation.quantity,
+      operation.balance_before,
+      operation.balance_after,
+    ],
+    ["supplier_return", "supplier_return", first.body.id, "OUT", 1, 4, 3],
+  );
+
+  const replay = await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    requestBody,
+    sessions.administrator,
+    key,
+  ).expect(200);
+  assert.equal(replay.body.id, first.body.id);
+  assert.equal(replay.body.replayed, true);
+  const receiptAfter = await get(
+    `/api/v1/purchase-orders/${created.body.id}/receipts/${receipt.body.id}`,
+  ).expect(200);
+  assert.deepEqual(
+    [
+      receiptAfter.body.lines[0].quantity,
+      receiptAfter.body.lines[0].returnedQuantity,
+      receiptAfter.body.lines[0].returnableQuantity,
+    ],
+    [4, 1, 3],
+  );
+  const orderAfter = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+  assert.deepEqual(
+    [
+      orderAfter.body.lines[0].quantity,
+      orderAfter.body.lines[0].receivedQuantity,
+      orderAfter.body.lines[0].pendingQuantity,
+    ],
+    [6, 4, 2],
+  );
+  const listed = await get(
+    `/api/v1/purchase-orders/${created.body.id}/returns`,
+  ).expect(200);
+  assert.equal(listed.body.items.length, 1);
+  const detail = await get(
+    `/api/v1/purchase-orders/${created.body.id}/returns/${first.body.id}`,
+  ).expect(200);
+  assert.equal(detail.body.sourceOperationId, first.body.sourceOperationId);
+
+  const second = await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    {
+      ...requestBody,
+      reference: `DEV-${suffix}-B`,
+      lines: [{ purchaseReceiptLineId: receiptLine.id, quantity: 2 }],
+    },
+    sessions.administrator,
+    `return-twice-${suffix}`,
+  ).expect(201);
+  const finalReturn = await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    {
+      ...requestBody,
+      reference: `DEV-${suffix}-C`,
+      lines: [{ purchaseReceiptLineId: receiptLine.id, quantity: 1 }],
+    },
+    sessions.administrator,
+    `return-complete-${suffix}`,
+  ).expect(201);
+  assert.notEqual(second.body.id, finalReturn.body.id);
+  const [[finalBalance]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [returnedProductId, warehouseId],
+  );
+  assert.deepEqual(
+    [finalBalance.quantity, String(finalBalance.version)],
+    [0, "4"],
+  );
+  const exhausted = await get(
+    `/api/v1/purchase-orders/${created.body.id}/receipts/${receipt.body.id}`,
+  ).expect(200);
+  assert.equal(exhausted.body.lines[0].returnableQuantity, 0);
+  assert.equal(exhausted.body.lines[0].quantity, 4);
+});
+
+test("supplier returns reject over-return, duplicate references, invalid lines and missing keys", async () => {
+  const { created, receipt } = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const lineId = receipt.body.lines[0].id;
+  const base = {
+    reference: `DEV-VALID-${suffix}`,
+    reason: "Producto con empaque dañado",
+    lines: [{ purchaseReceiptLineId: lineId, quantity: 2 }],
+  };
+  await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    base,
+    sessions.administrator,
+    `validate-return-${suffix}`,
+  ).expect(201);
+
+  await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    { ...base, reference: `DEV-DIFFERENT-${suffix}` },
+    sessions.administrator,
+    `validate-return-${suffix}`,
+  ).expect(409);
+
+  await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/receipts/${receipt.body.id}/returns`,
+    { ...base, reference: `DEV-OVER-${suffix}` },
+  )
+    .set("Idempotency-Key", `over-return-${suffix}`)
+    .expect(409);
+  await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    {
+      ...base,
+      reference: `DEV-VALID-${suffix}`,
+      lines: [{ purchaseReceiptLineId: lineId, quantity: 1 }],
+    },
+    sessions.administrator,
+    `duplicate-return-reference-${suffix}`,
+  ).expect(409);
+  await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    {
+      ...base,
+      reference: `DEV-DUPLINE-${suffix}`,
+      lines: [
+        { purchaseReceiptLineId: lineId, quantity: 1 },
+        { purchaseReceiptLineId: lineId, quantity: 1 },
+      ],
+    },
+    sessions.administrator,
+    `duplicate-return-line-${suffix}`,
+  ).expect(400);
+  await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    { ...base, reference: " ", reason: " ", lines: [] },
+    sessions.administrator,
+    `invalid-return-fields-${suffix}`,
+  ).expect(400);
+  await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/receipts/${receipt.body.id}/returns`,
+    base,
+  ).expect(400);
+});
+
+test("supplier returns enforce role, explicit warehouse assignment and receipt ownership", async () => {
+  const first = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const second = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const body = {
+    reference: `DEV-AUTH-${suffix}`,
+    reason: "Devolución autorizada de prueba",
+    lines: [
+      { purchaseReceiptLineId: first.receipt.body.lines[0].id, quantity: 1 },
+    ],
+  };
+  const url = `/api/v1/purchase-orders/${first.created.body.id}/receipts/${first.receipt.body.id}/returns`;
+  for (const session of [
+    sessions.warehouse,
+    sessions.auditor,
+    sessions.seller,
+  ]) {
+    await returnRequest(
+      first.created.body.id,
+      first.receipt.body.id,
+      {
+        ...body,
+        reference: `${body.reference}-${session === sessions.warehouse ? "W" : session === sessions.auditor ? "A" : "S"}`,
+      },
+      session,
+      `return-role-${randomBytes(5).toString("hex")}`,
+    ).expect(403);
+  }
+  await returnRequest(
+    first.created.body.id,
+    first.receipt.body.id,
+    { ...body, reference: `DEV-UNASSIGNED-${suffix}` },
+    sessions.unassignedAdministrator,
+    `return-unassigned-${suffix}`,
+  ).expect(404);
+  await returnRequest(
+    first.created.body.id,
+    first.receipt.body.id,
+    {
+      ...body,
+      reference: `DEV-FOREIGN-${suffix}`,
+      lines: [
+        { purchaseReceiptLineId: second.receipt.body.lines[0].id, quantity: 1 },
+      ],
+    },
+    sessions.administrator,
+    `return-foreign-line-${suffix}`,
+  ).expect(400);
+  await get(
+    `/api/v1/purchase-orders/${first.created.body.id}/returns`,
+    sessions.seller,
+  ).expect(403);
+  const allowedRead = await get(
+    `/api/v1/purchase-orders/${first.created.body.id}/returns`,
+    sessions.auditor,
+  ).expect(200);
+  assert.deepEqual(allowedRead.body.items, []);
+  assert.equal(url.includes("/returns"), true);
+});
+
+test("supplier returns remain available for closed orders and deactivated suppliers", async () => {
+  const { created, receipt } = await createReceivedOrder({
+    orderQuantity: 5,
+    receiptQuantity: 2,
+  });
+  const current = await get(
+    `/api/v1/purchase-orders/${created.body.id}`,
+  ).expect(200);
+  await mutate("post", `/api/v1/purchase-orders/${created.body.id}/closure`, {
+    expectedVersion: current.body.version,
+    reason: "Proveedor no enviará el saldo",
+  })
+    .set("Idempotency-Key", `close-before-return-${suffix}`)
+    .expect(200);
+  await pool.execute("UPDATE suppliers SET is_active = 0 WHERE id = ?", [
+    supplierId,
+  ]);
+  const returned = await returnRequest(
+    created.body.id,
+    receipt.body.id,
+    {
+      reference: `DEV-CERRADA-${suffix}`,
+      reason: "Mercancía recibida no corresponde",
+      lines: [{ purchaseReceiptLineId: receipt.body.lines[0].id, quantity: 1 }],
+    },
+    sessions.administrator,
+    `return-closed-order-${suffix}`,
+  ).expect(201);
+  assert.equal(returned.body.lines[0].quantity, 1);
+  const order = await get(`/api/v1/purchase-orders/${created.body.id}`).expect(
+    200,
+  );
+  assert.equal(order.body.closure.reason, "Proveedor no enviará el saldo");
+  assert.deepEqual(
+    [
+      order.body.lines[0].quantity,
+      order.body.lines[0].receivedQuantity,
+      order.body.lines[0].pendingQuantity,
+    ],
+    [5, 2, 0],
+  );
+  await pool.execute("UPDATE suppliers SET is_active = 1 WHERE id = ?", [
+    supplierId,
+  ]);
+});
+
+test("supplier returns serialize competing requests and reject insufficient stock or inactive resources", async () => {
+  const {
+    created,
+    receipt,
+    productId: concurrentProductId,
+  } = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const requestBody = {
+    reason: "Devolución parcial concurrente",
+    lines: [{ purchaseReceiptLineId: receipt.body.lines[0].id, quantity: 2 }],
+  };
+  const outcomes = await Promise.all([
+    returnRequest(
+      created.body.id,
+      receipt.body.id,
+      { ...requestBody, reference: `DEV-RACE-A-${suffix}` },
+      sessions.administrator,
+      `return-race-a-${suffix}`,
+    ),
+    returnRequest(
+      created.body.id,
+      receipt.body.id,
+      { ...requestBody, reference: `DEV-RACE-B-${suffix}` },
+      sessions.secondAdministrator,
+      `return-race-b-${suffix}`,
+    ),
+  ]);
+  assert.deepEqual(outcomes.map(({ status }) => status).sort(), [201, 409]);
+  const [[balance]] = await pool.execute(
+    "SELECT quantity FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [concurrentProductId, warehouseId],
+  );
+  assert.equal(balance.quantity, 1);
+
+  const {
+    created: stockOrder,
+    receipt: stockReceipt,
+    productId: stockProductId,
+  } = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const engine = createInventoryEngine({ dbPool: pool });
+  await engine.createOperation({
+    userId: users.administrator,
+    idempotencyKey: `return-stock-drain-${suffix}`,
+    payload: {
+      type: "adjustment_out",
+      sourceWarehouseId: warehouseId,
+      destinationWarehouseId: null,
+      reason: "Drenaje de stock para prueba de devolución",
+      reference: null,
+      lines: [{ productId: stockProductId, quantity: 3, expectedVersion: "1" }],
+    },
+  });
+  const noStock = await returnRequest(
+    stockOrder.body.id,
+    stockReceipt.body.id,
+    {
+      reference: `DEV-SIN-STOCK-${suffix}`,
+      reason: "Producto recibido defectuoso",
+      lines: [
+        { purchaseReceiptLineId: stockReceipt.body.lines[0].id, quantity: 1 },
+      ],
+    },
+    sessions.administrator,
+    `return-no-stock-${suffix}`,
+  ).expect(409);
+  assert.equal(noStock.body.error.code, "INSUFFICIENT_STOCK");
+
+  const [[beforeInactive]] = await pool.execute(
+    "SELECT is_active FROM products WHERE id = ?",
+    [stockProductId],
+  );
+  await pool.execute("UPDATE products SET is_active = 0 WHERE id = ?", [
+    stockProductId,
+  ]);
+  const inactive = await returnRequest(
+    stockOrder.body.id,
+    stockReceipt.body.id,
+    {
+      reference: `DEV-PRODUCT-INACTIVE-${suffix}`,
+      reason: "Producto desactivado para prueba",
+      lines: [
+        { purchaseReceiptLineId: stockReceipt.body.lines[0].id, quantity: 1 },
+      ],
+    },
+    sessions.administrator,
+    `return-inactive-product-${suffix}`,
+  ).expect(409);
+  assert.equal(inactive.body.error.code, "INACTIVE_PRODUCT");
+  await pool.execute("UPDATE products SET is_active = ? WHERE id = ?", [
+    beforeInactive.is_active,
+    stockProductId,
+  ]);
+  await pool.execute("UPDATE warehouses SET is_active = 0 WHERE id = ?", [
+    warehouseId,
+  ]);
+  const inactiveWarehouse = await returnRequest(
+    stockOrder.body.id,
+    stockReceipt.body.id,
+    {
+      reference: `DEV-BODEGA-INACTIVA-${suffix}`,
+      reason: "Validación de bodega inactiva",
+      lines: [
+        { purchaseReceiptLineId: stockReceipt.body.lines[0].id, quantity: 1 },
+      ],
+    },
+    sessions.administrator,
+    `return-inactive-warehouse-${suffix}`,
+  ).expect(409);
+  assert.equal(inactiveWarehouse.body.error.code, "INACTIVE_WAREHOUSE");
+  await pool.execute("UPDATE warehouses SET is_active = 1 WHERE id = ?", [
+    warehouseId,
+  ]);
+});
+
+test("a supplier return audit failure rolls back its document, inventory and order version", async () => {
+  const {
+    created,
+    receipt,
+    productId: returnedProductId,
+  } = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const before = await get(`/api/v1/purchase-orders/${created.body.id}`).expect(
+    200,
+  );
+  const failingPool = {
+    execute: pool.execute.bind(pool),
+    query: pool.query.bind(pool),
+    getConnection: async () => {
+      const connection = await pool.getConnection();
+      const execute = connection.execute.bind(connection);
+      connection.execute = (sql, values) => {
+        if (
+          String(sql).includes("INSERT INTO audit_events") &&
+          String(sql).includes("purchases.return_confirmed")
+        )
+          throw new Error("Injected supplier-return audit failure.");
+        return execute(sql, values);
+      };
+      return connection;
+    },
+  };
+  const failingApp = createApp({
+    dbPool: failingPool,
+    authConfig,
+    logger: createLogger({ level: "silent" }),
+  });
+  const response = await request(failingApp)
+    .post(
+      `/api/v1/purchase-orders/${created.body.id}/receipts/${receipt.body.id}/returns`,
+    )
+    .set("Origin", origin)
+    .set("Cookie", sessions.administrator.cookie)
+    .set("X-CSRF-Token", sessions.administrator.csrfToken)
+    .set("Idempotency-Key", `return-audit-rollback-${suffix}`)
+    .send({
+      reference: `DEV-ROLLBACK-${suffix}`,
+      reason: "La auditoría debe revertir todo",
+      lines: [{ purchaseReceiptLineId: receipt.body.lines[0].id, quantity: 1 }],
+    });
+  assert.equal(response.status, 500);
+  const after = await get(`/api/v1/purchase-orders/${created.body.id}`).expect(
+    200,
+  );
+  assert.equal(after.body.version, before.body.version);
+  const [[counts]] = await pool.execute(
+    `SELECT
+      (SELECT COUNT(*) FROM supplier_returns WHERE purchase_order_id = ?) AS returns,
+      (SELECT COUNT(*) FROM inventory_operations WHERE source_type = 'supplier_return' AND idempotency_key = ?) AS operations,
+      (SELECT COUNT(*) FROM audit_events WHERE action = 'purchases.return_confirmed' AND entity_id = ?) AS audits,
+      (SELECT quantity FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?) AS balance`,
+    [
+      created.body.id,
+      `return-audit-rollback-${suffix}`,
+      created.body.id,
+      returnedProductId,
+      warehouseId,
+    ],
+  );
+  assert.deepEqual(
+    [
+      Number(counts.returns),
+      Number(counts.operations),
+      Number(counts.audits),
+      Number(counts.balance),
+    ],
+    [0, 0, 0, 3],
+  );
+});
+
+test("an inventory-engine failure rolls back a supplier-return document and stock", async () => {
+  const {
+    created,
+    receipt,
+    productId: returnedProductId,
+  } = await createReceivedOrder({
+    orderQuantity: 3,
+    receiptQuantity: 3,
+  });
+  const failingPool = {
+    execute: pool.execute.bind(pool),
+    query: pool.query.bind(pool),
+    getConnection: async () => {
+      const connection = await pool.getConnection();
+      const execute = connection.execute.bind(connection);
+      connection.execute = (sql, values) => {
+        if (String(sql).includes("INSERT INTO inventory_operations")) {
+          const error = new Error("Injected supplier-return engine failure.");
+          error.code = "INJECTED_ENGINE_FAILURE";
+          throw error;
+        }
+        return execute(sql, values);
+      };
+      return connection;
+    },
+  };
+  const failingApp = createApp({
+    dbPool: failingPool,
+    authConfig,
+    logger: createLogger({ level: "silent" }),
+  });
+  const response = await request(failingApp)
+    .post(
+      `/api/v1/purchase-orders/${created.body.id}/receipts/${receipt.body.id}/returns`,
+    )
+    .set("Origin", origin)
+    .set("Cookie", sessions.administrator.cookie)
+    .set("X-CSRF-Token", sessions.administrator.csrfToken)
+    .set("Idempotency-Key", `return-engine-rollback-${suffix}`)
+    .send({
+      reference: `DEV-ENGINE-ROLLBACK-${suffix}`,
+      reason: "La operación de inventario falló",
+      lines: [{ purchaseReceiptLineId: receipt.body.lines[0].id, quantity: 1 }],
+    });
+  assert.equal(response.status, 500);
+  const [[state]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM supplier_returns WHERE purchase_order_id = ?) AS returns,
+       (SELECT quantity FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?) AS balance,
+       (SELECT version FROM purchase_orders WHERE id = ?) AS version`,
+    [created.body.id, returnedProductId, warehouseId, created.body.id],
+  );
+  assert.deepEqual(
+    [Number(state.returns), Number(state.balance), Number(state.version)],
+    [0, 3, created.body.version + 2],
+  );
 });
 
 test("simultaneous administrators cannot receive the same pending quantity twice", async () => {

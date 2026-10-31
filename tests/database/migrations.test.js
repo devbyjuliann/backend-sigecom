@@ -20,6 +20,8 @@ test("loads versioned migrations in order with stable checksums", async () => {
       "0010",
       "0011",
       "0012",
+      "0013",
+      "0014",
     ],
   );
   for (const migration of migrations) {
@@ -86,4 +88,27 @@ test("loads versioned migrations in order with stable checksums", async () => {
     purchaseCommercialCode,
     /UNIQUE KEY uq_purchase_orders_commercial_code/i,
   );
+
+  const purchaseClosures = migrations.find(
+    ({ version }) => version === "0013",
+  ).sql;
+  assert.match(purchaseClosures, /closure_reason VARCHAR\(500\)/i);
+  assert.match(purchaseClosures, /closure_idempotency_key/i);
+  assert.match(purchaseClosures, /closure_request_hash/i);
+  assert.match(purchaseClosures, /purchases\.close/i);
+  assert.match(purchaseClosures, /role\.code = 'administrator'/i);
+
+  const supplierReturns = migrations.find(
+    ({ version }) => version === "0014",
+  ).sql;
+  for (const table of ["supplier_returns", "supplier_return_lines"]) {
+    assert.match(
+      supplierReturns,
+      new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`, "i"),
+    );
+  }
+  assert.match(supplierReturns, /uq_supplier_returns_receipt_reference/i);
+  assert.match(supplierReturns, /uq_supplier_returns_actor_idempotency/i);
+  assert.match(supplierReturns, /source_operation_id/i);
+  assert.match(supplierReturns, /purchase_receipt_line_id/i);
 });

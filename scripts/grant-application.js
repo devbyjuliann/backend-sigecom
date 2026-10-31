@@ -50,6 +50,8 @@ try {
     "purchase_order_lines",
     "purchase_receipts",
     "purchase_receipt_lines",
+    "supplier_returns",
+    "supplier_return_lines",
   ];
 
   for (const table of applicationTables) {

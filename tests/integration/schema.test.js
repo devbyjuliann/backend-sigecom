@@ -22,6 +22,8 @@ const expectedTables = [
   "role_permissions",
   "schema_migrations",
   "suppliers",
+  "supplier_returns",
+  "supplier_return_lines",
   "users",
   "user_sessions",
   "user_warehouses",
@@ -68,7 +70,31 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   assert.equal(Number(roles.count), 4);
   assert.ok(Number(permissions.count) >= 35);
   assert.ok(Number(rolePermissions.count) >= Number(permissions.count));
-  assert.equal(Number(versions.count), 12);
+  assert.equal(Number(versions.count), 14);
+
+  const [closurePermission] = await pool.execute(
+    `SELECT r.code AS role_code
+     FROM role_permissions rp
+     JOIN roles r ON r.id = rp.role_id
+     JOIN permissions p ON p.id = rp.permission_id
+     WHERE p.code = 'purchases.close' ORDER BY r.code`,
+  );
+  assert.deepEqual(
+    closurePermission.map(({ role_code }) => role_code),
+    ["administrator"],
+  );
+
+  const [returnPermission] = await pool.execute(
+    `SELECT r.code AS role_code
+     FROM role_permissions rp
+     JOIN roles r ON r.id = rp.role_id
+     JOIN permissions p ON p.id = rp.permission_id
+     WHERE p.code = 'purchases.return' ORDER BY r.code`,
+  );
+  assert.deepEqual(
+    returnPermission.map(({ role_code }) => role_code),
+    ["administrator"],
+  );
 
   const [categoryAssignments] = await pool.execute(
     `SELECT r.code AS role_code, p.code AS permission_code
@@ -169,7 +195,7 @@ test("all phase 1 tables use InnoDB and declared foreign keys", async () => {
     `SELECT COUNT(*) AS count FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = 'sigecom_test' AND REFERENCED_TABLE_NAME IS NOT NULL`,
   );
-  assert.equal(Number(constraints.count), 35);
+  assert.equal(Number(constraints.count), 51);
 });
 
 test("database connections use UTC sessions without changing MariaDB global settings", async () => {
@@ -370,7 +396,7 @@ test("migration account can read schema but cannot drop existing tables", async 
     const [[row]] = await migrator.query(
       "SELECT COUNT(*) AS count FROM schema_migrations",
     );
-    assert.equal(Number(row.count), 12);
+    assert.equal(Number(row.count), 14);
     await assert.rejects(
       migrator.query("DROP TABLE sigecom_test.schema_migrations"),
       (error) =>

@@ -116,6 +116,36 @@ const receiptSchema = z
       ),
   })
   .strict();
+const closureSchema = z
+  .object({
+    expectedVersion: z.number().int().min(1).max(2_147_483_647),
+    reason: z.string().trim().min(3).max(500),
+  })
+  .strict();
+const supplierReturnSchema = z
+  .object({
+    reference: z.string().trim().min(1).max(120),
+    reason: z.string().trim().min(3).max(500),
+    lines: z
+      .array(
+        z
+          .object({
+            purchaseReceiptLineId: idSchema,
+            quantity: z.number().int().min(1).max(maxQuantity),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(50)
+      .refine(
+        (lines) =>
+          new Set(
+            lines.map(({ purchaseReceiptLineId }) => purchaseReceiptLineId),
+          ).size === lines.length,
+        "No repitas líneas dentro de una devolución.",
+      ),
+  })
+  .strict();
 const listSchema = z
   .object({
     page: z.coerce.number().int().min(1).max(1_000_000).default(1),
@@ -182,6 +212,83 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
     request.idempotencyKey = key.trim();
     return next();
   };
+  const requireClosureKey = (request, _response, next) => {
+    const key = request.get("Idempotency-Key")?.trim();
+    if (!key || key.length > 128 || !/^[\x21-\x7e]+$/.test(key)) {
+      return next(
+        new HttpError(
+          400,
+          "IDEMPOTENCY_KEY_REQUIRED",
+          "Envía una clave Idempotency-Key imprimible de hasta 128 caracteres.",
+        ),
+      );
+    }
+    request.idempotencyKey = key;
+    return next();
+  };
+  const requireSupplierReturnKey = (request, _response, next) => {
+    const key = request.get("Idempotency-Key")?.trim();
+    if (!key || key.length > 128 || !/^[\x21-\x7e]+$/.test(key)) {
+      return next(
+        new HttpError(
+          400,
+          "IDEMPOTENCY_KEY_REQUIRED",
+          "Envía una clave Idempotency-Key imprimible de hasta 128 caracteres.",
+        ),
+      );
+    }
+    request.idempotencyKey = key;
+    return next();
+  };
+
+  router.post(
+    "/:id/receipts/:receiptId/returns",
+    requireSession,
+    requirePermission("purchases.return"),
+    requireAdministrator,
+    requireSupplierReturnKey,
+    async (request, response) => {
+      const result = await service.createSupplierReturn({
+        orderId: parse(idSchema, request.params.id),
+        receiptId: parse(idSchema, request.params.receiptId),
+        input: parse(supplierReturnSchema, request.body),
+        userId: request.auth.user.id,
+        idempotencyKey: request.idempotencyKey,
+        request,
+      });
+      response
+        .status(result.replayed ? 200 : 201)
+        .set("Cache-Control", "no-store")
+        .json(result);
+    },
+  );
+
+  router.get(
+    "/:id/returns",
+    requireSession,
+    requirePermission("purchases.read"),
+    async (request, response) => {
+      const result = await service.listSupplierReturns({
+        orderId: parse(idSchema, request.params.id),
+        userId: request.auth.user.id,
+      });
+      response.set("Cache-Control", "no-store").json(result);
+    },
+  );
+
+  router.get(
+    "/:id/returns/:returnId",
+    requireSession,
+    requirePermission("purchases.read"),
+    async (request, response) => {
+      const result = await service.getSupplierReturn({
+        orderId: parse(idSchema, request.params.id),
+        returnId: parse(idSchema, request.params.returnId),
+        userId: request.auth.user.id,
+      });
+      response.set("Cache-Control", "no-store").json(result);
+    },
+  );
 
   router.get(
     "/:id/receipts",
@@ -324,6 +431,25 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
         request,
       });
       response.set("Cache-Control", "no-store").json(order);
+    },
+  );
+
+  router.post(
+    "/:id/closure",
+    requireSession,
+    requirePermission("purchases.close"),
+    requireAdministrator,
+    requireClosureKey,
+    async (request, response) => {
+      const orderId = parse(idSchema, request.params.id);
+      const order = await service.close({
+        orderId,
+        input: parse(closureSchema, request.body),
+        userId: request.auth.user.id,
+        idempotencyKey: request.idempotencyKey,
+        request,
+      });
+      response.status(200).set("Cache-Control", "no-store").json(order);
     },
   );
 
