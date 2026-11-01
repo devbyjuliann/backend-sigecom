@@ -153,6 +153,7 @@ export function createAuthRouter({ dbPool, authConfig }) {
       const result = await changePassword({
         dbPool,
         userId: request.auth.user.id,
+        sessionId: request.auth.sessionId,
         currentPassword: parsed.data.currentPassword,
         newPassword: parsed.data.newPassword,
         request,

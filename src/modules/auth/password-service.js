@@ -12,6 +12,7 @@ function metadata(request) {
 export async function changePassword({
   dbPool,
   userId,
+  sessionId,
   currentPassword,
   newPassword,
   request,
@@ -29,6 +30,21 @@ export async function changePassword({
     );
     const user = users[0];
     if (!user || !user.is_active) {
+      await connection.rollback();
+      throw new HttpError(
+        401,
+        "SESSION_INVALID",
+        "La sesión no es válida o ha vencido.",
+      );
+    }
+
+    const [sessions] = await connection.execute(
+      `SELECT id FROM user_sessions
+       WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+         AND expires_at > UTC_TIMESTAMP(3) FOR UPDATE`,
+      [sessionId, userId],
+    );
+    if (!sessions[0]) {
       await connection.rollback();
       throw new HttpError(
         401,

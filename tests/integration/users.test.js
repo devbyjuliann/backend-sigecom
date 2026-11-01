@@ -53,7 +53,11 @@ async function login(email, password) {
 }
 
 function api(method, path, body, session = adminCookies) {
-  const client = request(app);
+  return apiWith(app, method, path, body, session);
+}
+
+function apiWith(appInstance, method, path, body, session = adminCookies) {
+  const client = request(appInstance);
   const call =
     method === "get"
       ? client.get(path)
@@ -65,6 +69,14 @@ function api(method, path, body, session = adminCookies) {
     call.set("X-CSRF-Token", session.csrfToken).send(body);
   }
   return call;
+}
+
+function createFreshApp() {
+  return createApp({
+    dbPool: pool,
+    authConfig,
+    logger: createLogger({ level: "silent" }),
+  });
 }
 
 before(async () => {
@@ -206,6 +218,521 @@ test("administrator creates a user with a one-time temporary password", async ()
   assert.equal(changeResponse.body.changed, true);
 });
 
+test("administrator resets an active account and receives its temporary password once", async () => {
+  const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(200);
+  const previousSession = await login(targetEmail, changedTargetPassword);
+  const response = await api(
+    "post",
+    `/api/v1/users/${createdUserId}/password-reset`,
+    { expectedRevision: detail.body.revision, confirmReset: true },
+  ).expect(200);
+
+  assert.equal(response.headers["cache-control"], "no-store");
+  assert.equal(response.body.user.passwordChangeRequired, true);
+  assert.equal(response.body.user.email, targetEmail);
+  assert.notEqual(response.body.temporaryPassword, changedTargetPassword);
+  assert.match(response.body.temporaryPassword, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(response.body.revokedSessions, 1);
+  const auditSecretCheck = JSON.stringify(response.body);
+  assert.doesNotMatch(auditSecretCheck, /password_hash|passwordHash/);
+  assert.equal("passwordHash" in response.body.user, false);
+  const [[stored]] = await pool.execute(
+    "SELECT password_hash, password_change_required FROM users WHERE id = ?",
+    [createdUserId],
+  );
+  assert.equal(stored.password_change_required, 1);
+  assert.match(stored.password_hash, /^\$2[aby]\$12\$/);
+  assert.equal(
+    await bcrypt.compare(response.body.temporaryPassword, stored.password_hash),
+    true,
+  );
+  const [[resetAudit]] = await pool.execute(
+    `SELECT action, details FROM audit_events
+     WHERE action = 'users.password_reset' AND entity_id = ?
+     ORDER BY id DESC LIMIT 1`,
+    [createdUserId],
+  );
+  assert.equal(resetAudit.action, "users.password_reset");
+  assert.deepEqual(JSON.parse(resetAudit.details), {
+    revokedSessions: 1,
+    passwordChangeRequired: true,
+  });
+  assert.equal(
+    resetAudit.details.includes(response.body.temporaryPassword),
+    false,
+  );
+
+  await request(app)
+    .get("/api/v1/auth/me")
+    .set("Cookie", previousSession.cookies.join("; "))
+    .expect(401);
+  const oldPasswordCsrf = await csrf();
+  await request(app)
+    .post("/api/v1/auth/login")
+    .set("Origin", origin)
+    .set("Cookie", oldPasswordCsrf.cookie)
+    .set("X-CSRF-Token", oldPasswordCsrf.token)
+    .send({ email: targetEmail, password: changedTargetPassword })
+    .expect(401);
+
+  const temporarySession = await login(
+    targetEmail,
+    response.body.temporaryPassword,
+  );
+  await request(app)
+    .post("/api/v1/auth/change-password")
+    .set("Origin", origin)
+    .set("Cookie", temporarySession.cookies.join("; "))
+    .set("X-CSRF-Token", temporarySession.csrfToken)
+    .send({
+      currentPassword: response.body.temporaryPassword,
+      newPassword: changedTargetPassword,
+      confirmPassword: changedTargetPassword,
+    })
+    .expect(200);
+});
+
+test("password reset rolls back credential and session changes when revocation or audit fails", async () => {
+  for (const failedStatement of [
+    "UPDATE user_sessions SET revoked_at",
+    "INSERT INTO audit_events",
+  ]) {
+    const targetSession = await login(targetEmail, changedTargetPassword);
+    const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(
+      200,
+    );
+    const [[before]] = await pool.execute(
+      `SELECT password_hash, password_change_required,
+              (SELECT COUNT(*) FROM user_sessions
+               WHERE user_id = users.id AND revoked_at IS NULL) AS active_sessions
+       FROM users WHERE id = ?`,
+      [createdUserId],
+    );
+    const faultPool = new Proxy(pool, {
+      get(target, property) {
+        if (property === "getConnection") {
+          return async () => {
+            const connection = await target.getConnection();
+            return new Proxy(connection, {
+              get(inner, method) {
+                if (method === "execute") {
+                  return async (sql, parameters) => {
+                    if (String(sql).includes(failedStatement)) {
+                      throw new Error("Injected transactional failure");
+                    }
+                    return inner.execute.call(inner, sql, parameters);
+                  };
+                }
+                const value = Reflect.get(inner, method, inner);
+                return typeof value === "function" ? value.bind(inner) : value;
+              },
+            });
+          };
+        }
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const faultApp = createApp({
+      dbPool: faultPool,
+      authConfig,
+      logger: createLogger({ level: "silent" }),
+    });
+    const failed = await request(faultApp)
+      .post(`/api/v1/users/${createdUserId}/password-reset`)
+      .set("Origin", origin)
+      .set("Cookie", adminCookies.cookies.join("; "))
+      .set("X-CSRF-Token", adminCookies.csrfToken)
+      .send({ expectedRevision: detail.body.revision, confirmReset: true })
+      .expect(500);
+    assert.equal(failed.headers["cache-control"], "no-store");
+    const [[afterFailure]] = await pool.execute(
+      `SELECT password_hash, password_change_required,
+              (SELECT COUNT(*) FROM user_sessions
+               WHERE user_id = users.id AND revoked_at IS NULL) AS active_sessions
+       FROM users WHERE id = ?`,
+      [createdUserId],
+    );
+    assert.equal(afterFailure.password_hash, before.password_hash);
+    assert.equal(
+      Number(afterFailure.password_change_required),
+      Number(before.password_change_required),
+    );
+    assert.equal(
+      Number(afterFailure.active_sessions),
+      Number(before.active_sessions),
+    );
+    await request(app)
+      .get("/api/v1/auth/me")
+      .set("Cookie", targetSession.cookies.join("; "))
+      .expect(200);
+  }
+});
+
+test("a concurrent login with the old password cannot create a session surviving a reset", async () => {
+  const raceApp = createFreshApp();
+  const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(200);
+  const csrfResponse = await request(raceApp)
+    .get("/api/v1/auth/csrf")
+    .expect(200);
+  const csrfCookie = csrfResponse.headers["set-cookie"]
+    .find((cookie) => cookie.startsWith("sigecom_csrf="))
+    .split(";", 1)[0];
+  const loginAttempt = request(raceApp)
+    .post("/api/v1/auth/login")
+    .set("Origin", origin)
+    .set("Cookie", csrfCookie)
+    .set("X-CSRF-Token", csrfResponse.body.csrfToken)
+    .send({ email: targetEmail, password: changedTargetPassword });
+  const resetAttempt = apiWith(
+    raceApp,
+    "post",
+    `/api/v1/users/${createdUserId}/password-reset`,
+    { expectedRevision: detail.body.revision, confirmReset: true },
+  );
+  const [oldLogin, reset] = await Promise.all([loginAttempt, resetAttempt]);
+  assert.equal(reset.status, 200, JSON.stringify(reset.body));
+  if (oldLogin.status === 200) {
+    const sessionCookie = oldLogin.headers["set-cookie"]
+      .find((cookie) => cookie.startsWith("sigecom_session="))
+      .split(";", 1)[0];
+    await request(raceApp)
+      .get("/api/v1/auth/me")
+      .set("Cookie", sessionCookie)
+      .expect(401);
+  } else {
+    assert.equal(oldLogin.status, 401);
+    assert.equal(oldLogin.body.error.code, "INVALID_CREDENTIALS");
+  }
+
+  const temporarySession = await login(
+    targetEmail,
+    reset.body.temporaryPassword,
+  );
+  await request(app)
+    .post("/api/v1/auth/change-password")
+    .set("Origin", origin)
+    .set("Cookie", temporarySession.cookies.join("; "))
+    .set("X-CSRF-Token", temporarySession.csrfToken)
+    .send({
+      currentPassword: reset.body.temporaryPassword,
+      newPassword: changedTargetPassword,
+      confirmPassword: changedTargetPassword,
+    })
+    .expect(200);
+});
+
+test("password reset rejects self-targets and stale credential revisions", async () => {
+  const resetApp = createFreshApp();
+  const self = await api("get", `/api/v1/users/${adminId}`).expect(200);
+  const selfReset = await apiWith(
+    resetApp,
+    "post",
+    `/api/v1/users/${adminId}/password-reset`,
+    {
+      expectedRevision: self.body.revision,
+      confirmReset: true,
+    },
+  ).expect(409);
+  assert.equal(selfReset.body.error.code, "OWN_PASSWORD_RESET_DENIED");
+
+  const current = await api("get", `/api/v1/users/${createdUserId}`).expect(
+    200,
+  );
+  const [[original]] = await pool.execute(
+    "SELECT password_hash FROM users WHERE id = ?",
+    [createdUserId],
+  );
+  const oldHash = await bcrypt.hash(randomBytes(32).toString("base64url"), 12);
+  await pool.execute("UPDATE users SET password_hash = ? WHERE id = ?", [
+    oldHash,
+    createdUserId,
+  ]);
+  const afterCredentialChange = await api(
+    "get",
+    `/api/v1/users/${createdUserId}`,
+  ).expect(200);
+  assert.notEqual(afterCredentialChange.body.revision, current.body.revision);
+  const stale = await apiWith(
+    resetApp,
+    "post",
+    `/api/v1/users/${createdUserId}/password-reset`,
+    {
+      expectedRevision: current.body.revision,
+      confirmReset: true,
+    },
+  ).expect(409);
+  assert.equal(stale.body.error.code, "USER_REVISION_CONFLICT");
+  await pool.execute("UPDATE users SET password_hash = ? WHERE id = ?", [
+    original.password_hash,
+    createdUserId,
+  ]);
+});
+
+test("an active account with a required password change can receive a replacement temporary password", async () => {
+  const resetApp = createFreshApp();
+  const created = await api("post", "/api/v1/users", {
+    email: `users-pending-reset-${unique}@sigecom.invalid`,
+    displayName: "Cuenta con temporal pendiente",
+    roleCode: "seller",
+    warehouseIds: [warehouseId],
+  }).expect(201);
+  extraCreatedUserIds.push(created.body.user.id);
+  const detail = await api(
+    "get",
+    `/api/v1/users/${created.body.user.id}`,
+  ).expect(200);
+  const reset = await apiWith(
+    resetApp,
+    "post",
+    `/api/v1/users/${created.body.user.id}/password-reset`,
+    { expectedRevision: detail.body.revision, confirmReset: true },
+  ).expect(200);
+  assert.equal(reset.body.user.passwordChangeRequired, true);
+  assert.notEqual(reset.body.temporaryPassword, created.body.temporaryPassword);
+
+  const oldCsrf = await csrf();
+  await request(app)
+    .post("/api/v1/auth/login")
+    .set("Origin", origin)
+    .set("Cookie", oldCsrf.cookie)
+    .set("X-CSRF-Token", oldCsrf.token)
+    .send({
+      email: created.body.user.email,
+      password: created.body.temporaryPassword,
+    })
+    .expect(401);
+  const current = await login(
+    created.body.user.email,
+    reset.body.temporaryPassword,
+  );
+  await api("get", "/api/v1/users", undefined, current).expect(403);
+});
+
+test("password reset strictly validates confirmation and rejects inactive accounts", async () => {
+  const resetApp = createFreshApp();
+  const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(200);
+  const csrfDenied = await request(app)
+    .post(`/api/v1/users/${createdUserId}/password-reset`)
+    .set("Origin", origin)
+    .set("Cookie", adminCookies.cookies.join("; "))
+    .send({ expectedRevision: detail.body.revision, confirmReset: true })
+    .expect(403);
+  assert.equal(csrfDenied.headers["cache-control"], "no-store");
+  const unsafe = await apiWith(
+    resetApp,
+    "post",
+    `/api/v1/users/${createdUserId}/password-reset`,
+    {
+      expectedRevision: detail.body.revision,
+      confirmReset: true,
+      password: "not-allowed",
+    },
+  ).expect(400);
+  assert.equal(unsafe.body.error.code, "INVALID_REQUEST");
+  await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [
+    createdUserId,
+  ]);
+  try {
+    const inactiveDetail = await api(
+      "get",
+      `/api/v1/users/${createdUserId}`,
+    ).expect(200);
+    const response = await apiWith(
+      resetApp,
+      "post",
+      `/api/v1/users/${createdUserId}/password-reset`,
+      {
+        expectedRevision: inactiveDetail.body.revision,
+        confirmReset: true,
+      },
+    ).expect(409);
+    assert.equal(
+      response.body.error.code,
+      "INACTIVE_USER_PASSWORD_RESET_DENIED",
+    );
+  } finally {
+    await pool.execute("UPDATE users SET is_active = 1 WHERE id = ?", [
+      createdUserId,
+    ]);
+  }
+});
+
+test("password reset rate limit applies ten attempts per administrator in fifteen minutes", async () => {
+  const limitedApp = createApp({
+    dbPool: pool,
+    authConfig,
+    logger: createLogger({ level: "silent" }),
+  });
+  const responses = [];
+  for (let attempt = 0; attempt < 11; attempt += 1) {
+    responses.push(
+      await request(limitedApp)
+        .post("/api/v1/users/18446744073709551615/password-reset")
+        .set("Origin", origin)
+        .set("Cookie", adminCookies.cookies.join("; "))
+        .set("X-CSRF-Token", adminCookies.csrfToken)
+        .send({
+          expectedRevision: "revision-01234567890123456789",
+          confirmReset: true,
+        }),
+    );
+  }
+  assert.deepEqual(
+    responses.map((response) => response.status),
+    [...Array(10).fill(404), 429],
+  );
+  assert.equal(responses.at(-1).body.error.code, "PASSWORD_RESET_RATE_LIMITED");
+  assert.ok(responses.at(-1).body.error.requestId);
+});
+
+test("mutual administrator password resets serialize and cannot invalidate the surviving operator", async () => {
+  const resetApp = createFreshApp();
+  const admins = [];
+  const sessions = [];
+  const initialPasswords = [];
+  for (const suffix of ["left", "right"]) {
+    const created = await api("post", "/api/v1/users", {
+      email: `users-reset-${suffix}-${unique}@sigecom.invalid`,
+      displayName: `Administrador ${suffix}`,
+      roleCode: "administrator",
+      warehouseIds: [warehouseId],
+    }).expect(201);
+    admins.push(created.body.user.id);
+    extraCreatedUserIds.push(created.body.user.id);
+    initialPasswords.push(created.body.temporaryPassword);
+  }
+  for (let index = 0; index < admins.length; index += 1) {
+    const email = `users-reset-${index === 0 ? "left" : "right"}-${unique}@sigecom.invalid`;
+    const pending = await login(email, initialPasswords[index]);
+    await request(app)
+      .post("/api/v1/auth/change-password")
+      .set("Origin", origin)
+      .set("Cookie", pending.cookies.join("; "))
+      .set("X-CSRF-Token", pending.csrfToken)
+      .send({
+        currentPassword: initialPasswords[index],
+        newPassword: `Reset-Admin-${index}-Secure-2026!`,
+        confirmPassword: `Reset-Admin-${index}-Secure-2026!`,
+      })
+      .expect(200);
+    sessions.push(await login(email, `Reset-Admin-${index}-Secure-2026!`));
+  }
+  const details = await Promise.all(
+    admins.map((id) => api("get", `/api/v1/users/${id}`)),
+  );
+  assert.ok(details.every((response) => response.status === 200));
+  const reset = (targetIndex, actorSession) => {
+    const call = request(resetApp)
+      .post(`/api/v1/users/${admins[targetIndex]}/password-reset`)
+      .set("Origin", origin)
+      .set("Cookie", actorSession.cookies.join("; "))
+      .set("X-CSRF-Token", actorSession.csrfToken)
+      .send({
+        expectedRevision: details[targetIndex].body.revision,
+        confirmReset: true,
+      });
+    return call;
+  };
+  const outcomes = await Promise.all([
+    reset(1, sessions[0]),
+    reset(0, sessions[1]),
+  ]);
+  assert.equal(
+    outcomes.filter((response) => response.status === 200).length,
+    1,
+  );
+  assert.ok(
+    outcomes.every((response) =>
+      [200, 401, 403, 409].includes(response.status),
+    ),
+  );
+  const [[operators]] = await pool.execute(
+    `SELECT COUNT(*) AS total FROM users
+     WHERE role_id = (SELECT id FROM roles WHERE code = 'administrator')
+       AND is_active = 1 AND password_change_required = 0`,
+  );
+  assert.ok(Number(operators.total) >= 1);
+});
+
+test("a concurrent password reset and normal password change cannot restore a revoked credential", async () => {
+  const raceApp = createFreshApp();
+  const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(200);
+  const targetSession = await login(targetEmail, changedTargetPassword);
+  const resetRequest = apiWith(
+    raceApp,
+    "post",
+    `/api/v1/users/${createdUserId}/password-reset`,
+    { expectedRevision: detail.body.revision, confirmReset: true },
+  );
+  const passwordChangeRequest = request(raceApp)
+    .post("/api/v1/auth/change-password")
+    .set("Origin", origin)
+    .set("Cookie", targetSession.cookies.join("; "))
+    .set("X-CSRF-Token", targetSession.csrfToken)
+    .send({
+      currentPassword: changedTargetPassword,
+      newPassword: "Concurrent-Definitive-2026!",
+      confirmPassword: "Concurrent-Definitive-2026!",
+    });
+  const [reset, changed] = await Promise.all([
+    resetRequest,
+    passwordChangeRequest,
+  ]);
+
+  if (reset.status === 200) {
+    assert.equal(changed.status, 401);
+    assert.equal(changed.body.error.code, "SESSION_INVALID");
+    const temporarySession = await login(
+      targetEmail,
+      reset.body.temporaryPassword,
+    );
+    await request(app)
+      .post("/api/v1/auth/change-password")
+      .set("Origin", origin)
+      .set("Cookie", temporarySession.cookies.join("; "))
+      .set("X-CSRF-Token", temporarySession.csrfToken)
+      .send({
+        currentPassword: reset.body.temporaryPassword,
+        newPassword: changedTargetPassword,
+        confirmPassword: changedTargetPassword,
+      })
+      .expect(200);
+  } else {
+    assert.equal(changed.status, 200, JSON.stringify(changed.body));
+    assert.equal(reset.status, 409, JSON.stringify(reset.body));
+    assert.equal(reset.body.error.code, "USER_REVISION_CONFLICT");
+    const recoveryDetail = await api(
+      "get",
+      `/api/v1/users/${createdUserId}`,
+    ).expect(200);
+    const recovery = await apiWith(
+      raceApp,
+      "post",
+      `/api/v1/users/${createdUserId}/password-reset`,
+      {
+        expectedRevision: recoveryDetail.body.revision,
+        confirmReset: true,
+      },
+    ).expect(200);
+    const recoverySession = await login(
+      targetEmail,
+      recovery.body.temporaryPassword,
+    );
+    await request(raceApp)
+      .post("/api/v1/auth/change-password")
+      .set("Origin", origin)
+      .set("Cookie", recoverySession.cookies.join("; "))
+      .set("X-CSRF-Token", recoverySession.csrfToken)
+      .send({
+        currentPassword: recovery.body.temporaryPassword,
+        newPassword: changedTargetPassword,
+        confirmPassword: changedTargetPassword,
+      })
+      .expect(200);
+  }
+});
+
 test("edits role and warehouse scope incrementally, rejects stale revisions and revokes sessions", async () => {
   const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(200);
   assert.deepEqual(
@@ -307,6 +834,16 @@ test("hides out-of-scope warehouse details and blocks all edits to that account"
     displayName: "Cambio fuera de alcance",
   }).expect(403);
   assert.equal(denied.body.error.code, "USER_WAREHOUSE_SCOPE_REQUIRED");
+  const resetDenied = await apiWith(
+    createFreshApp(),
+    "post",
+    `/api/v1/users/${createdUserId}/password-reset`,
+    {
+      expectedRevision: detail.body.revision,
+      confirmReset: true,
+    },
+  ).expect(403);
+  assert.equal(resetDenied.body.error.code, "USER_WAREHOUSE_SCOPE_REQUIRED");
 });
 
 test("role directory is limited to the four existing roles and filters paginate users", async () => {
@@ -506,6 +1043,15 @@ test("user administration requires the administrator role and effective permissi
       password,
     );
     await api("get", "/api/v1/users", undefined, sellerSession).expect(403);
+    await api(
+      "post",
+      `/api/v1/users/${adminId}/password-reset`,
+      {
+        expectedRevision: "valid-but-not-authorized-revision",
+        confirmReset: true,
+      },
+      sellerSession,
+    ).expect(403);
   } finally {
     await pool.execute(
       "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",

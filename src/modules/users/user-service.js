@@ -28,6 +28,7 @@ function userRevision(user, assignments) {
         displayName: user.display_name,
         isActive: Boolean(user.is_active),
         passwordChangeRequired: Boolean(user.password_change_required),
+        credentialRevision: user.password_hash,
         updatedAt: user.updated_at,
         assignments: assignments.map((item) => ({
           warehouseId: String(item.warehouse_id),
@@ -78,17 +79,18 @@ export function createUserService({ dbPool }) {
   async function readState(connection, id) {
     const [users] = await connection.execute(
       `SELECT u.id, u.role_id, u.email, u.display_name, u.is_active,
-              u.password_change_required,
+               u.password_change_required,
+               u.password_hash,
               DATE_FORMAT(u.updated_at, '%Y-%m-%d %H:%i:%s.%f') AS updated_at,
               r.code AS role_code, r.name AS role_name
-       FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ? LIMIT 1`,
+        FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ? LIMIT 1 FOR UPDATE`,
       [id],
     );
     if (!users[0]) return null;
     const [assignments] = await connection.execute(
       `SELECT uw.warehouse_id, uw.assigned_by,
               DATE_FORMAT(uw.created_at, '%Y-%m-%d %H:%i:%s.%f') AS created_at
-       FROM user_warehouses uw WHERE uw.user_id = ? ORDER BY uw.warehouse_id`,
+        FROM user_warehouses uw WHERE uw.user_id = ? ORDER BY uw.warehouse_id FOR UPDATE`,
       [id],
     );
     return {
@@ -123,7 +125,8 @@ export function createUserService({ dbPool }) {
     const [rows] = await connection.execute(
       `SELECT p.code FROM role_permissions rp
        JOIN permissions p ON p.id = rp.permission_id
-       WHERE rp.role_id = ? AND p.code IN (${required.map(() => "?").join(",")})`,
+        WHERE rp.role_id = ? AND p.code IN (${required.map(() => "?").join(",")})
+        FOR UPDATE`,
       [roleId, ...required],
     );
     const granted = new Set(rows.map((row) => row.code));
@@ -204,14 +207,17 @@ export function createUserService({ dbPool }) {
   async function withTransaction(work) {
     for (let attempt = 0; ; attempt += 1) {
       const connection = await dbPool.getConnection();
+      let commitStarted = false;
       try {
         await connection.beginTransaction();
         const result = await work(connection);
+        commitStarted = true;
         await connection.commit();
         return result;
       } catch (error) {
         await connection.rollback();
         if (
+          !commitStarted &&
           attempt < 2 &&
           ["ER_LOCK_DEADLOCK", "ER_LOCK_WAIT_TIMEOUT"].includes(error.code)
         ) {
@@ -340,7 +346,7 @@ export function createUserService({ dbPool }) {
     const [rows] = await connection.execute(
       `SELECT id FROM users
        WHERE role_id = ? AND is_active = 1 AND password_change_required = 0
-       ORDER BY id LIMIT 1`,
+       ORDER BY id LIMIT 1 FOR UPDATE`,
       [roleId],
     );
     if (!rows.length) {
@@ -838,5 +844,84 @@ export function createUserService({ dbPool }) {
     return getById(result.id, result.actorId);
   }
 
-  return { list, roles, getById, create, update, setStatus };
+  async function resetPassword({ id, input, actor: auth, request }) {
+    if (String(id) === String(auth.user.id))
+      throw failure(
+        409,
+        "OWN_PASSWORD_RESET_DENIED",
+        "No puedes restablecer tu propia contraseña desde la administración.",
+      );
+
+    const temporaryPassword = randomBytes(32).toString("base64url");
+    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
+    const result = await withTransaction(async (connection) => {
+      await lockAdministratorRole(connection);
+      const actor = await assertActorSessionPermissions(
+        connection,
+        auth,
+        requiredAdminPermissions,
+      );
+      const [targetLocks] = await connection.execute(
+        "SELECT id FROM users WHERE id = ? FOR UPDATE",
+        [id],
+      );
+      if (!targetLocks[0])
+        throw failure(
+          404,
+          "USER_NOT_FOUND",
+          "No se encontró la cuenta solicitada.",
+        );
+      const assignments = await checkTargetScope(connection, id, actor);
+      const state = await readState(connection, id);
+      if (!state)
+        throw failure(
+          404,
+          "USER_NOT_FOUND",
+          "No se encontró la cuenta solicitada.",
+        );
+      if (state.revision !== input.expectedRevision)
+        throw failure(
+          409,
+          "USER_REVISION_CONFLICT",
+          "La cuenta cambió. Actualiza sus datos antes de restablecer la contraseña.",
+        );
+      if (!state.user.is_active)
+        throw failure(
+          409,
+          "INACTIVE_USER_PASSWORD_RESET_DENIED",
+          "Activa la cuenta antes de restablecer su contraseña.",
+        );
+
+      await connection.execute(
+        `UPDATE users SET password_hash = ?, password_change_required = 1
+         WHERE id = ?`,
+        [passwordHash, id],
+      );
+      const [revoked] = await connection.execute(
+        `UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3)
+         WHERE user_id = ? AND revoked_at IS NULL`,
+        [id],
+      );
+      await assertAdministratorContinuity(connection);
+      await writeAudit(connection, {
+        actorId: actor.id,
+        targetId: id,
+        action: "users.password_reset",
+        details: {
+          revokedSessions: revoked.affectedRows,
+          passwordChangeRequired: true,
+        },
+        request,
+      });
+      const updated = await readState(connection, id);
+      const user = rowUser(updated.user, updated.revision, {
+        totalWarehouseCount: assignments.length,
+        visibleWarehouseCount: assignments.length,
+      });
+      return { user, revokedSessions: revoked.affectedRows };
+    });
+    return { ...result, temporaryPassword };
+  }
+
+  return { list, roles, getById, create, update, setStatus, resetPassword };
 }

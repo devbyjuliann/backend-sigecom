@@ -7,6 +7,7 @@ import request from "supertest";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createApp } from "../../src/app.js";
+import { changePassword } from "../../src/modules/auth/password-service.js";
 import {
   authenticate,
   requirePermission,
@@ -298,6 +299,59 @@ test("successful password change clears the required flag and revokes every sess
     .get("/api/v1/auth/me")
     .set("Cookie", newLogin.sessionCookie)
     .expect(200);
+});
+
+test("password change revalidates that its session is still active inside the transaction", async () => {
+  const session = await login();
+  const [[before]] = await pool.execute(
+    "SELECT password_hash, password_change_required FROM users WHERE id = ?",
+    [ownerId],
+  );
+  const probe = express();
+  probe.post(
+    "/change",
+    authenticate({
+      dbPool: pool,
+      authConfig,
+      allowPasswordChangePending: true,
+    }),
+    async (request, response, next) => {
+      try {
+        await pool.execute(
+          "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE id = ?",
+          [request.auth.sessionId],
+        );
+        const result = await changePassword({
+          dbPool: pool,
+          userId: request.auth.user.id,
+          sessionId: request.auth.sessionId,
+          currentPassword: initialPassword,
+          newPassword: changedPassword,
+          request,
+        });
+        response.json(result);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
+  probe.use(createErrorHandler(createLogger({ level: "silent" })));
+
+  const rejected = await request(probe)
+    .post("/change")
+    .set("Cookie", session.sessionCookie)
+    .expect(401);
+  assert.equal(rejected.body.error.code, "SESSION_INVALID");
+  const [[after]] = await pool.execute(
+    "SELECT password_hash, password_change_required FROM users WHERE id = ?",
+    [ownerId],
+  );
+  assert.equal(after.password_hash, before.password_hash);
+  assert.equal(Number(after.password_change_required), 1);
+  await request(app)
+    .get("/api/v1/auth/me")
+    .set("Cookie", session.sessionCookie)
+    .expect(401);
 });
 
 test("profile reads and updates only the authenticated user's display name", async () => {

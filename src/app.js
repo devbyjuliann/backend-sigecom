@@ -35,6 +35,12 @@ export function createApp({
     next();
   });
   app.use(requestLogger(logger));
+  app.use((request, response, next) => {
+    if (/^\/api\/v1\/users\/[^/]+\/password-reset$/.test(request.path)) {
+      response.set("Cache-Control", "no-store");
+    }
+    next();
+  });
 
   if (dbPool && authConfig) {
     app.use(

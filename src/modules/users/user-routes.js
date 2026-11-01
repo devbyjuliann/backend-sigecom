@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
 import { authenticate, requirePermission } from "../auth/auth-middleware.js";
 import { HttpError } from "../../shared/http-error.js";
@@ -56,6 +57,12 @@ const statusSchema = z
     isActive: z.boolean(),
   })
   .strict();
+const passwordResetSchema = z
+  .object({
+    expectedRevision: z.string().min(20).max(128),
+    confirmReset: z.literal(true),
+  })
+  .strict();
 
 function parse(schema, input, message) {
   const result = schema.safeParse(input);
@@ -64,7 +71,7 @@ function parse(schema, input, message) {
 }
 
 function parseId(value) {
-  if (!idPattern.test(value))
+  if (!idPattern.test(value) || BigInt(value) > 18446744073709551615n)
     throw new HttpError(400, "INVALID_USER_ID", "Indica una cuenta válida.");
   return value;
 }
@@ -86,10 +93,26 @@ export function createUserRouter({ dbPool, authConfig }) {
   const router = Router();
   const service = createUserService({ dbPool });
   const requireSession = authenticate({ dbPool, authConfig });
-  router.use(requireSession, requireAdministrator);
   router.use((_request, response, next) => {
     response.set("Cache-Control", "no-store");
     next();
+  });
+  router.use(requireSession, requireAdministrator);
+  const passwordResetLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    keyGenerator: (request) => String(request.auth.user.id),
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (request, response) =>
+      response.status(429).json({
+        error: {
+          code: "PASSWORD_RESET_RATE_LIMITED",
+          message:
+            "Se alcanzó el límite de restablecimientos. Inténtalo más tarde.",
+          requestId: request.requestId,
+        },
+      }),
   });
 
   router.get(
@@ -163,6 +186,28 @@ export function createUserRouter({ dbPool, authConfig }) {
           updateSchema,
           request.body,
           "Revisa los datos y la revisión de la cuenta.",
+        ),
+        actor: request.auth,
+        request,
+      });
+      response.set("Cache-Control", "no-store").json(result);
+    },
+  );
+
+  router.post(
+    "/:userId/password-reset",
+    requirePermission("users.read"),
+    requirePermission("users.manage"),
+    requirePermission("roles.manage"),
+    requirePermission("warehouses.read"),
+    passwordResetLimiter,
+    async (request, response) => {
+      const result = await service.resetPassword({
+        id: parseId(request.params.userId),
+        input: parse(
+          passwordResetSchema,
+          request.body,
+          "Confirma el restablecimiento con la revisión actual de la cuenta.",
         ),
         actor: request.auth,
         request,
