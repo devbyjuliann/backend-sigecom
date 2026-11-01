@@ -62,6 +62,13 @@ try {
   }
 
   await connection.query(
+    `REVOKE DELETE ON \`${target.database}\`.\`user_warehouses\` FROM '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `GRANT DELETE ON \`${target.database}\`.\`user_warehouses\` TO '${appUser}'@'127.0.0.1'`,
+  );
+
+  await connection.query(
     `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`sales\` TO '${appUser}'@'127.0.0.1'`,
   );
   await connection.query(
