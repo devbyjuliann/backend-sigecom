@@ -108,3 +108,28 @@ test("sale reversal inventory operations require an internal cancellation docume
   assert.equal(payload.sourceType, "sale_cancellation");
   assert.equal(payload.sourceId, "9007199254740993");
 });
+
+test("customer return inventory operations require an internal return document", () => {
+  const input = {
+    type: "customer_return",
+    sourceWarehouseId: "17",
+    destinationWarehouseId: null,
+    sourceType: "customer_return",
+    sourceId: "9007199254740993",
+    reason: "Mercancía apta recibida por devolución",
+    reference: "DEV-CLIENTE-42",
+    lines: [
+      { productId: "9007199254740995", quantity: 2, expectedVersion: "8" },
+    ],
+  };
+  assert.throws(
+    () => inventoryEngineValidation.normalizePayload(input),
+    /no está habilitado/i,
+  );
+  const payload = inventoryEngineValidation.normalizePayload(input, {
+    allowCustomerReturn: true,
+  });
+  assert.equal(payload.type, "customer_return");
+  assert.equal(payload.sourceType, "customer_return");
+  assert.equal(payload.sourceId, "9007199254740993");
+});

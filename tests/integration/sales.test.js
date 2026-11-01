@@ -153,6 +153,19 @@ function reversalInput(sale, overrides = {}) {
   };
 }
 
+function customerReturnInput(sale, lines, overrides = {}) {
+  return {
+    expectedVersion: sale.version,
+    reference: `DEV-${sale.id}`,
+    reason: "Mercancía recibida y revisada por el cliente",
+    physicalObservation: "Conteo físico documentado en la recepción.",
+    receivedPhysical: true,
+    inspected: true,
+    lines,
+    ...overrides,
+  };
+}
+
 before(async () => {
   pool = createDatabasePool("test");
   const [[database]] = await pool.query("SELECT DATABASE() AS name");
@@ -1601,6 +1614,422 @@ test("seller edits only owned drafts, versions reject stale writes, and auditor 
       : audit.details;
   assert.equal(auditDetails.previous.lines[0].unitPrice, "999.99");
   assert.equal(auditDetails.current.lines[0].unitPrice, "1000.01");
+});
+
+test("customer returns allow partial and complete quantities, restock only inspected apt units, and prevent over-return or cancellation", async () => {
+  const fixture = await createConfirmedReversalFixture(10);
+  const lineId = fixture.confirmed.lines[0].id;
+  const path = `/api/v1/sales/${fixture.created.id}/returns`;
+  const firstBody = customerReturnInput(
+    fixture.confirmed,
+    [
+      {
+        saleLineId: lineId,
+        quantityReceived: 4,
+        quantityRestocked: 3,
+        nonRestockReason: "Una unidad llegó con el empaque abierto",
+      },
+    ],
+    { reference: `DEV-PARCIAL-${fixture.fixture}` },
+  );
+  const first = await mutate(
+    "post",
+    path,
+    firstBody,
+    sessions.administrator,
+    `customer-return-partial-${fixture.fixture}`,
+  ).expect(201);
+  assert.equal(first.body.customerReturn.lines[0].quantityReceived, 4);
+  assert.equal(first.body.customerReturn.lines[0].quantityRestocked, 3);
+  assert.equal(first.body.customerReturn.lines[0].quantityNotRestocked, 1);
+  assert.equal(first.body.sale.status, "confirmed");
+  const [[balanceAfterFirst]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.equal(Number(balanceAfterFirst.quantity), 7);
+  assert.equal(first.body.sale.lines[0].returnedQuantity, 4);
+  assert.equal(first.body.sale.lines[0].returnableQuantity, 6);
+  const [[restockOperation]] = await pool.execute(
+    "SELECT id, operation_type FROM inventory_operations WHERE source_type = 'customer_return' AND source_id = ?",
+    [first.body.customerReturn.id],
+  );
+  assert.equal(restockOperation.operation_type, "customer_return");
+  const [[restockMovement]] = await pool.execute(
+    "SELECT direction, quantity FROM inventory_movements WHERE operation_id = ?",
+    [restockOperation.id],
+  );
+  assert.equal(restockMovement.direction, "IN");
+  assert.equal(Number(restockMovement.quantity), 3);
+  await mutate(
+    "post",
+    path,
+    { ...firstBody, reason: "Contenido diferente" },
+    sessions.administrator,
+    `customer-return-partial-${fixture.fixture}`,
+  ).expect(409);
+  await mutate(
+    "post",
+    path,
+    customerReturnInput(
+      first.body.sale,
+      [{ saleLineId: lineId, quantityReceived: 1, quantityRestocked: 1 }],
+      { reference: firstBody.reference },
+    ),
+    sessions.administrator,
+    `customer-return-duplicate-reference-${fixture.fixture}`,
+  ).expect(409);
+  const pdf = await get(`${path}/${first.body.customerReturn.id}/pdf`).expect(
+    200,
+  );
+  assert.match(pdf.headers["content-type"], /application\/pdf/);
+  assert.ok(pdf.body.toString("latin1").startsWith("%PDF-1.4"));
+  const replay = await mutate(
+    "post",
+    path,
+    firstBody,
+    sessions.administrator,
+    `customer-return-partial-${fixture.fixture}`,
+  ).expect(200);
+  assert.equal(replay.body.customerReturn.id, first.body.customerReturn.id);
+  await mutate(
+    "post",
+    `/api/v1/sales/${fixture.created.id}/reversal`,
+    reversalInput(first.body.sale),
+    sessions.administrator,
+    `customer-return-block-reversal-${fixture.fixture}`,
+  ).expect(409);
+
+  const secondBody = customerReturnInput(
+    first.body.sale,
+    [
+      {
+        saleLineId: lineId,
+        quantityReceived: 6,
+        quantityRestocked: 0,
+        nonRestockReason: "Mercancía no apta para reincorporación",
+      },
+    ],
+    { reference: `DEV-COMPLETA-${fixture.fixture}` },
+  );
+  const second = await mutate(
+    "post",
+    path,
+    secondBody,
+    sessions.administrator,
+    `customer-return-complete-${fixture.fixture}`,
+  ).expect(201);
+  assert.equal(second.body.sale.status, "confirmed");
+  const [[balanceAfterZero]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.equal(Number(balanceAfterZero.quantity), 7);
+  assert.deepEqual(balanceAfterZero, balanceAfterFirst);
+  const [[sourceIssue]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM inventory_operations WHERE source_type = 'sale' AND source_id = ? AND operation_type = 'sale_issue'",
+    [fixture.created.id],
+  );
+  assert.equal(Number(sourceIssue.count), 1);
+  const [[operationCount]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM inventory_operations WHERE source_type = 'customer_return' AND source_id = ?",
+    [second.body.customerReturn.id],
+  );
+  assert.equal(Number(operationCount.count), 0);
+  const noRestockReplay = await mutate(
+    "post",
+    path,
+    secondBody,
+    sessions.administrator,
+    `customer-return-complete-${fixture.fixture}`,
+  ).expect(200);
+  assert.equal(
+    noRestockReplay.body.customerReturn.id,
+    second.body.customerReturn.id,
+  );
+  await mutate(
+    "post",
+    path,
+    customerReturnInput(
+      second.body.sale,
+      [{ saleLineId: lineId, quantityReceived: 1, quantityRestocked: 1 }],
+      { reference: `DEV-EXCESO-${fixture.fixture}` },
+    ),
+    sessions.administrator,
+    `customer-return-excess-${fixture.fixture}`,
+  ).expect(409);
+  const history = await get(path).expect(200);
+  assert.equal(history.body.items.length, 2);
+  const detail = await get(`${path}/${first.body.customerReturn.id}`).expect(
+    200,
+  );
+  assert.equal(detail.body.id, first.body.customerReturn.id);
+});
+
+test("customer returns enforce manager permission, strict declarations, original lines, and required non-restock reason", async () => {
+  const fixture = await createConfirmedReversalFixture(2);
+  const path = `/api/v1/sales/${fixture.created.id}/returns`;
+  const valid = customerReturnInput(fixture.confirmed, [
+    {
+      saleLineId: fixture.confirmed.lines[0].id,
+      quantityReceived: 1,
+      quantityRestocked: 0,
+      nonRestockReason: "Empaque deteriorado",
+    },
+  ]);
+  await mutate(
+    "post",
+    path,
+    valid,
+    sessions.seller,
+    `customer-return-seller-${fixture.fixture}`,
+  ).expect(403);
+  await mutate(
+    "post",
+    path,
+    { ...valid, inspected: false },
+    sessions.administrator,
+    `customer-return-not-inspected-${fixture.fixture}`,
+  ).expect(400);
+  await mutate(
+    "post",
+    path,
+    { ...valid, lines: [{ ...valid.lines[0], quantityReceived: 0 }] },
+    sessions.administrator,
+    `customer-return-zero-quantity-${fixture.fixture}`,
+  ).expect(400);
+  await mutate(
+    "post",
+    path,
+    { ...valid, lines: [{ ...valid.lines[0], saleLineId: "999999999" }] },
+    sessions.administrator,
+    `customer-return-foreign-line-${fixture.fixture}`,
+  ).expect(400);
+  await mutate(
+    "post",
+    path,
+    { ...valid, lines: [{ ...valid.lines[0], nonRestockReason: "" }] },
+    sessions.administrator,
+    `customer-return-no-reason-${fixture.fixture}`,
+  ).expect(400);
+  await pool.execute("UPDATE products SET is_active = 0 WHERE id = ?", [
+    fixture.productId,
+  ]);
+  try {
+    const apt = {
+      ...valid,
+      reference: `INACTIVE-APT-${fixture.fixture}`,
+      lines: [
+        { ...valid.lines[0], quantityRestocked: 1, nonRestockReason: "" },
+      ],
+    };
+    const inactiveApt = await mutate(
+      "post",
+      path,
+      apt,
+      sessions.administrator,
+      `customer-return-inactive-apt-${fixture.fixture}`,
+    );
+    assert.equal(inactiveApt.status, 409, JSON.stringify(inactiveApt.body));
+    const historical = {
+      ...valid,
+      reference: `INACTIVE-NO-RESTOCK-${fixture.fixture}`,
+    };
+    const result = await mutate(
+      "post",
+      path,
+      historical,
+      sessions.administrator,
+      `customer-return-inactive-historical-${fixture.fixture}`,
+    ).expect(201);
+    assert.equal(result.body.customerReturn.lines[0].quantityNotRestocked, 1);
+  } finally {
+    await pool.execute("UPDATE products SET is_active = 1 WHERE id = ?", [
+      fixture.productId,
+    ]);
+  }
+});
+
+test("cancelled confirmed sales cannot receive customer returns", async () => {
+  const fixture = await createConfirmedReversalFixture(2);
+  const reversed = await mutate(
+    "post",
+    `/api/v1/sales/${fixture.created.id}/reversal`,
+    reversalInput(fixture.confirmed),
+    sessions.administrator,
+    `customer-return-cancelled-sale-reversal-${fixture.fixture}`,
+  ).expect(200);
+  await mutate(
+    "post",
+    `/api/v1/sales/${fixture.created.id}/returns`,
+    customerReturnInput(reversed.body.sale, [
+      {
+        saleLineId: fixture.confirmed.lines[0].id,
+        quantityReceived: 1,
+        quantityRestocked: 1,
+      },
+    ]),
+    sessions.administrator,
+    `customer-return-cancelled-sale-${fixture.fixture}`,
+  ).expect(409);
+});
+
+test("concurrent returns serialize with each other and with confirmed-sale reversal", async () => {
+  const fixture = await createConfirmedReversalFixture(3);
+  const path = `/api/v1/sales/${fixture.created.id}/returns`;
+  const makeReturn = (sale, reference) =>
+    customerReturnInput(
+      sale,
+      [
+        {
+          saleLineId: sale.lines[0].id,
+          quantityReceived: 2,
+          quantityRestocked: 2,
+        },
+      ],
+      { reference },
+    );
+  const concurrent = await Promise.all([
+    mutate(
+      "post",
+      path,
+      makeReturn(fixture.confirmed, `RACE-A-${fixture.fixture}`),
+      sessions.administrator,
+      `customer-return-race-a-${fixture.fixture}`,
+    ),
+    mutate(
+      "post",
+      path,
+      makeReturn(fixture.confirmed, `RACE-B-${fixture.fixture}`),
+      sessions.administrator,
+      `customer-return-race-b-${fixture.fixture}`,
+    ),
+  ]);
+  assert.deepEqual(
+    concurrent.map((response) => response.status).sort(),
+    [201, 409],
+  );
+  const [[returnCount]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM customer_returns WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(Number(returnCount.count), 1);
+
+  const other = await createConfirmedReversalFixture(2);
+  const race = await Promise.all([
+    mutate(
+      "post",
+      `/api/v1/sales/${other.created.id}/returns`,
+      makeReturn(other.confirmed, `RACE-C-${other.fixture}`),
+      sessions.administrator,
+      `customer-return-reverse-race-${other.fixture}`,
+    ),
+    mutate(
+      "post",
+      `/api/v1/sales/${other.created.id}/reversal`,
+      reversalInput(other.confirmed),
+      sessions.administrator,
+      `customer-reversal-race-${other.fixture}`,
+    ),
+  ]);
+  assert.deepEqual(race.map((response) => response.status).sort(), [
+    race.some((response) => response.status === 201) ? 201 : 200,
+    409,
+  ]);
+  const [[state]] = await pool.execute(
+    "SELECT status FROM sales WHERE id = ?",
+    [other.created.id],
+  );
+  const [[returns]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM customer_returns WHERE sale_id = ?",
+    [other.created.id],
+  );
+  const [[reversals]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_cancellations WHERE sale_id = ?",
+    [other.created.id],
+  );
+  assert.equal(Number(returns.count) + Number(reversals.count), 1);
+  assert.equal(
+    state.status,
+    Number(reversals.count) ? "cancelled" : "confirmed",
+  );
+});
+
+test("a customer-return audit failure rolls back document, inventory, sale version, and idempotency", async () => {
+  const fixture = await createConfirmedReversalFixture(2);
+  const [[before]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  const failingPool = {
+    async getConnection() {
+      const connection = await pool.getConnection();
+      return new Proxy(connection, {
+        get(target, property) {
+          const value = target[property];
+          if (property === "execute")
+            return async (sql, values) => {
+              if (
+                String(sql).includes("INSERT INTO audit_events") &&
+                values?.[1] === "sales.return_confirmed"
+              )
+                throw new Error(
+                  "Injected test-only customer-return audit failure",
+                );
+              return value.call(target, sql, values);
+            };
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+  const service = createSaleService({ dbPool: failingPool });
+  const key = `customer-return-audit-failure-${fixture.fixture}`;
+  await assert.rejects(
+    service.createCustomerReturn({
+      id: fixture.created.id,
+      input: customerReturnInput(fixture.confirmed, [
+        {
+          saleLineId: fixture.confirmed.lines[0].id,
+          quantityReceived: 1,
+          quantityRestocked: 1,
+        },
+      ]),
+      actor: {
+        user: { id: users.administrator, role: "administrator" },
+        warehouseIds: new Set([warehouseId]),
+      },
+      request: { ip: "127.0.0.1", get: () => "integration-test" },
+      key,
+    }),
+    /Injected test-only customer-return audit failure/,
+  );
+  const [[sale]] = await pool.execute(
+    "SELECT status, version FROM sales WHERE id = ?",
+    [fixture.created.id],
+  );
+  assert.equal(sale.status, "confirmed");
+  assert.equal(Number(sale.version), fixture.confirmed.version);
+  const [[after]] = await pool.execute(
+    "SELECT quantity, version FROM inventory_balances WHERE product_id = ? AND warehouse_id = ?",
+    [fixture.productId, warehouseId],
+  );
+  assert.deepEqual(after, before);
+  const [[documents]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM customer_returns WHERE sale_id = ?",
+    [fixture.created.id],
+  );
+  const [[operations]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM inventory_operations WHERE created_by = ? AND idempotency_key = ?",
+    [users.administrator, key],
+  );
+  const [[requests]] = await pool.execute(
+    "SELECT COUNT(*) AS count FROM sale_requests WHERE actor_id = ? AND idempotency_key = ?",
+    [users.administrator, key],
+  );
+  assert.equal(Number(documents.count), 0);
+  assert.equal(Number(operations.count), 0);
+  assert.equal(Number(requests.count), 0);
 });
 
 test("validates active references, assigned warehouses, unique products and wholesale minimums", async () => {

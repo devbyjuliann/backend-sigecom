@@ -24,6 +24,7 @@ test("loads versioned migrations in order with stable checksums", async () => {
       "0014",
       "0015",
       "0016",
+      "0017",
     ],
   );
   for (const migration of migrations) {
@@ -140,4 +141,20 @@ test("loads versioned migrations in order with stable checksums", async () => {
   assert.match(saleCancellations, /all_products_saleable/i);
   assert.match(saleCancellations, /ADD COLUMN reversal_id/i);
   assert.doesNotMatch(saleCancellations, /DROP\s+(?:TABLE|COLUMN)/i);
+
+  const customerReturns = migrations.find(
+    ({ version }) => version === "0017",
+  ).sql;
+  for (const table of ["customer_returns", "customer_return_lines"])
+    assert.match(
+      customerReturns,
+      new RegExp(`CREATE TABLE IF NOT EXISTS ${table}`, "i"),
+    );
+  assert.match(customerReturns, /uq_customer_returns_sale_reference/i);
+  assert.match(customerReturns, /FOREIGN KEY \(sale_line_id, sale_id\)/i);
+  assert.match(customerReturns, /ADD COLUMN return_id/i);
+  assert.match(customerReturns, /sales\.return/i);
+  assert.match(customerReturns, /role_permissions/i);
+  assert.match(customerReturns, /role\.code = 'administrator'/i);
+  assert.doesNotMatch(customerReturns, /DROP\s+(?:TABLE|COLUMN)/i);
 });

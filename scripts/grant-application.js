@@ -52,6 +52,7 @@ try {
     "purchase_receipt_lines",
     "supplier_returns",
     "supplier_return_lines",
+    "customer_returns",
   ];
 
   for (const table of applicationTables) {
@@ -65,6 +66,15 @@ try {
   );
   await connection.query(
     `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`sale_cancellations\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`customer_returns\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `GRANT SELECT, INSERT ON \`${target.database}\`.\`customer_return_lines\` TO '${appUser}'@'127.0.0.1'`,
+  );
+  await connection.query(
+    `REVOKE UPDATE, DELETE ON \`${target.database}\`.\`customer_return_lines\` FROM '${appUser}'@'127.0.0.1'`,
   );
   await connection.query(
     `GRANT SELECT, INSERT, UPDATE, DELETE ON \`${target.database}\`.\`sale_lines\` TO '${appUser}'@'127.0.0.1'`,

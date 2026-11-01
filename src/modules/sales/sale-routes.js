@@ -83,6 +83,44 @@ const reversalSchema = z
     allProductsSaleable: z.literal(true),
   })
   .strict();
+const customerReturnLineSchema = z
+  .object({
+    saleLineId: idSchema,
+    quantityReceived: z.number().int().min(1).max(4_294_967_295),
+    quantityRestocked: z.number().int().min(0).max(4_294_967_295),
+    nonRestockReason: z.string().trim().max(500).optional().default(""),
+  })
+  .strict()
+  .refine((line) => line.quantityRestocked <= line.quantityReceived, {
+    message: "La cantidad reintegrada no puede superar la recibida.",
+  })
+  .refine(
+    (line) =>
+      line.quantityRestocked === line.quantityReceived ||
+      line.nonRestockReason.length > 0,
+    {
+      message: "Indica el motivo de las unidades no reintegradas.",
+    },
+  );
+const customerReturnSchema = z
+  .object({
+    expectedVersion: z.number().int().min(1).max(2_147_483_647),
+    reference: z.string().trim().min(1).max(120),
+    reason: z.string().trim().min(1).max(500),
+    physicalObservation: z.string().trim().min(3).max(1000),
+    receivedPhysical: z.literal(true),
+    inspected: z.literal(true),
+    lines: z
+      .array(customerReturnLineSchema)
+      .min(1)
+      .max(50)
+      .refine(
+        (lines) =>
+          new Set(lines.map((line) => line.saleLineId)).size === lines.length,
+        "No repitas líneas de la venta.",
+      ),
+  })
+  .strict();
 const listSchema = z
   .object({
     page: z.coerce.number().int().min(1).max(1_000_000).default(1),
@@ -294,6 +332,93 @@ export function createSaleRouter({ dbPool, authConfig }) {
           key: idempotencyKey(request),
         }),
       );
+    },
+  );
+
+  router.post(
+    "/:id/returns",
+    auth,
+    requirePermission("sales.return"),
+    async (request, response) => {
+      if (!idPattern.test(request.params.id))
+        throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
+      const result = await service.createCustomerReturn({
+        id: request.params.id,
+        input: parse(customerReturnSchema, request.body),
+        actor: request.auth,
+        request,
+        key: idempotencyKey(request),
+      });
+      response.status(result.replayed ? 200 : 201).json(result);
+    },
+  );
+
+  router.get(
+    "/:id/returns",
+    auth,
+    requirePermission("sales.read"),
+    async (request, response) => {
+      if (!idPattern.test(request.params.id))
+        throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
+      response.set("Cache-Control", "no-store").json(
+        await service.listCustomerReturns({
+          saleId: request.params.id,
+          warehouseIds: [...request.auth.warehouseIds],
+        }),
+      );
+    },
+  );
+
+  router.get(
+    "/:id/returns/:returnId",
+    auth,
+    requirePermission("sales.read"),
+    async (request, response) => {
+      if (
+        !idPattern.test(request.params.id) ||
+        !idPattern.test(request.params.returnId)
+      )
+        throw new HttpError(
+          400,
+          "INVALID_CUSTOMER_RETURN_ID",
+          "Indica una devolución válida.",
+        );
+      response.set("Cache-Control", "no-store").json(
+        await service.getCustomerReturn({
+          saleId: request.params.id,
+          returnId: request.params.returnId,
+          warehouseIds: [...request.auth.warehouseIds],
+        }),
+      );
+    },
+  );
+
+  router.get(
+    "/:id/returns/:returnId/pdf",
+    auth,
+    requirePermission("sales.read"),
+    async (request, response) => {
+      if (
+        !idPattern.test(request.params.id) ||
+        !idPattern.test(request.params.returnId)
+      )
+        throw new HttpError(
+          400,
+          "INVALID_CUSTOMER_RETURN_ID",
+          "Indica una devolución válida.",
+        );
+      const pdf = await service.getCustomerReturnPdf({
+        saleId: request.params.id,
+        returnId: request.params.returnId,
+        warehouseIds: [...request.auth.warehouseIds],
+      });
+      response
+        .set("Cache-Control", "no-store")
+        .type("application/pdf")
+        .attachment(
+          `devolucion-cliente-${request.params.id}-${request.params.returnId}.pdf`,
+        )
+        .send(pdf);
     },
   );
 

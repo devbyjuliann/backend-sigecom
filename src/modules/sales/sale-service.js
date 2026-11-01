@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { HttpError } from "../../shared/http-error.js";
 import { createInventoryEngine } from "../inventory/inventory-engine.js";
+import { createCustomerReturnPdf } from "./customer-return-pdf.js";
 
 const maxCents = BigInt("9".repeat(22));
 const sorts = {
@@ -244,6 +245,502 @@ export function createSaleService({ dbPool }) {
     return { sale, reversal };
   }
 
+  async function assertReturnActor(connection, actorId) {
+    const [users] = await connection.execute(
+      `SELECT u.id, u.is_active, r.code AS role_code
+       FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ? FOR UPDATE`,
+      [actorId],
+    );
+    if (!users[0] || !users[0].is_active)
+      throw new HttpError(
+        401,
+        "SESSION_INVALID",
+        "La sesión no es válida o ha vencido.",
+      );
+    if (users[0].role_code !== "administrator")
+      throw new HttpError(
+        403,
+        "PERMISSION_DENIED",
+        "Solo un Administrador puede registrar devoluciones de clientes.",
+      );
+    const [permissions] = await connection.execute(
+      `SELECT 1 FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id
+       JOIN users u ON u.role_id = rp.role_id
+       WHERE u.id = ? AND p.code = 'sales.return' LOCK IN SHARE MODE`,
+      [actorId],
+    );
+    if (!permissions.length)
+      throw new HttpError(
+        403,
+        "PERMISSION_DENIED",
+        "No tienes permiso para registrar devoluciones.",
+      );
+  }
+
+  async function loadCustomerReturn(connection, returnId, warehouseIds) {
+    if (!warehouseIds.length)
+      throw new HttpError(
+        404,
+        "CUSTOMER_RETURN_NOT_FOUND",
+        "No se encontró la devolución disponible.",
+      );
+    const [headers] = await connection.execute(
+      `SELECT cr.*, s.commercial_code, DATE_FORMAT(s.sale_date, '%Y-%m-%d') AS sale_date,
+              s.customer_name_snapshot, s.warehouse_name_snapshot,
+              u.display_name AS returned_by_name
+       FROM customer_returns cr JOIN sales s ON s.id = cr.sale_id
+       JOIN users u ON u.id = cr.returned_by
+       WHERE cr.id = ? AND s.warehouse_id IN (${placeholders(warehouseIds)}) LIMIT 1`,
+      [returnId, ...warehouseIds],
+    );
+    const row = headers[0];
+    if (!row)
+      throw new HttpError(
+        404,
+        "CUSTOMER_RETURN_NOT_FOUND",
+        "No se encontró la devolución disponible.",
+      );
+    const [lines] = await connection.execute(
+      `SELECT crl.id, crl.sale_line_id, crl.product_id, crl.sku_snapshot,
+              crl.product_name_snapshot, crl.unit_snapshot, sl.quantity AS sold_quantity,
+              crl.quantity_received, crl.quantity_restocked, crl.non_restock_reason,
+              (crl.quantity_received - crl.quantity_restocked) AS quantity_not_restocked
+       FROM customer_return_lines crl JOIN sale_lines sl
+         ON sl.id = crl.sale_line_id AND sl.sale_id = crl.sale_id
+       WHERE crl.customer_return_id = ? ORDER BY sl.position, sl.id`,
+      [returnId],
+    );
+    return {
+      id: String(row.id),
+      number: `DEV-${String(row.id).padStart(6, "0")}`,
+      saleId: String(row.sale_id),
+      saleNumber: row.commercial_code,
+      saleDate: row.sale_date,
+      customerName: row.customer_name_snapshot,
+      warehouseName: row.warehouse_name_snapshot,
+      reference: row.reference,
+      reason: row.reason,
+      physicalObservation: row.physical_observation,
+      receivedPhysical: Boolean(row.received_physical),
+      inspected: Boolean(row.inspected),
+      sourceOperationId:
+        row.source_operation_id === null
+          ? null
+          : String(row.source_operation_id),
+      returnedBy: String(row.returned_by),
+      returnedByName: row.returned_by_name,
+      returnedAt: row.returned_at,
+      lines: lines.map((line) => ({
+        id: String(line.id),
+        saleLineId: String(line.sale_line_id),
+        productId: String(line.product_id),
+        sku: line.sku_snapshot,
+        name: line.product_name_snapshot,
+        unit: line.unit_snapshot,
+        soldQuantity: Number(line.sold_quantity),
+        quantityReceived: Number(line.quantity_received),
+        quantityRestocked: Number(line.quantity_restocked),
+        quantityNotRestocked: Number(line.quantity_not_restocked),
+        nonRestockReason: line.non_restock_reason,
+      })),
+    };
+  }
+
+  async function getCustomerReturn({ saleId, returnId, warehouseIds }) {
+    if (!warehouseIds.length)
+      throw new HttpError(
+        404,
+        "CUSTOMER_RETURN_NOT_FOUND",
+        "No se encontró la devolución disponible.",
+      );
+    const [rows] = await dbPool.execute(
+      `SELECT cr.id FROM customer_returns cr JOIN sales s ON s.id = cr.sale_id
+       WHERE cr.id = ? AND cr.sale_id = ? AND s.warehouse_id IN (${placeholders(warehouseIds)}) LIMIT 1`,
+      [returnId, saleId, ...warehouseIds],
+    );
+    if (!rows[0])
+      throw new HttpError(
+        404,
+        "CUSTOMER_RETURN_NOT_FOUND",
+        "No se encontró la devolución disponible.",
+      );
+    return loadCustomerReturn(dbPool, returnId, warehouseIds);
+  }
+
+  async function listCustomerReturns({ saleId, warehouseIds }) {
+    const sale = await loadSale(dbPool, saleId, warehouseIds);
+    const [rows] = await dbPool.execute(
+      "SELECT id FROM customer_returns WHERE sale_id = ? ORDER BY returned_at DESC, id DESC",
+      [saleId],
+    );
+    const items = [];
+    for (const row of rows)
+      items.push(
+        await loadCustomerReturn(dbPool, String(row.id), warehouseIds),
+      );
+    return { saleId: sale.id, items };
+  }
+
+  async function readCustomerReturnReplay(
+    connection,
+    { actorId, key, requestHash, saleId, warehouseIds },
+  ) {
+    const [rows] = await connection.execute(
+      `SELECT operation, request_hash, sale_id, return_id FROM sale_requests
+       WHERE actor_id = ? AND idempotency_key = ? LIMIT 1 FOR UPDATE`,
+      [actorId, key],
+    );
+    const prior = rows[0];
+    if (!prior) return null;
+    if (
+      prior.operation !== "return" ||
+      prior.request_hash !== requestHash ||
+      String(prior.sale_id) !== String(saleId) ||
+      prior.return_id === null
+    )
+      throw conflict(
+        "IDEMPOTENCY_KEY_REUSED",
+        "La clave de idempotencia ya se utilizó con otros datos.",
+      );
+    return loadCustomerReturn(
+      connection,
+      String(prior.return_id),
+      warehouseIds,
+    );
+  }
+
+  async function returnAttempt({ id, input, actor, request, key }) {
+    const connection = await dbPool.getConnection();
+    const canonicalInput = {
+      expectedVersion: input.expectedVersion,
+      reference: input.reference,
+      reason: input.reason,
+      physicalObservation: input.physicalObservation,
+      receivedPhysical: input.receivedPhysical,
+      inspected: input.inspected,
+      lines: [...input.lines].sort((a, b) =>
+        BigInt(a.saleLineId) < BigInt(b.saleLineId) ? -1 : 1,
+      ),
+    };
+    const requestHash = hashRequest("return", id, canonicalInput);
+    try {
+      await connection.beginTransaction();
+      await assertReturnActor(connection, actor.user.id);
+      const [sales] = await connection.execute(
+        "SELECT * FROM sales WHERE id = ? FOR UPDATE",
+        [id],
+      );
+      const sale = sales[0];
+      if (!sale || !actor.warehouseIds.has(String(sale.warehouse_id)))
+        throw new HttpError(
+          404,
+          "SALE_NOT_FOUND",
+          "No se encontró la venta disponible.",
+        );
+      const [assignments] = await connection.execute(
+        `SELECT w.is_active FROM warehouses w JOIN user_warehouses uw
+          ON uw.warehouse_id = w.id AND uw.user_id = ? WHERE w.id = ? LOCK IN SHARE MODE`,
+        [actor.user.id, sale.warehouse_id],
+      );
+      if (!assignments[0])
+        throw new HttpError(
+          404,
+          "SALE_NOT_FOUND",
+          "No se encontró la venta disponible.",
+        );
+      const replayed = await readCustomerReturnReplay(connection, {
+        actorId: actor.user.id,
+        key,
+        requestHash,
+        saleId: id,
+        warehouseIds: [...actor.warehouseIds],
+      });
+      if (replayed) {
+        await connection.commit();
+        const replaySale = await loadSale(connection, id, [
+          ...actor.warehouseIds,
+        ]);
+        return {
+          sale: await withReturnSummary(connection, id, replaySale),
+          customerReturn: replayed,
+          replayed: true,
+        };
+      }
+      const [inventoryKeyUses] = await connection.execute(
+        "SELECT id FROM inventory_operations WHERE created_by = ? AND idempotency_key = ? LIMIT 1 FOR UPDATE",
+        [actor.user.id, key],
+      );
+      if (inventoryKeyUses.length)
+        throw conflict(
+          "IDEMPOTENCY_KEY_REUSED",
+          "La clave de idempotencia ya se utilizó para otra operación.",
+        );
+      if (sale.status !== "confirmed")
+        throw conflict(
+          "SALE_NOT_RETURNABLE",
+          "Solo se admiten devoluciones de ventas confirmadas.",
+        );
+      if (!assignments[0].is_active)
+        throw conflict(
+          "INACTIVE_WAREHOUSE",
+          "La bodega original está inactiva.",
+        );
+      if (Number(sale.version) !== input.expectedVersion)
+        throw conflict(
+          "SALE_VERSION_CONFLICT",
+          "La venta cambió. Actualiza el documento antes de devolver mercancía.",
+        );
+
+      const lines = await getLines(connection, id);
+      const priorTotals = new Map();
+      const [totals] = await connection.execute(
+        `SELECT sale_line_id, SUM(quantity_received) AS received
+         FROM customer_return_lines WHERE sale_id = ? GROUP BY sale_line_id`,
+        [id],
+      );
+      for (const row of totals)
+        priorTotals.set(String(row.sale_line_id), Number(row.received));
+      const originals = new Map(lines.map((line) => [String(line.id), line]));
+      const selected = input.lines.map((requested) => {
+        const original = originals.get(requested.saleLineId);
+        if (!original)
+          throw invalid("Una línea no pertenece a la venta original.");
+        const returned = priorTotals.get(requested.saleLineId) || 0;
+        const pending = Number(original.quantity) - returned;
+        if (requested.quantityReceived > pending)
+          throw conflict(
+            "RETURN_QUANTITY_EXCEEDED",
+            `La cantidad supera lo pendiente para ${original.product_name_snapshot} (${pending}).`,
+          );
+        return { requested, original, returned, pending };
+      });
+      const [duplicates] = await connection.execute(
+        "SELECT id FROM customer_returns WHERE sale_id = ? AND reference = ? LIMIT 1 FOR UPDATE",
+        [id, input.reference],
+      );
+      if (duplicates.length)
+        throw conflict(
+          "DUPLICATE_RETURN_REFERENCE",
+          "Esta referencia ya se registró para la venta.",
+        );
+
+      const [inserted] = await connection.execute(
+        `INSERT INTO customer_returns
+          (sale_id, reference, reason, physical_observation, received_physical, inspected, returned_by)
+         VALUES (?, ?, ?, ?, 1, 1, ?)`,
+        [
+          id,
+          input.reference,
+          input.reason,
+          input.physicalObservation,
+          actor.user.id,
+        ],
+      );
+      const returnId = String(inserted.insertId);
+      for (const { requested, original } of selected) {
+        const notRestocked =
+          requested.quantityReceived - requested.quantityRestocked;
+        await connection.execute(
+          `INSERT INTO customer_return_lines
+            (customer_return_id, sale_id, sale_line_id, product_id, sku_snapshot,
+             product_name_snapshot, unit_snapshot, quantity_received, quantity_restocked, non_restock_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            returnId,
+            id,
+            original.id,
+            original.product_id,
+            original.sku_snapshot,
+            original.product_name_snapshot,
+            original.unit_snapshot,
+            requested.quantityReceived,
+            requested.quantityRestocked,
+            notRestocked ? requested.nonRestockReason : null,
+          ],
+        );
+      }
+
+      const restockLines = selected.filter(
+        ({ requested }) => requested.quantityRestocked > 0,
+      );
+      let operationId = null;
+      if (restockLines.length) {
+        const inventoryLines = [];
+        for (const { requested, original } of restockLines) {
+          const [balances] = await connection.execute(
+            `SELECT CAST(version AS CHAR) AS version FROM inventory_balances
+             WHERE product_id = ? AND warehouse_id = ? FOR UPDATE`,
+            [original.product_id, sale.warehouse_id],
+          );
+          if (!balances[0])
+            throw conflict(
+              "INVENTORY_HISTORY_INCONSISTENT",
+              "No se encontró el saldo de Inventario de la venta.",
+            );
+          inventoryLines.push({
+            productId: String(original.product_id),
+            quantity: requested.quantityRestocked,
+            expectedVersion: String(balances[0].version),
+          });
+        }
+        const inventory = await inventoryEngine.applyWithinTransaction({
+          connection,
+          userId: actor.user.id,
+          idempotencyKey: key,
+          payload: {
+            type: "customer_return",
+            sourceWarehouseId: String(sale.warehouse_id),
+            destinationWarehouseId: null,
+            sourceType: "customer_return",
+            sourceId: returnId,
+            reason: input.reason,
+            reference: input.reference,
+            lines: inventoryLines,
+          },
+          internal: true,
+          allowCustomerReturn: true,
+          request,
+          validateProducts: async ({ products }) => {
+            for (const { original } of restockLines) {
+              const product = products.get(String(original.product_id));
+              if (!product || product.unit !== original.unit_snapshot)
+                throw conflict(
+                  "RETURN_PRODUCT_INVALID",
+                  `El producto ${original.product_name_snapshot} no está disponible con su unidad original para reintegrarlo.`,
+                );
+            }
+          },
+        });
+        operationId = inventory.operationId;
+        await connection.execute(
+          "UPDATE customer_returns SET source_operation_id = ? WHERE id = ?",
+          [operationId, returnId],
+        );
+      }
+
+      const [updated] = await connection.execute(
+        `UPDATE sales SET updated_by = ?, version = version + 1
+         WHERE id = ? AND status = 'confirmed' AND version = ?`,
+        [actor.user.id, id, input.expectedVersion],
+      );
+      if (updated.affectedRows !== 1)
+        throw conflict(
+          "SALE_VERSION_CONFLICT",
+          "La venta cambió. Actualiza el documento antes de devolver mercancía.",
+        );
+      await writeAudit(connection, {
+        userId: actor.user.id,
+        action: "sales.return_confirmed",
+        saleId: id,
+        details: {
+          returnId,
+          expectedVersion: input.expectedVersion,
+          version: input.expectedVersion + 1,
+          reference: input.reference,
+          sourceOperationId: operationId,
+          reason: input.reason,
+          physicalObservation: input.physicalObservation,
+          receivedPhysical: true,
+          inspected: true,
+          lines: selected.map(({ requested, original }) => ({
+            saleLineId: String(original.id),
+            productId: String(original.product_id),
+            received: requested.quantityReceived,
+            restocked: requested.quantityRestocked,
+            notRestocked:
+              requested.quantityReceived - requested.quantityRestocked,
+            nonRestockReason: requested.nonRestockReason || null,
+            unit: original.unit_snapshot,
+          })),
+        },
+        request,
+      });
+      await connection.execute(
+        `INSERT INTO sale_requests (actor_id, idempotency_key, operation, request_hash, sale_id, return_id, response_version)
+         VALUES (?, ?, 'return', ?, ?, ?, ?)`,
+        [
+          actor.user.id,
+          key,
+          requestHash,
+          id,
+          returnId,
+          input.expectedVersion + 1,
+        ],
+      );
+      const document = await loadCustomerReturn(connection, returnId, [
+        ...actor.warehouseIds,
+      ]);
+      const updatedSale = await withReturnSummary(
+        connection,
+        id,
+        await loadSale(connection, id, [...actor.warehouseIds]),
+      );
+      await connection.commit();
+      return { sale: updatedSale, customerReturn: document, replayed: false };
+    } catch (error) {
+      try {
+        await connection.rollback();
+      } catch {
+        /* Preserve original error. */
+      }
+      if (error.code === "ER_DUP_ENTRY") {
+        if (String(error.message).includes("uq_sale_requests_actor_key")) {
+          const replay = await readCustomerReturnReplay(dbPool, {
+            actorId: actor.user.id,
+            key,
+            requestHash,
+            saleId: id,
+            warehouseIds: [...actor.warehouseIds],
+          });
+          if (replay) {
+            const replaySale = await loadSale(dbPool, id, [
+              ...actor.warehouseIds,
+            ]);
+            return {
+              sale: await withReturnSummary(dbPool, id, replaySale),
+              customerReturn: replay,
+              replayed: true,
+            };
+          }
+        }
+        if (
+          String(error.message).includes("uq_customer_returns_sale_reference")
+        )
+          throw conflict(
+            "DUPLICATE_RETURN_REFERENCE",
+            "Esta referencia ya se registró para la venta.",
+          );
+      }
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  async function createCustomerReturn(args) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await returnAttempt(args);
+      } catch (error) {
+        if (![1213, 1205].includes(error.errno) || attempt >= 2) throw error;
+        attempt += 1;
+        await new Promise((resolve) =>
+          setTimeout(resolve, 15 * 2 ** (attempt - 1)),
+        );
+      }
+    }
+  }
+
+  async function getCustomerReturnPdf({ saleId, returnId, warehouseIds }) {
+    const customerReturn = await getCustomerReturn({
+      saleId,
+      returnId,
+      warehouseIds,
+    });
+    return createCustomerReturnPdf(customerReturn);
+  }
+
   async function assertReversalActor(connection, actorId) {
     const [users] = await connection.execute(
       `SELECT u.id, u.is_active, role.code AS role_code
@@ -355,6 +852,15 @@ export function createSaleService({ dbPool }) {
         throw reversalConflict(
           "SALE_ALREADY_REVERSED",
           "Esta venta ya tiene una anulación registrada.",
+        );
+      const [existingReturns] = await connection.execute(
+        "SELECT id FROM customer_returns WHERE sale_id = ? LIMIT 1 FOR UPDATE",
+        [id],
+      );
+      if (existingReturns.length)
+        throw reversalConflict(
+          "SALE_HAS_RETURNS",
+          "No se puede anular una venta que ya tiene devoluciones registradas.",
         );
 
       const [sourceOperations] = await connection.execute(
@@ -738,7 +1244,36 @@ export function createSaleService({ dbPool }) {
         "SALE_NOT_FOUND",
         "No se encontró la venta disponible.",
       );
-    return loadSale(dbPool, id, warehouseIds);
+    const sale = await loadSale(dbPool, id, warehouseIds);
+    return withReturnSummary(dbPool, id, sale);
+  }
+
+  async function withReturnSummary(connection, id, sale) {
+    const [lines] = await connection.execute(
+      `SELECT sl.id, sl.quantity, COALESCE(SUM(crl.quantity_received), 0) AS returned,
+              COALESCE(SUM(crl.quantity_restocked), 0) AS restocked
+       FROM sale_lines sl LEFT JOIN customer_return_lines crl
+         ON crl.sale_line_id = sl.id AND crl.sale_id = sl.sale_id
+       WHERE sl.sale_id = ? GROUP BY sl.id`,
+      [id],
+    );
+    const summary = new Map(lines.map((line) => [String(line.id), line]));
+    sale.lines = sale.lines.map((line) => {
+      const totals = summary.get(line.id);
+      const returnedQuantity = Number(totals?.returned || 0);
+      return {
+        ...line,
+        returnedQuantity,
+        returnableQuantity: Math.max(0, line.quantity - returnedQuantity),
+        restockedQuantity: Number(totals?.restocked || 0),
+      };
+    });
+    sale.returnStatus = sale.lines.every((line) => line.returnedQuantity === 0)
+      ? "none"
+      : sale.lines.every((line) => line.returnableQuantity === 0)
+        ? "complete"
+        : "partial";
+    return sale;
   }
 
   async function list({ warehouseIds, query }) {
@@ -1389,5 +1924,16 @@ export function createSaleService({ dbPool }) {
     }
   }
 
-  return { list, getById, getReversal, write, confirm, reverse };
+  return {
+    list,
+    getById,
+    getReversal,
+    getCustomerReturn,
+    listCustomerReturns,
+    createCustomerReturn,
+    getCustomerReturnPdf,
+    write,
+    confirm,
+    reverse,
+  };
 }

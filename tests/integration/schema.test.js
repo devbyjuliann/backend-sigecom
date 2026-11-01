@@ -9,6 +9,8 @@ const expectedTables = [
   "audit_events",
   "categories",
   "customers",
+  "customer_returns",
+  "customer_return_lines",
   "inventory_balances",
   "inventory_movements",
   "inventory_operations",
@@ -74,7 +76,7 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   assert.equal(Number(roles.count), 4);
   assert.ok(Number(permissions.count) >= 35);
   assert.ok(Number(rolePermissions.count) >= Number(permissions.count));
-  assert.equal(Number(versions.count), 16);
+  assert.equal(Number(versions.count), 17);
 
   const [closurePermission] = await pool.execute(
     `SELECT r.code AS role_code
@@ -97,6 +99,15 @@ test("test migrations and role seeds can be applied repeatedly without duplicate
   );
   assert.deepEqual(
     returnPermission.map(({ role_code }) => role_code),
+    ["administrator"],
+  );
+  const [salesReturnPermission] = await pool.execute(
+    `SELECT r.code AS role_code FROM role_permissions rp
+     JOIN roles r ON r.id = rp.role_id JOIN permissions p ON p.id = rp.permission_id
+     WHERE p.code = 'sales.return' ORDER BY r.code`,
+  );
+  assert.deepEqual(
+    salesReturnPermission.map(({ role_code }) => role_code),
     ["administrator"],
   );
 
@@ -199,7 +210,7 @@ test("all phase 1 tables use InnoDB and declared foreign keys", async () => {
     `SELECT COUNT(*) AS count FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = 'sigecom_test' AND REFERENCED_TABLE_NAME IS NOT NULL`,
   );
-  assert.equal(Number(constraints.count), 64);
+  assert.equal(Number(constraints.count), 73);
 });
 
 test("database connections use UTC sessions without changing MariaDB global settings", async () => {
@@ -400,7 +411,7 @@ test("migration account can read schema but cannot drop existing tables", async 
     const [[row]] = await migrator.query(
       "SELECT COUNT(*) AS count FROM schema_migrations",
     );
-    assert.equal(Number(row.count), 16);
+    assert.equal(Number(row.count), 17);
     await assert.rejects(
       migrator.query("DROP TABLE sigecom_test.schema_migrations"),
       (error) =>
