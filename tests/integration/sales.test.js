@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
-import mysql from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
@@ -10,6 +9,8 @@ import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
 import { createSaleService } from "../../src/modules/sales/sale-service.js";
+import { connectAdminTestDatabase } from "../support/test-database.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -40,6 +41,7 @@ let inactiveCustomerId;
 let productId;
 let minimumProductId;
 let inactiveProductId;
+const fixtures = new IntegrationFixtures({ suite: "sales" });
 let categoryId;
 let reversalFixtureNumber = 0;
 
@@ -191,17 +193,20 @@ before(async () => {
       [role.id, email, `Ventas ${account} ${suffix}`, passwordHash],
     );
     users[account] = String(created.insertId);
+    fixtures.user(users[account]);
   }
   const [warehouse] = await pool.execute(
     "INSERT INTO warehouses (code, name) VALUES (?, ?)",
     [`S-${suffix}`, `Bodega ventas ${suffix}`],
   );
   warehouseId = String(warehouse.insertId);
+  fixtures.warehouse(warehouseId);
   const [unassignedWarehouse] = await pool.execute(
     "INSERT INTO warehouses (code, name) VALUES (?, ?)",
     [`SU-${suffix}`, `Bodega no asignada ${suffix}`],
   );
   unassignedWarehouseId = String(unassignedWarehouse.insertId);
+  fixtures.warehouse(unassignedWarehouseId);
   for (const account of [
     "administrator",
     "seller",
@@ -213,6 +218,7 @@ before(async () => {
       "INSERT INTO user_warehouses (user_id, warehouse_id, assigned_by) VALUES (?, ?, ?)",
       [users[account], warehouseId, users.administrator],
     );
+    fixtures.assignment(users[account], warehouseId);
   }
   const [category] = await pool.execute(
     "INSERT INTO categories (name) VALUES (?)",
@@ -250,14 +256,11 @@ before(async () => {
 
 after(async () => {
   if (!pool) return;
-  for (const userId of Object.values(users)) {
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [userId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [userId]);
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
   }
-  await pool.end();
 });
 
 test("creates an inventory-neutral draft with exact COP totals and idempotency", async () => {
@@ -1018,13 +1021,7 @@ test("audit failure rolls back sale confirmation and all inventory writes", asyn
      WHERE product_id = ? AND warehouse_id = ?`,
     [productId, warehouseId],
   );
-  const privileged = await mysql.createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: process.env.XAMPP_ADMIN_USER || "root",
-    password: process.env.XAMPP_ADMIN_PASSWORD || "",
-    database: "sigecom_test",
-  });
+  const privileged = await connectAdminTestDatabase();
   const triggerName = `trg_test_sale_audit_${suffix.toLowerCase()}`;
   try {
     await privileged.query(
@@ -1076,13 +1073,15 @@ test("confirmation revalidates the warehouse assignment and persisted unit snaps
     sessions.seller,
     `warehouse-revoke-create-${suffix}`,
   ).expect(201);
-  const privileged = await mysql.createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: process.env.XAMPP_ADMIN_USER || "root",
-    password: process.env.XAMPP_ADMIN_PASSWORD || "",
-    database: "sigecom_test",
-  });
+  const privileged = await connectAdminTestDatabase();
+  const [[sellerAssignment]] = await privileged.execute(
+    "SELECT assigned_by, created_at FROM user_warehouses WHERE user_id = ? AND warehouse_id = ?",
+    [users.seller, warehouseId],
+  );
+  assert.ok(
+    sellerAssignment,
+    "The fixture assignment must exist before mutation",
+  );
   try {
     await privileged.execute(
       "DELETE FROM user_warehouses WHERE user_id = ? AND warehouse_id = ?",
@@ -1097,19 +1096,20 @@ test("confirmation revalidates the warehouse assignment and persisted unit snaps
     ).expect(404);
   } finally {
     await privileged.execute(
-      "INSERT IGNORE INTO user_warehouses (user_id, warehouse_id, assigned_by) VALUES (?, ?, ?)",
-      [users.seller, warehouseId, users.administrator],
+      `INSERT INTO user_warehouses (user_id, warehouse_id, assigned_by, created_at)
+       VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE
+       assigned_by = VALUES(assigned_by), created_at = VALUES(created_at)`,
+      [
+        users.seller,
+        warehouseId,
+        sellerAssignment.assigned_by,
+        sellerAssignment.created_at,
+      ],
     );
     await privileged.end();
   }
 
-  const warehouseAdmin = await mysql.createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: process.env.XAMPP_ADMIN_USER || "root",
-    password: process.env.XAMPP_ADMIN_PASSWORD || "",
-    database: "sigecom_test",
-  });
+  const warehouseAdmin = await connectAdminTestDatabase();
   await warehouseAdmin.execute(
     "INSERT IGNORE INTO user_warehouses (user_id, warehouse_id, assigned_by) VALUES (?, ?, ?)",
     [users.administrator, unassignedWarehouseId, users.administrator],

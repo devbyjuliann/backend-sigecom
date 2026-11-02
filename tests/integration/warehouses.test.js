@@ -2,13 +2,13 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
-import { createConnection } from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
-import { getDatabaseConfig } from "../../src/db/config.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
+import { connectTestDatabase } from "../support/test-database.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -27,6 +27,7 @@ let userIds = {};
 let adminSession;
 let assignedOperatorSession;
 let unassignedOperatorSession;
+const fixtures = new IntegrationFixtures({ suite: "warehouses" });
 
 async function signIn(email) {
   const csrfResponse = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -66,6 +67,12 @@ function createWarehouse(input, session = adminSession) {
   return mutate("post", "/api/v1/warehouses", input, session);
 }
 
+async function createOwnedWarehouse(input, session = adminSession) {
+  const response = await createWarehouse(input, session).expect(201);
+  fixtures.warehouse(response.body.id);
+  return response;
+}
+
 before(async () => {
   pool = createDatabasePool("test");
   const [[database]] = await pool.query("SELECT DATABASE() AS name");
@@ -99,6 +106,7 @@ before(async () => {
       [role.id, email, `Prueba ${key} ${suffix}`, passwordHash],
     );
     userIds[key] = String(result.insertId);
+    fixtures.user(userIds[key]);
   }
 
   adminSession = await signIn(accounts.administrator);
@@ -108,15 +116,11 @@ before(async () => {
 
 after(async () => {
   if (!pool) return;
-  for (const userId of Object.values(userIds)) {
-    await pool.execute(
-      `UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3)
-       WHERE user_id = ? AND revoked_at IS NULL`,
-      [userId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [userId]);
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
   }
-  await pool.end();
 });
 
 test("administrator creates warehouses with explicit administrator assignments", async () => {
@@ -126,7 +130,7 @@ test("administrator creates warehouses with explicit administrator assignments",
     location: "Zona industrial",
     responsibleUserId: userIds.responsible,
   };
-  const created = await createWarehouse(input).expect(201);
+  const created = await createOwnedWarehouse(input);
   const warehouse = created.body;
 
   assert.equal(warehouse.code, input.code);
@@ -190,15 +194,15 @@ test("administrator creates warehouses with explicit administrator assignments",
 });
 
 test("assigned warehouse operators are scoped by explicit assignments, not responsible status", async () => {
-  const assigned = await createWarehouse({
+  const assigned = await createOwnedWarehouse({
     code: `ASI-${suffix}`,
     name: `Bodega asignada ${suffix}`,
-  }).expect(201);
-  const unassigned = await createWarehouse({
+  });
+  const unassigned = await createOwnedWarehouse({
     code: `SIN-${suffix}`,
     name: `Bodega sin asignar ${suffix}`,
     responsibleUserId: userIds.assignedOperator,
-  }).expect(201);
+  });
 
   await pool.execute(
     `INSERT INTO user_warehouses (user_id, warehouse_id, assigned_by)
@@ -230,10 +234,10 @@ test("assigned warehouse operators are scoped by explicit assignments, not respo
 });
 
 test("warehouse management validates codes, responsible users, filters, and pagination", async () => {
-  const existing = await createWarehouse({
+  const existing = await createOwnedWarehouse({
     code: `VAL-${suffix}`,
     name: `Bodega de validación ${suffix}`,
-  }).expect(201);
+  });
 
   const duplicate = await createWarehouse({
     code: `val-${suffix}`,
@@ -261,10 +265,10 @@ test("warehouse management validates codes, responsible users, filters, and pagi
     userIds.responsible,
   ]);
 
-  const other = await createWarehouse({
+  const other = await createOwnedWarehouse({
     code: `OTR-${suffix}`,
     name: "Código ocupado para actualizar",
-  }).expect(201);
+  });
   const duplicateUpdate = await mutate(
     "patch",
     `/api/v1/warehouses/${existing.body.id}`,
@@ -319,10 +323,10 @@ test("warehouse management validates codes, responsible users, filters, and pagi
 });
 
 test("assigned administrator can query and reactivate an inactive warehouse", async () => {
-  const created = await createWarehouse({
+  const created = await createOwnedWarehouse({
     code: `INA-${suffix}`,
     name: `Bodega reactivable ${suffix}`,
-  }).expect(201);
+  });
   const warehouseId = created.body.id;
 
   const deactivated = await mutate(
@@ -367,10 +371,10 @@ test("assigned administrator can query and reactivate an inactive warehouse", as
 });
 
 test("only administrators may create, edit, or change warehouse status", async () => {
-  const created = await createWarehouse({
+  const created = await createOwnedWarehouse({
     code: `SEC-${suffix}`,
     name: `Bodega segura ${suffix}`,
-  }).expect(201);
+  });
 
   await createWarehouse(
     { code: `NO-${suffix}`, name: "No autorizada" },
@@ -422,10 +426,10 @@ test("inventory and sales schemas exist without exposing inventory write endpoin
 });
 
 test("warehouse with positive stock cannot be deactivated", async () => {
-  const created = await createWarehouse({
+  const created = await createOwnedWarehouse({
     code: `STK-${suffix}`,
     name: `Bodega con saldo ${suffix}`,
-  }).expect(201);
+  });
   const product = await pool.execute(
     `INSERT INTO products
        (sku, name, category_id, unit, purchase_price, sale_price)
@@ -434,9 +438,7 @@ test("warehouse with positive stock cannot be deactivated", async () => {
     [`STK-${suffix}`, `Producto saldo ${suffix}`],
   );
   const productId = String(product[0].insertId);
-  const privileged = await createConnection(
-    getDatabaseConfig("test", process.env, "MIGRATOR"),
-  );
+  const privileged = await connectTestDatabase("MIGRATOR");
   try {
     await privileged.execute(
       `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)

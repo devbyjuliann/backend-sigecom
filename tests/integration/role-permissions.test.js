@@ -7,6 +7,7 @@ import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
 const unique = randomBytes(8).toString("hex");
@@ -20,8 +21,11 @@ let sellerRoleId;
 let originalAssignments;
 let adminRoleId;
 let originalAdminAssignments;
+let originalRoleMetadata;
+let originalAdminMetadata;
 let adminPassword;
 let sellerPassword;
+const fixtures = new IntegrationFixtures({ suite: "role-permissions" });
 
 async function csrf() {
   const response = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -99,6 +103,28 @@ before(async () => {
   assert.ok(warehouse, "sigecom_test necesita una bodega activa");
   sellerRoleId = targetRole.id;
   adminRoleId = adminRole.id;
+  const [[activeSharedSessions]] = await pool.execute(
+    `SELECT COUNT(*) AS count FROM user_sessions s
+     JOIN users u ON u.id = s.user_id
+     WHERE u.role_id IN (?, ?) AND s.revoked_at IS NULL
+       AND s.expires_at > UTC_TIMESTAMP(3)`,
+    [sellerRoleId, adminRoleId],
+  );
+  assert.equal(
+    Number(activeSharedSessions.count),
+    0,
+    "Refusing role-permissions setup while unrelated live role sessions exist",
+  );
+  const [[sellerMetadata]] = await pool.execute(
+    "SELECT code, name, description, is_system, created_at, updated_at FROM roles WHERE id = ?",
+    [sellerRoleId],
+  );
+  const [[adminMetadata]] = await pool.execute(
+    "SELECT code, name, description, is_system, created_at, updated_at FROM roles WHERE id = ?",
+    [adminRoleId],
+  );
+  originalRoleMetadata = sellerMetadata;
+  originalAdminMetadata = adminMetadata;
   const [adminBaseline] = await pool.execute(
     `SELECT permission_id, DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s.%f') AS created_at
      FROM role_permissions WHERE role_id = ? ORDER BY permission_id`,
@@ -127,6 +153,7 @@ before(async () => {
     ],
   );
   adminId = String(admin.insertId);
+  fixtures.user(adminId);
   const [seller] = await pool.execute(
     `INSERT INTO users (role_id, email, display_name, password_hash, is_active, password_change_required)
      VALUES (?, ?, 'Vendedor de permisos test', ?, 1, 0)`,
@@ -137,16 +164,19 @@ before(async () => {
     ],
   );
   sellerId = String(seller.insertId);
+  fixtures.user(sellerId);
   for (const row of allWarehouses[0]) {
     await pool.execute(
       "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
       [adminId, row.id],
     );
+    fixtures.assignment(adminId, row.id);
   }
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [sellerId, warehouse.id],
   );
+  fixtures.assignment(sellerId, warehouse.id);
   adminSession = await login(
     `roles-admin-${unique}@sigecom.invalid`,
     adminPassword,
@@ -159,37 +189,49 @@ before(async () => {
 
 after(async () => {
   if (!pool) return;
-  if (sellerRoleId && originalAssignments) {
-    await pool.execute("DELETE FROM role_permissions WHERE role_id = ?", [
-      sellerRoleId,
-    ]);
-    for (const row of originalAssignments) {
-      await pool.execute(
-        "INSERT INTO role_permissions (role_id, permission_id, created_at) VALUES (?, ?, ?)",
-        [sellerRoleId, row.permission_id, row.created_at],
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (const [roleId, assignments] of [
+      [sellerRoleId, originalAssignments],
+      [adminRoleId, originalAdminAssignments],
+    ]) {
+      if (!roleId || !assignments) continue;
+      await connection.execute(
+        "DELETE FROM role_permissions WHERE role_id = ?",
+        [roleId],
+      );
+      for (const row of assignments) {
+        await connection.execute(
+          "INSERT INTO role_permissions (role_id, permission_id, created_at) VALUES (?, ?, ?)",
+          [roleId, row.permission_id, row.created_at],
+        );
+      }
+    }
+    if (originalRoleMetadata) {
+      await connection.execute(
+        `UPDATE roles SET code=?, name=?, description=?, is_system=?, created_at=?, updated_at=? WHERE id=?`,
+        [...Object.values(originalRoleMetadata), sellerRoleId],
       );
     }
-  }
-  if (adminRoleId && originalAdminAssignments) {
-    await pool.execute("DELETE FROM role_permissions WHERE role_id = ?", [
-      adminRoleId,
-    ]);
-    for (const row of originalAdminAssignments) {
-      await pool.execute(
-        "INSERT INTO role_permissions (role_id, permission_id, created_at) VALUES (?, ?, ?)",
-        [adminRoleId, row.permission_id, row.created_at],
+    if (originalAdminMetadata) {
+      await connection.execute(
+        `UPDATE roles SET code=?, name=?, description=?, is_system=?, created_at=?, updated_at=? WHERE id=?`,
+        [...Object.values(originalAdminMetadata), adminRoleId],
       );
     }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
   }
-  for (const id of [sellerId, adminId].filter(Boolean)) {
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [id],
-    );
-    await pool.execute("DELETE FROM user_warehouses WHERE user_id = ?", [id]);
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [id]);
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
   }
-  await pool.end();
 });
 
 test("permission administration lists policy and atomically revokes affected role sessions", async () => {
@@ -424,14 +466,12 @@ test("concurrent role edits reject the stale revision and restore permissions", 
   const before = await api("get", "/api/v1/roles/seller/permissions").expect(
     200,
   );
-  const candidates = before.body.configurablePermissionCodes.filter((code) => {
-    const permission = before.body.permissions.find(
-      (item) => item.code === code,
-    );
-    return !permission?.dependencies?.length;
-  });
-  assert.ok(candidates.length >= 2);
-  const [firstCode, secondCode] = candidates;
+  const [firstCode, secondCode] = ["categories.read", "customers.manage"];
+  assert.ok(
+    before.body.configurablePermissionCodes.includes(firstCode) &&
+      before.body.configurablePermissionCodes.includes(secondCode),
+    "The concurrent edit fixtures must start from the captured seller baseline",
+  );
   const firstInput = {
     expectedRevision: before.body.revision,
     configurablePermissionCodes: before.body.configurablePermissionCodes.filter(
@@ -455,6 +495,12 @@ test("concurrent role edits reject the stale revision and restore permissions", 
     assert.deepEqual(
       responses.map((response) => response.status).sort(),
       [200, 409],
+      JSON.stringify(
+        responses.map((response) => ({
+          status: response.status,
+          body: response.body,
+        })),
+      ),
     );
     const conflict = responses.find((response) => response.status === 409);
     assert.equal(conflict.body.error.code, "ROLE_PERMISSION_REVISION_CONFLICT");
@@ -623,6 +669,12 @@ test("global role editing blocks when one affected warehouse is outside the acto
     [sellerId],
   );
   assert.ok(sellerWarehouse);
+  const [[adminWarehouseAssignment]] = await pool.execute(
+    `SELECT assigned_by, created_at FROM user_warehouses
+     WHERE user_id = ? AND warehouse_id = ?`,
+    [adminId, sellerWarehouse.warehouse_id],
+  );
+  assert.ok(adminWarehouseAssignment);
   await pool.execute(
     "DELETE FROM user_warehouses WHERE user_id = ? AND warehouse_id = ?",
     [adminId, sellerWarehouse.warehouse_id],
@@ -644,8 +696,15 @@ test("global role editing blocks when one affected warehouse is outside the acto
     assert.equal(response.body.error.code, "ROLE_WAREHOUSE_SCOPE_REQUIRED");
   } finally {
     await pool.execute(
-      "INSERT IGNORE INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
-      [adminId, sellerWarehouse.warehouse_id],
+      `INSERT INTO user_warehouses (user_id, warehouse_id, assigned_by, created_at)
+       VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE
+       assigned_by = VALUES(assigned_by), created_at = VALUES(created_at)`,
+      [
+        adminId,
+        sellerWarehouse.warehouse_id,
+        adminWarehouseAssignment.assigned_by,
+        adminWarehouseAssignment.created_at,
+      ],
     );
   }
 });
@@ -665,6 +724,7 @@ test("non-administrator accounts cannot read the role policy endpoints", async (
     ],
   );
   const deniedUserId = String(created.insertId);
+  fixtures.user(deniedUserId);
   try {
     const [[warehouse]] = await pool.execute(
       "SELECT id FROM warehouses WHERE is_active = 1 ORDER BY id LIMIT 1",

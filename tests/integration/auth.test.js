@@ -17,13 +17,15 @@ import {
 import { revokeUserSessions } from "../../src/modules/auth/auth-service.js";
 import { createErrorHandler } from "../../src/shared/error-handler.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
-const testEmail = "auth-test@sigecom.invalid";
-const testWarehouseCode = "AUTH-TEST";
+const testEmail = `auth-test-${randomUUID()}@sigecom.invalid`;
+const testWarehouseCode = `AUTH-${randomUUID().replaceAll("-", "").slice(0, 20).toUpperCase()}`;
 let pool;
 let fixture;
 let authConfig;
+const fixtures = new IntegrationFixtures({ suite: "auth" });
 
 function cookieValue(headers, name) {
   const cookie = (headers["set-cookie"] || []).find((value) =>
@@ -106,71 +108,42 @@ before(async () => {
   const [[role]] = await pool.execute(
     "SELECT id FROM roles WHERE code = 'seller'",
   );
-  const [[existingUser]] = await pool.execute(
-    "SELECT id FROM users WHERE email = ?",
-    [testEmail],
+  const [user] = await pool.execute(
+    `INSERT INTO users (role_id, email, password_hash, is_active, password_change_required)
+     VALUES (?, ?, ?, 1, 0)`,
+    [role.id, testEmail, passwordHash],
   );
-  let userId = existingUser?.id;
-
-  if (userId) {
-    await pool.execute(
-      `UPDATE users SET role_id = ?, password_hash = ?, is_active = 1,
-       password_change_required = 0 WHERE id = ?`,
-      [role.id, passwordHash, userId],
-    );
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [userId],
-    );
-  } else {
-    const [result] = await pool.execute(
-      `INSERT INTO users (role_id, email, password_hash, is_active, password_change_required)
-       VALUES (?, ?, ?, 1, 0)`,
-      [role.id, testEmail, passwordHash],
-    );
-    userId = result.insertId;
-  }
-
-  const [[existingWarehouse]] = await pool.execute(
-    "SELECT id FROM warehouses WHERE code = ?",
-    [testWarehouseCode],
+  const userId = String(user.insertId);
+  fixtures.user(userId);
+  const [warehouse] = await pool.execute(
+    "INSERT INTO warehouses (code, name, is_active) VALUES (?, ?, 1)",
+    [testWarehouseCode, "Bodega de pruebas de autenticación"],
   );
-  let warehouseId = existingWarehouse?.id;
-  if (warehouseId) {
-    await pool.execute("UPDATE warehouses SET is_active = 1 WHERE id = ?", [
-      warehouseId,
-    ]);
-  } else {
-    const [result] = await pool.execute(
-      "INSERT INTO warehouses (code, name, is_active) VALUES (?, ?, 1)",
-      [testWarehouseCode, "Bodega de pruebas de autenticación"],
-    );
-    warehouseId = result.insertId;
-  }
+  const warehouseId = String(warehouse.insertId);
+  fixtures.warehouse(warehouseId);
 
   await pool.execute(
     `INSERT INTO user_warehouses (user_id, warehouse_id)
      VALUES (?, ?) ON DUPLICATE KEY UPDATE warehouse_id = VALUES(warehouse_id)`,
     [userId, warehouseId],
   );
+  fixtures.assignment(userId, warehouseId);
 
   fixture = { userId, warehouseId, password };
 });
 
 after(async () => {
-  if (pool && fixture) {
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [fixture.userId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [
-      fixture.userId,
-    ]);
-    await pool.execute("UPDATE warehouses SET is_active = 0 WHERE id = ?", [
-      fixture.warehouseId,
-    ]);
+  if (!pool) return;
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+    if (fixture) {
+      await pool.execute("UPDATE warehouses SET is_active = 0 WHERE id = ?", [
+        fixture.warehouseId,
+      ]);
+    }
+  } finally {
+    await pool.end();
   }
-  if (pool) await pool.end();
 });
 
 test("login accepts valid credentials and returns an HttpOnly local session cookie", async () => {

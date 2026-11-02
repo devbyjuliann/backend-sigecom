@@ -9,6 +9,7 @@ import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { createInventoryService } from "../../src/modules/inventory/inventory-service.js";
 import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -127,6 +128,7 @@ let warehouseId;
 let productId;
 let zeroCostProductId;
 let categoryId;
+const fixtures = new IntegrationFixtures({ suite: "purchases" });
 
 async function signIn(email) {
   const csrf = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -187,12 +189,14 @@ before(async () => {
       [roleRow.id, email, `Compras ${account} ${suffix}`, passwordHash],
     );
     users[account] = String(created.insertId);
+    fixtures.user(users[account]);
   }
   const [warehouse] = await pool.execute(
     "INSERT INTO warehouses (code, name) VALUES (?, ?)",
     [`P-${suffix}`, `Bodega compras ${suffix}`],
   );
   warehouseId = String(warehouse.insertId);
+  fixtures.warehouse(warehouseId);
   for (const role of [
     "administrator",
     "secondAdministrator",
@@ -233,14 +237,11 @@ before(async () => {
 
 after(async () => {
   if (!pool) return;
-  for (const userId of Object.values(users)) {
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [userId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [userId]);
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
   }
-  await pool.end();
 });
 
 test("administrator can create, review, confirm and cancel orders without stock effects", async () => {
@@ -732,6 +733,7 @@ test("order writes revalidate active suppliers, products, and assigned warehouse
     "INSERT INTO warehouses (code, name) VALUES (?, ?)",
     [`UN-${suffix}`, `Bodega sin asignar ${suffix}`],
   );
+  fixtures.warehouse(String(warehouse.insertId));
   await mutate(
     "post",
     "/api/v1/purchase-orders",

@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
-import mysql from "mysql2/promise";
-import { getDatabaseConfig } from "../../src/db/config.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
 import { createInventoryService } from "../../src/modules/inventory/inventory-service.js";
 import { createProductService } from "../../src/modules/products/product-service.js";
+import { connectTestDatabase } from "../support/test-database.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const suffix = randomBytes(6).toString("hex").toUpperCase();
 let pool;
@@ -15,6 +15,7 @@ let userId;
 let categoryId;
 let warehouseId;
 let productId;
+const fixtures = new IntegrationFixtures({ suite: "inventory-engine" });
 
 function initialPayload(quantity = 8) {
   return {
@@ -42,6 +43,7 @@ before(async () => {
     [role.id, `inventory-engine-${suffix}@sigecom.invalid`],
   );
   userId = String(user.insertId);
+  fixtures.user(userId);
   const [category] = await pool.execute(
     "INSERT INTO categories (name) VALUES (?)",
     [`Inventario ${suffix}`],
@@ -52,6 +54,7 @@ before(async () => {
     [`INV-${suffix}`, `Bodega inventario ${suffix}`],
   );
   warehouseId = String(warehouse.insertId);
+  fixtures.warehouse(warehouseId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [userId, warehouseId],
@@ -66,7 +69,12 @@ before(async () => {
 });
 
 after(async () => {
-  if (pool) await pool.end();
+  if (!pool) return;
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
+  }
 });
 
 test("internal ledger operations are atomic, versioned and idempotent", async () => {
@@ -407,13 +415,8 @@ test("movement date filters use inclusive Bogota days over UTC timestamps", asyn
     });
   }
 
-  const migrator = await mysql.createConnection(
-    getDatabaseConfig("test", process.env, "MIGRATOR"),
-  );
+  const migrator = await connectTestDatabase("MIGRATOR");
   try {
-    await migrator.query("SET time_zone = '+00:00'");
-    const [[database]] = await migrator.query("SELECT DATABASE() AS name");
-    assert.equal(database.name, "sigecom_test");
     for (const [index, createdAt] of [
       "2024-03-01 05:00:00.000",
       "2024-03-02 04:59:59.999",
@@ -467,6 +470,7 @@ test("movement history hides the other side of a transfer from single-warehouse 
     [`PRIV-${suffix}`, `Destino privado ${suffix}`],
   );
   const destinationId = String(destination.insertId);
+  fixtures.warehouse(destinationId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [userId, destinationId],
@@ -500,6 +504,7 @@ test("movement history hides the other side of a transfer from single-warehouse 
     [`inventory-private-reader-${suffix}@sigecom.invalid`, userId],
   );
   const sourceOnlyUserId = String(reader.insertId);
+  fixtures.user(sourceOnlyUserId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [sourceOnlyUserId, warehouseId],
@@ -686,13 +691,8 @@ test("inventory engine rejects new writes when the historical unit differs from 
     },
   });
 
-  const migrator = await mysql.createConnection(
-    getDatabaseConfig("test", process.env, "MIGRATOR"),
-  );
+  const migrator = await connectTestDatabase("MIGRATOR");
   try {
-    await migrator.query("SET time_zone = '+00:00'");
-    const [[database]] = await migrator.query("SELECT DATABASE() AS name");
-    assert.equal(database.name, "sigecom_test");
     const [changed] = await migrator.execute(
       `UPDATE inventory_movements SET unit_snapshot = 'caja'
        WHERE operation_id = ? AND product_id = ? AND warehouse_id = ?`,
@@ -756,6 +756,7 @@ test("simultaneous operations use independent connections and reject a stale ver
     [`inventory-racer-${suffix}@sigecom.invalid`, userId],
   );
   const secondUserId = String(independentUser.insertId);
+  fixtures.user(secondUserId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [secondUserId, warehouseId],
@@ -970,6 +971,7 @@ test("inventory reads are assignment-scoped and distinguish missing from zero ba
     [`inventory-unassigned-${suffix}@sigecom.invalid`, userId],
   );
   const unassignedId = String(unassigned[0].insertId);
+  fixtures.user(unassignedId);
   const noAccess = await service.listBalances({
     userId: unassignedId,
     page: 1,
@@ -1005,6 +1007,7 @@ test("historical reads permit assigned inactive warehouses", async () => {
     [`INVD-${suffix}`, `Bodega histórica ${suffix}`],
   );
   const destinationId = String(destination.insertId);
+  fixtures.warehouse(destinationId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [userId, destinationId],

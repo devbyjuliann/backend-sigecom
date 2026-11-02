@@ -4,8 +4,8 @@
   "description": "API REST de SIGECOM",
   "main": "src/server.js",
   "scripts": {
-    "test": "node --test tests/health.test.js tests/database/*.test.js",
-    "test:integration": "node --env-file=.env --test tests/integration/*.test.js",
+    "test": "node --test tests/health.test.js tests/database/*.test.js tests/support/integration-fixtures.test.js",
+    "test:integration": "node --env-file=.env tests/support/integration-runner.js",
     "db:provision": "node --env-file=.env scripts/provision-databases.js",
     "db:migrate:test": "node --env-file=.env scripts/migrate.js test",
     "db:migrate:dev": "node --env-file=.env scripts/migrate.js development",

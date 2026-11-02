@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
-import { createConnection } from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
+import {
+  connectAdminTestDatabase,
+  connectTestDatabase,
+} from "../support/test-database.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -29,6 +33,8 @@ let users = {};
 let sessions = {};
 let roleIds = {};
 let warehouseIds = {};
+let migrator;
+const fixtures = new IntegrationFixtures({ suite: "dashboard" });
 
 async function signIn(email) {
   const csrf = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -78,7 +84,8 @@ before(async () => {
   const [[productsRead]] = await pool.execute(
     "SELECT id FROM permissions WHERE code = 'products.read'",
   );
-  const [limitedRole] = await pool.execute(
+  migrator = await connectTestDatabase("MIGRATOR");
+  const [limitedRole] = await migrator.execute(
     "INSERT INTO roles (code, name, description, is_system) VALUES (?, ?, ?, 0)",
     [
       limitedRoleCode,
@@ -87,7 +94,8 @@ before(async () => {
     ],
   );
   roleIds.limited = String(limitedRole.insertId);
-  const [noDashboardRole] = await pool.execute(
+  fixtures.role(roleIds.limited);
+  const [noDashboardRole] = await migrator.execute(
     "INSERT INTO roles (code, name, description, is_system) VALUES (?, ?, ?, 0)",
     [
       noDashboardRoleCode,
@@ -96,7 +104,8 @@ before(async () => {
     ],
   );
   roleIds.noDashboard = String(noDashboardRole.insertId);
-  await pool.execute(
+  fixtures.role(roleIds.noDashboard);
+  await migrator.execute(
     "INSERT INTO role_permissions (role_id, permission_id) VALUES (?, ?), (?, ?)",
     [roleIds.limited, dashboardRead.id, roleIds.limited, productsRead.id],
   );
@@ -108,6 +117,7 @@ before(async () => {
       [roleIds[roleCode], email, passwordHash],
     );
     users[roleCode] = String(result.insertId);
+    fixtures.user(users[roleCode]);
   }
 
   const [category] = await pool.execute(
@@ -154,6 +164,7 @@ before(async () => {
       [`DASH-${suffix}-${code}`, `Bodega ${label} ${suffix}`],
     );
     warehouseIds[code] = String(warehouse.insertId);
+    fixtures.warehouse(warehouseIds[code]);
   }
   await pool.execute(
     `INSERT INTO user_warehouses (user_id, warehouse_id, assigned_by)
@@ -183,13 +194,7 @@ after(async () => {
   if (!pool) return;
   let cleanupConnection;
   try {
-    cleanupConnection = await createConnection({
-      host: "127.0.0.1",
-      port: 3306,
-      user: process.env.XAMPP_ADMIN_USER || "root",
-      password: process.env.XAMPP_ADMIN_PASSWORD || "",
-      database: "sigecom_test",
-    });
+    cleanupConnection = await connectAdminTestDatabase();
     const [[database]] = await cleanupConnection.query(
       "SELECT DATABASE() AS name",
     );
@@ -219,31 +224,26 @@ after(async () => {
         [warehouseIds.A, warehouseIds.U],
       );
     }
-    for (const userId of Object.values(users)) {
-      await pool.execute(
-        `UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3)
-         WHERE user_id = ? AND revoked_at IS NULL`,
-        [userId],
-      );
-      await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [
-        userId,
-      ]);
+    await fixtures.cleanupUserAssignments(pool);
+    for (const [roleCode, roleId] of Object.entries(roleIds)) {
+      if (!roleId || !roleIds.seller) continue;
+      const assignedUserIds = Object.entries(users)
+        .filter(([userRole]) => userRole === roleCode)
+        .map(([, userId]) => userId);
+      if (assignedUserIds.length) {
+        await pool.execute(
+          `UPDATE users SET role_id = ? WHERE id IN (${assignedUserIds.map(() => "?").join(",")})`,
+          [roleIds.seller, ...assignedUserIds],
+        );
+      }
     }
-    if (users.limited && users.noDashboard) {
-      await pool.execute(`UPDATE users SET role_id = ? WHERE id IN (?, ?)`, [
-        roleIds.seller,
-        users.limited,
-        users.noDashboard,
-      ]);
-    }
-    if (roleIds.limited && roleIds.noDashboard) {
+    for (const roleId of fixtures.ownedRoles) {
       await cleanupConnection.execute(
-        "DELETE FROM role_permissions WHERE role_id IN (?, ?)",
-        [roleIds.limited, roleIds.noDashboard],
+        "DELETE FROM role_permissions WHERE role_id = ?",
+        [roleId],
       );
-      await cleanupConnection.execute("DELETE FROM roles WHERE id IN (?, ?)", [
-        roleIds.limited,
-        roleIds.noDashboard,
+      await cleanupConnection.execute("DELETE FROM roles WHERE id = ?", [
+        roleId,
       ]);
     }
   } catch (error) {
@@ -252,6 +252,7 @@ after(async () => {
   } finally {
     await pool.end();
     await cleanupConnection?.end();
+    await migrator?.end();
   }
 });
 

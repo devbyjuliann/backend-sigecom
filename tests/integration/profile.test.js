@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { after, before, beforeEach, test } from "node:test";
 import bcrypt from "bcrypt";
 import express from "express";
@@ -14,10 +14,12 @@ import {
 } from "../../src/modules/auth/auth-middleware.js";
 import { createErrorHandler } from "../../src/shared/error-handler.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
-const ownerEmail = "phase15-owner@sigecom.invalid";
-const otherEmail = "phase15-other@sigecom.invalid";
+const fixtureId = randomUUID();
+const ownerEmail = `phase15-owner-${fixtureId}@sigecom.invalid`;
+const otherEmail = `phase15-other-${fixtureId}@sigecom.invalid`;
 const initialPassword = "Temporal-segura-2026!";
 const changedPassword = "Nueva-Clave-segura-2026!";
 let pool;
@@ -25,6 +27,7 @@ let authConfig;
 let app;
 let ownerId;
 let otherId;
+const fixtures = new IntegrationFixtures({ suite: "profile" });
 
 function cookieFrom(response, name) {
   const value = (response.headers["set-cookie"] || []).find((cookie) =>
@@ -106,30 +109,14 @@ before(async () => {
     [otherEmail, "Otra cuenta", "otherId"],
   ]) {
     const passwordHash = await bcrypt.hash(initialPassword, 12);
-    const [[existing]] = await pool.execute(
-      "SELECT id FROM users WHERE email = ?",
-      [email],
+    const [created] = await pool.execute(
+      `INSERT INTO users
+       (role_id,email,display_name,password_hash,is_active,password_change_required)
+       VALUES (?,?,?,?,1,1)`,
+      [role.id, email, displayName, passwordHash],
     );
-    let id = existing?.id;
-    if (id) {
-      await pool.execute(
-        `UPDATE users SET role_id = ?, display_name = ?, password_hash = ?,
-         is_active = 1, password_change_required = 1 WHERE id = ?`,
-        [role.id, displayName, passwordHash, id],
-      );
-    } else {
-      const [created] = await pool.execute(
-        `INSERT INTO users
-         (role_id,email,display_name,password_hash,is_active,password_change_required)
-         VALUES (?,?,?,?,1,1)`,
-        [role.id, email, displayName, passwordHash],
-      );
-      id = created.insertId;
-    }
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [id],
-    );
+    const id = String(created.insertId);
+    fixtures.user(id);
     if (idTarget === "ownerId") ownerId = id;
     else otherId = id;
   }
@@ -152,14 +139,10 @@ beforeEach(async () => {
 });
 
 after(async () => {
-  if (pool) {
-    for (const id of [ownerId, otherId]) {
-      await pool.execute(
-        "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-        [id],
-      );
-      await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [id]);
-    }
+  if (!pool) return;
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
     await pool.end();
   }
 });

@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
-import { createConnection } from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { connectAdminTestDatabase } from "../support/test-database.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -414,13 +414,7 @@ test("mutations require trusted origin and CSRF and audit failures roll back the
     .send(supplierInput({ identificationNumber: `CSRF-S-${suffix}` }))
     .expect(403);
 
-  const privileged = await createConnection({
-    host: "127.0.0.1",
-    port: 3306,
-    user: process.env.XAMPP_ADMIN_USER || "root",
-    password: process.env.XAMPP_ADMIN_PASSWORD || "",
-    database: "sigecom_test",
-  });
+  const privileged = await connectAdminTestDatabase();
   const triggerName = `trg_test_partner_audit_${suffix.toLowerCase()}`;
   const identificationNumber = `ROLLBACK-${suffix}`;
   try {

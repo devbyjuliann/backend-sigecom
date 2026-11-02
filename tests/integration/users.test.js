@@ -7,6 +7,7 @@ import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
 const unique = randomBytes(8).toString("hex");
@@ -15,6 +16,7 @@ const targetEmail = `users-target-${unique}@sigecom.invalid`;
 let pool;
 let authConfig;
 let adminId;
+const fixtures = new IntegrationFixtures({ suite: "users" });
 let warehouseId;
 let adminPassword;
 let app;
@@ -112,6 +114,7 @@ before(async () => {
   );
   secondWarehouseId = String(secondWarehouse.insertId);
   extraWarehouseIds.push(secondWarehouseId);
+  fixtures.warehouse(secondWarehouseId);
   adminPassword = randomBytes(32).toString("base64url");
   const hash = await bcrypt.hash(adminPassword, 12);
   const [created] = await pool.execute(
@@ -121,6 +124,7 @@ before(async () => {
     [administrator.id, adminEmail, hash],
   );
   adminId = String(created.insertId);
+  fixtures.user(adminId);
   await pool.execute(
     `INSERT INTO user_warehouses (user_id, warehouse_id)
      VALUES (?, ?), (?, ?)`,
@@ -132,41 +136,12 @@ before(async () => {
 });
 
 after(async () => {
-  if (pool && createdUserId) {
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [createdUserId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [
-      createdUserId,
-    ]);
+  if (!pool) return;
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
   }
-  for (const userId of extraCreatedUserIds) {
-    await pool.execute(
-      "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
-      [userId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [userId]);
-  }
-  if (pool && adminId) {
-    await pool.execute(
-      `UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3)
-       WHERE user_id = ? AND revoked_at IS NULL`,
-      [adminId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [
-      adminId,
-    ]);
-    await pool.execute("UPDATE warehouses SET is_active = 0 WHERE id = ?", [
-      secondWarehouseId,
-    ]);
-    for (const warehouseId of extraWarehouseIds) {
-      await pool.execute("UPDATE warehouses SET is_active = 0 WHERE id = ?", [
-        warehouseId,
-      ]);
-    }
-  }
-  if (pool) await pool.end();
 });
 
 test("administrator creates a user with a one-time temporary password", async () => {
@@ -179,6 +154,7 @@ test("administrator creates a user with a one-time temporary password", async ()
 
   const { user, temporaryPassword } = response.body;
   createdUserId = user.id;
+  fixtures.user(createdUserId);
   assert.equal(user.email, targetEmail);
   assert.equal(user.roleCode, "seller");
   assert.equal(user.isActive, true);
@@ -478,6 +454,7 @@ test("an active account with a required password change can receive a replacemen
     warehouseIds: [warehouseId],
   }).expect(201);
   extraCreatedUserIds.push(created.body.user.id);
+  fixtures.user(created.body.user.id);
   const detail = await api(
     "get",
     `/api/v1/users/${created.body.user.id}`,
@@ -600,6 +577,7 @@ test("mutual administrator password resets serialize and cannot invalidate the s
     }).expect(201);
     admins.push(created.body.user.id);
     extraCreatedUserIds.push(created.body.user.id);
+    fixtures.user(created.body.user.id);
     initialPasswords.push(created.body.temporaryPassword);
   }
   for (let index = 0; index < admins.length; index += 1) {
@@ -813,6 +791,7 @@ test("hides out-of-scope warehouse details and blocks all edits to that account"
   );
   const outOfScopeWarehouseId = String(createdWarehouse.insertId);
   extraWarehouseIds.push(outOfScopeWarehouseId);
+  fixtures.warehouse(outOfScopeWarehouseId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
     [createdUserId, outOfScopeWarehouseId],
@@ -876,6 +855,7 @@ test("creates accounts only with each of the four existing roles and rejects uns
       warehouseIds: [warehouseId],
     }).expect(201);
     extraCreatedUserIds.push(response.body.user.id);
+    fixtures.user(response.body.user.id);
     assert.equal(response.body.user.roleCode, roleCode);
     assert.equal(response.body.user.passwordChangeRequired, true);
     await pool.execute(
@@ -915,6 +895,7 @@ test("rejects warehouse assignments outside the actor scope or to inactive wareh
   );
   const outOfScope = String(createdWarehouse.insertId);
   extraWarehouseIds.push(outOfScope);
+  fixtures.warehouse(outOfScope);
   const denied = await api("post", "/api/v1/users", {
     email: `users-denied-scope-${unique}@sigecom.invalid`,
     displayName: "No autorizada",
@@ -964,6 +945,7 @@ test("serializes simultaneous administrator offboarding and prevents mutual deac
   }).expect(201);
   const secondAdminId = response.body.user.id;
   extraCreatedUserIds.push(secondAdminId);
+  fixtures.user(secondAdminId);
   const initialPassword = response.body.temporaryPassword;
   const pendingSession = await login(
     `users-concurrent-admin-${unique}@sigecom.invalid`,
@@ -1006,7 +988,13 @@ test("serializes simultaneous administrator offboarding and prevents mutual deac
       secondAdminSession,
     ),
   ]);
-  assert.equal(outcomes.filter((result) => result.status === 200).length, 1);
+  assert.equal(
+    outcomes.filter((result) => result.status === 200).length,
+    1,
+    JSON.stringify(
+      outcomes.map((result) => ({ status: result.status, body: result.body })),
+    ),
+  );
   assert.ok(
     outcomes.every((result) => [200, 401, 403, 409].includes(result.status)),
     JSON.stringify(
@@ -1033,6 +1021,7 @@ test("user administration requires the administrator role and effective permissi
     [sellerRole.id, `users-authz-seller-${unique}@sigecom.invalid`, hash],
   );
   const sellerId = String(created.insertId);
+  fixtures.user(sellerId);
   try {
     await pool.execute(
       "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?)",
@@ -1058,6 +1047,9 @@ test("user administration requires the administrator role and effective permissi
       [sellerId],
     );
     await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [
+      sellerId,
+    ]);
+    await pool.execute("DELETE FROM user_warehouses WHERE user_id = ?", [
       sellerId,
     ]);
   }

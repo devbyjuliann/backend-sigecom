@@ -7,6 +7,7 @@ import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
+import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
 const suffix = randomBytes(6).toString("hex").toUpperCase();
@@ -23,6 +24,7 @@ let userIds = {};
 let adminSession;
 let sellerSession;
 let unassignedSession;
+const fixtures = new IntegrationFixtures({ suite: "products" });
 let categoryId;
 let warehouseId;
 
@@ -101,6 +103,7 @@ before(async () => {
       [role.id, email, passwordHash],
     );
     userIds[key] = String(result.insertId);
+    fixtures.user(userIds[key]);
   }
   const [category] = await pool.execute(
     "INSERT INTO categories (name, description) VALUES (?, ?)",
@@ -112,6 +115,7 @@ before(async () => {
     [`PRD-${suffix}`, `Bodega productos ${suffix}`],
   );
   warehouseId = String(warehouse.insertId);
+  fixtures.warehouse(warehouseId);
   await pool.execute(
     "INSERT INTO user_warehouses (user_id, warehouse_id) VALUES (?, ?), (?, ?)",
     [userIds.seller, warehouseId, userIds.administrator, warehouseId],
@@ -123,15 +127,11 @@ before(async () => {
 
 after(async () => {
   if (!pool) return;
-  for (const userId of Object.values(userIds)) {
-    await pool.execute(
-      `UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3)
-       WHERE user_id = ? AND revoked_at IS NULL`,
-      [userId],
-    );
-    await pool.execute("UPDATE users SET is_active = 0 WHERE id = ?", [userId]);
+  try {
+    await fixtures.cleanupUserAssignments(pool);
+  } finally {
+    await pool.end();
   }
-  await pool.end();
 });
 
 test("administrator creates, lists, filters and updates products with exact prices", async () => {
