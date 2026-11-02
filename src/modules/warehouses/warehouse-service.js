@@ -188,6 +188,12 @@ export function createWarehouseService({ dbPool }) {
     let warehouseId;
     try {
       await connection.beginTransaction();
+      // Serialize new administrator assignments with global role-permission edits.
+      const [administratorRole] = await connection.execute(
+        "SELECT id FROM roles WHERE code = 'administrator' FOR UPDATE",
+      );
+      if (!administratorRole[0])
+        throw new Error("Falta el rol Administrador del sistema.");
       const responsibleUserId = await ensureResponsibleIsActive(
         connection,
         input.responsibleUserId,

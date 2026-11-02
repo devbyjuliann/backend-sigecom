@@ -6,6 +6,7 @@ const requiredAdminPermissions = [
   "users.read",
   "users.manage",
   "roles.manage",
+  "permissions.manage",
   "warehouses.read",
 ];
 const roleNames = {

@@ -35,9 +35,6 @@ try {
     throw new Error(`La base ${target.database} todavía no existe.`);
 
   const applicationTables = [
-    "roles",
-    "permissions",
-    "role_permissions",
     "users",
     "user_sessions",
     "warehouses",
@@ -58,6 +55,19 @@ try {
   for (const table of applicationTables) {
     await connection.query(
       `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`${table}\` TO '${appUser}'@'127.0.0.1'`,
+    );
+  }
+
+  for (const [table, revoke, grant] of [
+    ["roles", "INSERT, DELETE", "SELECT, UPDATE"],
+    ["permissions", "INSERT, UPDATE, DELETE", "SELECT"],
+    ["role_permissions", "UPDATE", "SELECT, INSERT, DELETE"],
+  ]) {
+    await connection.query(
+      `REVOKE ${revoke} ON \`${target.database}\`.\`${table}\` FROM '${appUser}'@'127.0.0.1'`,
+    );
+    await connection.query(
+      `GRANT ${grant} ON \`${target.database}\`.\`${table}\` TO '${appUser}'@'127.0.0.1'`,
     );
   }
 

@@ -14,6 +14,10 @@ import { createInventoryRouter } from "./modules/inventory/inventory-routes.js";
 import { createPurchaseRouter } from "./modules/purchases/purchase-routes.js";
 import { createSaleRouter } from "./modules/sales/sale-routes.js";
 import { createUserRouter } from "./modules/users/user-routes.js";
+import {
+  createPermissionRouter,
+  createRoleRouter,
+} from "./modules/roles/role-routes.js";
 import { requireTrustedOriginAndCsrf } from "./modules/auth/csrf.js";
 import { createErrorHandler, notFoundHandler } from "./shared/error-handler.js";
 import { createLogger, requestLogger } from "./shared/logger.js";
@@ -36,7 +40,10 @@ export function createApp({
   });
   app.use(requestLogger(logger));
   app.use((request, response, next) => {
-    if (/^\/api\/v1\/users\/[^/]+\/password-reset$/.test(request.path)) {
+    if (
+      /^\/api\/v1\/(roles|permissions)(\/|$)/.test(request.path) ||
+      /^\/api\/v1\/users\/[^/]+\/password-reset$/.test(request.path)
+    ) {
       response.set("Cache-Control", "no-store");
     }
     next();
@@ -83,6 +90,11 @@ export function createApp({
     );
     apiRouter.use("/sales", createSaleRouter({ dbPool, authConfig }));
     apiRouter.use("/users", createUserRouter({ dbPool, authConfig }));
+    apiRouter.use("/roles", createRoleRouter({ dbPool, authConfig }));
+    apiRouter.use(
+      "/permissions",
+      createPermissionRouter({ dbPool, authConfig }),
+    );
     app.use("/api/v1", apiRouter);
   }
 
