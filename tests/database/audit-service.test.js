@@ -108,6 +108,147 @@ test("la lista aplica alcance histórico en SQL y proyecta únicamente campos pe
   assert.doesNotMatch(listQuery.sql, /OFFSET/i);
 });
 
+test("proyecta el total histórico de venta como decimal exacto y omite importes inválidos", async () => {
+  const row = auditRow({
+    details: {
+      sourceOperationId: "8",
+      warehouseId: "3",
+      total: "9007199254740993.27",
+      privateNote: "no mostrar",
+    },
+  });
+  const service = createAuditService({
+    dbPool: poolWith({
+      latest: [{ id: row.id, created_at: row.created_at }],
+      page: [row],
+    }),
+    cursorSecret: secret,
+  });
+  const result = await service.list({
+    filters,
+    pageSize: 20,
+    userId: "2",
+    permissions,
+    role: "auditor",
+  });
+  assert.equal(result.items[0].details.total, "9007199254740993.27");
+  assert.deepEqual(Object.keys(result.items[0].details).sort(), [
+    "sourceOperationId",
+    "total",
+    "warehouseId",
+  ]);
+
+  for (const total of [null, "invalid", "1.234", "-10.00", 9007199254740992]) {
+    const invalid = { ...row, details: { ...row.details, total } };
+    const invalidService = createAuditService({
+      dbPool: poolWith({
+        latest: [{ id: invalid.id, created_at: invalid.created_at }],
+        page: [invalid],
+      }),
+      cursorSecret: secret,
+    });
+    const projected = await invalidService.list({
+      filters,
+      pageSize: 20,
+      userId: "2",
+      permissions,
+      role: "auditor",
+    });
+    assert.equal(Object.hasOwn(projected.items[0].details, "total"), false);
+    assert.equal(projected.items[0].detailState, "partial");
+  }
+});
+
+test("proyecta cantidades de recepción y devolución con nombres semánticos y sin campos ajenos", async () => {
+  const receipt = auditRow({
+    action: "purchases.receipt_confirmed",
+    module: "purchases",
+    entity_type: "purchase_receipt",
+    details: {
+      orderId: "21",
+      receiptId: "22",
+      sourceOperationId: "23",
+      lineCount: 2,
+      receivedQuantity: 17,
+      reference: "privada",
+    },
+  });
+  const returned = auditRow({
+    action: "purchases.return_confirmed",
+    module: "purchases",
+    entity_type: "supplier_return",
+    details: {
+      orderId: "31",
+      receiptId: "32",
+      sourceOperationId: "33",
+      lines: [
+        { receiptLineId: "4", productId: "5", quantity: 3 },
+        { receiptLineId: "6", productId: "7", quantity: 2 },
+      ],
+      reference: "privada",
+    },
+  });
+  const project = async (row) => {
+    const service = createAuditService({
+      dbPool: poolWith({
+        latest: [{ id: row.id, created_at: row.created_at }],
+        page: [row],
+      }),
+      cursorSecret: secret,
+    });
+    return (
+      await service.list({
+        filters,
+        pageSize: 20,
+        userId: "2",
+        permissions,
+        role: "auditor",
+      })
+    ).items[0].details;
+  };
+  assert.deepEqual(await project(receipt), {
+    orderId: "21",
+    receiptId: "22",
+    sourceOperationId: "23",
+    lineCount: 2,
+    receivedQuantity: 17,
+  });
+  assert.deepEqual(await project(returned), {
+    orderId: "31",
+    receiptId: "32",
+    sourceOperationId: "33",
+    lineCount: 2,
+    returnedQuantity: "5",
+  });
+
+  const partialReceipt = {
+    ...receipt,
+    details: { orderId: "21", receiptId: "22", sourceOperationId: "23" },
+  };
+  const partialService = createAuditService({
+    dbPool: poolWith({
+      latest: [
+        { id: partialReceipt.id, created_at: partialReceipt.created_at },
+      ],
+      page: [partialReceipt],
+    }),
+    cursorSecret: secret,
+  });
+  const partial = await partialService.list({
+    filters,
+    pageSize: 20,
+    userId: "2",
+    permissions,
+    role: "auditor",
+  });
+  assert.deepEqual(partial.items[0].details, {
+    orderId: "21",
+    receiptId: "22",
+    sourceOperationId: "23",
+  });
+  assert.equal(partial.items[0].detailState, "partial");
+});
+
 test("el cursor opaco mantiene el orden keyset y rechaza reutilización con otro contexto", async () => {
   const first = auditRow({ id: "18", created_at: "2026-11-01 12:00:00.000" });
   const second = auditRow({ id: "17", created_at: "2026-11-01 12:00:00.000" });

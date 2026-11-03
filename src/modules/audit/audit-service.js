@@ -339,6 +339,11 @@ function projectDetails(row, allowedWarehouseIds) {
       copyId("sourceOperationId");
       copyCount("lineCount");
       copyId("warehouseId");
+      if (
+        typeof source.total === "string" &&
+        /^\d{1,63}\.\d{2}$/.test(source.total)
+      )
+        output.total = source.total;
       break;
     case "sales.reversed":
       copyId("reversalId");
@@ -362,16 +367,37 @@ function projectDetails(row, allowedWarehouseIds) {
       if (Array.isArray(source.lines)) output.lineCount = source.lines.length;
       break;
     case "purchases.receipt_confirmed":
-      copyId("orderId");
+      if (row.entity_type === "purchase_order") copyIdFromEntityId(output, row);
+      else copyId("orderId");
       copyId("receiptId");
       copyId("sourceOperationId");
       copyCount("lineCount");
+      copyCount("receivedQuantity");
       break;
     case "purchases.return_confirmed":
       copyId("orderId");
       copyId("receiptId");
       copyId("sourceOperationId");
-      if (Array.isArray(source.lines)) output.lineCount = source.lines.length;
+      if (
+        Array.isArray(source.lines) &&
+        source.lines.every(
+          (line) =>
+            line &&
+            typeof line === "object" &&
+            positiveId(line.receiptLineId) &&
+            positiveId(line.productId) &&
+            ((typeof line.quantity === "number" &&
+              Number.isSafeInteger(line.quantity) &&
+              line.quantity > 0) ||
+              (typeof line.quantity === "string" &&
+                /^[1-9]\d{0,63}$/.test(line.quantity))),
+        )
+      ) {
+        output.lineCount = source.lines.length;
+        output.returnedQuantity = source.lines
+          .reduce((sum, line) => sum + BigInt(line.quantity), 0n)
+          .toString();
+      }
       break;
     default:
       if (row.module === "inventory") {
@@ -391,7 +417,7 @@ function projectDetails(row, allowedWarehouseIds) {
     "auth.login_succeeded": ["method"],
     "categories.created": ["name"],
     "products.created": ["sku", "name"],
-    "sales.confirmed": ["sourceOperationId", "warehouseId"],
+    "sales.confirmed": ["sourceOperationId", "warehouseId", "total"],
     "sales.draft_created": ["warehouseId"],
     "sales.draft_updated": ["warehouses"],
     "sales.reversed": [
@@ -399,8 +425,20 @@ function projectDetails(row, allowedWarehouseIds) {
       "sourceIssueOperationId",
       "warehouseId",
     ],
-    "purchases.receipt_confirmed": ["receiptId", "sourceOperationId"],
-    "purchases.return_confirmed": ["orderId", "receiptId", "sourceOperationId"],
+    "purchases.receipt_confirmed": [
+      "orderId",
+      "receiptId",
+      "sourceOperationId",
+      "lineCount",
+      "receivedQuantity",
+    ],
+    "purchases.return_confirmed": [
+      "orderId",
+      "receiptId",
+      "sourceOperationId",
+      "lineCount",
+      "returnedQuantity",
+    ],
   }[action];
   const requiredKnown =
     !requiredKeys || requiredKeys.every((key) => Object.hasOwn(output, key));
@@ -408,6 +446,11 @@ function projectDetails(row, allowedWarehouseIds) {
     detailState: requiredKnown ? "complete" : "partial",
     details: output,
   };
+}
+
+function copyIdFromEntityId(output, row, key = "orderId") {
+  const value = positiveId(row.entity_id);
+  if (value) output[key] = value;
 }
 
 function toMysqlUtc(isoValue) {

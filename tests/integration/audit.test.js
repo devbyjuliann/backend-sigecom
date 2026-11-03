@@ -18,6 +18,7 @@ let activeAuditConnection;
 let event;
 let excludedEvents;
 let historicalReferences;
+let historicalSale;
 let warehouseIds;
 let auditQueries;
 let baselineAuditFingerprint;
@@ -239,6 +240,19 @@ before(async () => {
     ...warehouseIds.filter((id) => id !== event.warehouseId).slice(0, 2),
   ];
 
+  const [[saleEvent]] = await pool.execute(
+    `SELECT ae.id, ae.details, JSON_UNQUOTE(JSON_EXTRACT(ae.details, '$.warehouseId')) AS warehouse_id
+       FROM audit_events ae
+      WHERE ae.module = 'sales' AND ae.action = 'sales.confirmed'
+        AND ae.entity_type = 'sale'
+      ORDER BY ae.created_at DESC, ae.id DESC LIMIT 1`,
+  );
+  assert.ok(saleEvent, "La base de test requiere una venta confirmada");
+  historicalSale = {
+    ...saleEvent,
+    warehouse_id: String(saleEvent.warehouse_id),
+  };
+
   const [[purchaseOrderEvent]] = await pool.execute(
     `SELECT id FROM audit_events WHERE module = 'purchases'
        AND action = 'purchases.order_created' AND entity_type = 'purchase_order'
@@ -288,6 +302,11 @@ before(async () => {
       "administrator",
       event.warehouseId,
       "administrator",
+    ),
+    salesAuditor: await createActor(
+      "auditor",
+      historicalSale.warehouse_id,
+      "sales-snapshot",
     ),
     auditor: await createActor("auditor", event.warehouseId, "auditor"),
     policyAuditor: await createActor("auditor", event.warehouseId, "policy"),
@@ -488,6 +507,10 @@ test("las referencias históricas de recepción y devolución se verifican sin r
   assert.equal(receipt.status, 200, JSON.stringify(receipt.body));
   assert.equal(receipt.body.action, "purchases.receipt_confirmed");
   assert.equal(receipt.body.entity.type, "purchase_order");
+  assert.equal(receipt.body.details.orderId, receipt.body.entity.id);
+  assert.equal(typeof receipt.body.details.receivedQuantity, "number");
+  assert.equal(typeof receipt.body.details.lineCount, "number");
+  assert.equal(Object.hasOwn(receipt.body.details, "reference"), false);
   assert.deepEqual(receipt.body.warehouses, [
     {
       id: historicalReferences.legacyReceipt.warehouse_id,
@@ -496,6 +519,14 @@ test("las referencias históricas de recepción y devolución se verifican sin r
   ]);
   assert.equal(customerReturn.status, 200, JSON.stringify(customerReturn.body));
   assert.equal(customerReturn.body.action, "sales.return_confirmed");
+  const sale = await getAs(
+    users.salesAuditor,
+    `/api/v1/audit-events/${historicalSale.id}`,
+  );
+  assert.equal(sale.status, 200, JSON.stringify(sale.body));
+  assert.equal(sale.body.details.warehouseId, historicalSale.warehouse_id);
+  assert.match(sale.body.details.total, /^\d+\.\d{2}$/);
+  assert.equal(Object.hasOwn(sale.body.details, "reference"), false);
   assert.equal(excludedOrder.status, 404);
   assert.equal(excludedOrder.body.error.code, "AUDIT_EVENT_NOT_FOUND");
   assert.equal(excludedDraftCancellation.status, 404);
