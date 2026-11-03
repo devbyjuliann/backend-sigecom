@@ -18,6 +18,7 @@ export const integrationFiles = [
   "tests/integration/users.test.js",
   "tests/integration/warehouses.test.js",
   "tests/integration/role-permissions.test.js",
+  "tests/integration/audit.test.js",
 ];
 
 async function fingerprint(connection, sql, params = []) {

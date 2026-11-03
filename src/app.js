@@ -13,6 +13,7 @@ import { createDashboardRouter } from "./modules/dashboard/dashboard-routes.js";
 import { createInventoryRouter } from "./modules/inventory/inventory-routes.js";
 import { createPurchaseRouter } from "./modules/purchases/purchase-routes.js";
 import { createSaleRouter } from "./modules/sales/sale-routes.js";
+import { createAuditRouter } from "./modules/audit/audit-routes.js";
 import { createUserRouter } from "./modules/users/user-routes.js";
 import {
   createPermissionRouter,
@@ -42,6 +43,7 @@ export function createApp({
   app.use((request, response, next) => {
     if (
       /^\/api\/v1\/(roles|permissions)(\/|$)/.test(request.path) ||
+      /^\/api\/v1\/audit-events(\/|$)/.test(request.path) ||
       /^\/api\/v1\/users\/[^/]+\/password-reset$/.test(request.path)
     ) {
       response.set("Cache-Control", "no-store");
@@ -95,6 +97,7 @@ export function createApp({
       "/permissions",
       createPermissionRouter({ dbPool, authConfig }),
     );
+    apiRouter.use("/audit-events", createAuditRouter({ dbPool, authConfig }));
     app.use("/api/v1", apiRouter);
   }
 

@@ -4,16 +4,17 @@ import { integrationFiles } from "./integration-runner.js";
 import { connectTestDatabase } from "./test-database.js";
 import { runIntegration } from "./integration-runner.js";
 
-test("safe integration runner excludes migrations and serializes shared-role suite last", () => {
+test("safe integration runner excludes migrations and serializes shared-role suite before audit", () => {
   assert.equal(
     integrationFiles.some((file) => file.endsWith("schema.test.js")),
     false,
   );
+  assert.equal(integrationFiles.at(-1), "tests/integration/audit.test.js");
   assert.equal(
-    integrationFiles.at(-1),
+    integrationFiles.at(-2),
     "tests/integration/role-permissions.test.js",
   );
-  assert.equal(integrationFiles.length, 13);
+  assert.equal(integrationFiles.length, 14);
 });
 
 test("second integration runner is rejected without releasing another run's lock", async () => {
