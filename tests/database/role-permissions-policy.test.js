@@ -7,7 +7,7 @@ import {
 } from "../../src/modules/roles/role-permissions-policy.js";
 
 test("policy classifies role-specific configurable, protected and reserved permissions", () => {
-  assert.equal(POLICY_VERSION, 1);
+  assert.equal(POLICY_VERSION, 2);
   assert.equal(
     classifyPermission("administrator", "users.read").category,
     "protected",
@@ -23,6 +23,18 @@ test("policy classifies role-specific configurable, protected and reserved permi
   assert.equal(
     classifyPermission("auditor", "audit.read").category,
     "reserved",
+  );
+  assert.equal(
+    classifyPermission("administrator", "reports.read").category,
+    "configurable",
+  );
+  assert.equal(
+    classifyPermission("auditor", "reports.read").category,
+    "configurable",
+  );
+  assert.equal(
+    classifyPermission("seller", "reports.read").category,
+    "incompatible",
   );
   assert.equal(
     classifyPermission("seller", "unknown.permission").category,
@@ -50,5 +62,24 @@ test("policy rejects permissions outside role ceiling and missing dependencies",
       "inventory.read",
     ]),
     [],
+  );
+});
+
+test("reports.read is configurable only with its existing sales and warehouse dependencies", () => {
+  assert.throws(
+    () => validatePermissionSet("auditor", ["reports.read"]),
+    (error) => error.code === "ROLE_PERMISSION_DEPENDENCY_MISSING",
+  );
+  assert.deepEqual(
+    validatePermissionSet("auditor", [
+      "reports.read",
+      "sales.read",
+      "warehouses.read",
+    ]),
+    [],
+  );
+  assert.throws(
+    () => validatePermissionSet("seller", ["reports.read"]),
+    (error) => error.code === "ROLE_PERMISSION_INCOMPATIBLE",
   );
 });

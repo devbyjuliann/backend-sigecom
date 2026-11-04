@@ -6,6 +6,7 @@ import { getDatabaseConfig } from "../../src/db/config.js";
 
 export const integrationFiles = [
   "tests/integration/isolation-fixtures.test.js",
+  "tests/integration/reports-sales-activity.test.js",
   "tests/integration/auth.test.js",
   "tests/integration/business-partners.test.js",
   "tests/integration/categories.test.js",
@@ -20,6 +21,18 @@ export const integrationFiles = [
   "tests/integration/role-permissions.test.js",
   "tests/integration/audit.test.js",
 ];
+
+export function selectIntegrationFiles(args = []) {
+  if (!args.length) return [...integrationFiles];
+  if (args.length !== 2 || args[0] !== "--suite") {
+    throw new Error("Uso: integration-runner.js [--suite <suite aprobada>]");
+  }
+  const [file] = args.slice(1);
+  if (!integrationFiles.includes(file)) {
+    throw new Error("La suite solicitada no está en la lista aprobada.");
+  }
+  return [file];
+}
 
 async function fingerprint(connection, sql, params = []) {
   const [rows] = await connection.execute(sql, params);
@@ -66,7 +79,18 @@ export async function captureSharedState(connection) {
   };
 }
 
-export async function runIntegration({ run = spawn } = {}) {
+export async function runIntegration({
+  files = integrationFiles,
+  run = spawn,
+} = {}) {
+  if (
+    !Array.isArray(files) ||
+    !files.length ||
+    files.some((file) => !integrationFiles.includes(file)) ||
+    new Set(files).size !== files.length
+  ) {
+    throw new Error("La lista de suites de integración no es válida.");
+  }
   const lock = await mysql.createConnection(
     getDatabaseConfig("test", process.env, "MIGRATOR"),
   );
@@ -86,7 +110,7 @@ export async function runIntegration({ run = spawn } = {}) {
       "Aviso: este candado coordina solo recorridos del runner oficial; no bloquea suites individuales ni otros procesos sobre sigecom_test. No ejecutar pruebas incompatibles concurrentemente.",
     );
 
-    for (const file of integrationFiles) {
+    for (const file of files) {
       const before = await captureSharedState(lock);
       const exitCode = await new Promise((resolve, reject) => {
         const child = run(process.execPath, ["--test", file], {
@@ -122,8 +146,15 @@ export async function runIntegration({ run = spawn } = {}) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  runIntegration().catch((error) => {
+  try {
+    runIntegration({
+      files: selectIntegrationFiles(process.argv.slice(2)),
+    }).catch((error) => {
+      console.error(error.message);
+      process.exitCode = 1;
+    });
+  } catch (error) {
     console.error(error.message);
     process.exitCode = 1;
-  });
+  }
 }

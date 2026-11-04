@@ -1,6 +1,6 @@
 import { HttpError } from "../../shared/http-error.js";
 
-export const POLICY_VERSION = 1;
+export const POLICY_VERSION = 2;
 
 export const ROLE_CODES = ["administrator", "seller", "warehouse", "auditor"];
 
@@ -19,7 +19,6 @@ const reservedPermissions = new Set([
   "inventory.initialize",
   "inventory.receive",
   "settings.manage",
-  "reports.read",
   "audit.read",
 ]);
 const reservedRoleAssignments = {
@@ -28,7 +27,6 @@ const reservedRoleAssignments = {
   "inventory.initialize": new Set(["administrator"]),
   "inventory.receive": new Set(["administrator", "warehouse"]),
   "settings.manage": new Set(["administrator"]),
-  "reports.read": new Set(["administrator", "auditor"]),
   "audit.read": new Set(["administrator", "auditor"]),
 };
 const protectedRoleAssignments = {
@@ -103,6 +101,7 @@ const roleCeilings = {
 };
 
 const dependencies = {
+  "reports.read": ["sales.read", "warehouses.read"],
   "categories.manage": ["categories.read"],
   "customers.manage": ["customers.read"],
   "products.manage": ["products.read", "categories.read"],
@@ -141,6 +140,7 @@ const dependencies = {
 const knownPermissions = new Set([
   ...protectedPermissions,
   ...reservedPermissions,
+  "reports.read",
   ...Object.values(roleCeilings).flatMap((permissions) => [...permissions]),
 ]);
 
@@ -165,7 +165,6 @@ const reservedReasons = {
   "inventory.receive": "Las recepciones aprobadas pertenecen a Compras.",
   "settings.manage":
     "No existe una función operativa de configuración en este incremento.",
-  "reports.read": "El módulo de Reportes no está implementado.",
   "audit.read": "La consulta del módulo de Auditoría no está implementada.",
 };
 
@@ -185,6 +184,17 @@ export function classifyPermission(roleCode, permissionCode) {
       reason:
         "Es indispensable para consultar el alcance de las asignaciones administrativas.",
       dependencies: [],
+    };
+  }
+  if (permissionCode === "reports.read") {
+    const compatible = ["administrator", "auditor"].includes(roleCode);
+    return {
+      category: compatible ? "configurable" : "incompatible",
+      compatible,
+      reason: compatible
+        ? null
+        : "Este permiso excede las capacidades aprobadas para el rol.",
+      dependencies: dependencies[permissionCode],
     };
   }
   if (protectedPermissions.has(permissionCode)) {
