@@ -15,6 +15,7 @@ import { createPurchaseRouter } from "./modules/purchases/purchase-routes.js";
 import { createSaleRouter } from "./modules/sales/sale-routes.js";
 import { createAuditRouter } from "./modules/audit/audit-routes.js";
 import { createSalesActivityRouter } from "./modules/reports/sales-activity-routes.js";
+import { createPurchaseReceiptsRouter } from "./modules/reports/purchase-receipts-routes.js";
 import { createUserRouter } from "./modules/users/user-routes.js";
 import {
   createPermissionRouter,
@@ -102,6 +103,10 @@ export function createApp({
     apiRouter.use(
       "/reports/sales-activity",
       createSalesActivityRouter({ dbPool, authConfig }),
+    );
+    apiRouter.use(
+      "/reports/purchase-receipts",
+      createPurchaseReceiptsRouter({ dbPool, authConfig }),
     );
     app.use("/api/v1", apiRouter);
   }

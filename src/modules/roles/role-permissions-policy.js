@@ -1,6 +1,6 @@
 import { HttpError } from "../../shared/http-error.js";
 
-export const POLICY_VERSION = 2;
+export const POLICY_VERSION = 3;
 
 export const ROLE_CODES = ["administrator", "seller", "warehouse", "auditor"];
 
@@ -101,7 +101,7 @@ const roleCeilings = {
 };
 
 const dependencies = {
-  "reports.read": ["sales.read", "warehouses.read"],
+  "reports.read": ["warehouses.read"],
   "categories.manage": ["categories.read"],
   "customers.manage": ["customers.read"],
   "products.manage": ["products.read", "categories.read"],

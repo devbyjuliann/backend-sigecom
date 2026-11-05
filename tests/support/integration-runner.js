@@ -15,6 +15,8 @@ export const integrationFiles = [
   "tests/integration/products.test.js",
   "tests/integration/profile.test.js",
   "tests/integration/purchases.test.js",
+  "tests/integration/reports-purchase-receipts.test.js",
+  "tests/integration/reports-purchase-receipts-http.test.js",
   "tests/integration/sales.test.js",
   "tests/integration/users.test.js",
   "tests/integration/warehouses.test.js",

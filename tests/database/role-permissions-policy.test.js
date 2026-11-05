@@ -7,7 +7,7 @@ import {
 } from "../../src/modules/roles/role-permissions-policy.js";
 
 test("policy classifies role-specific configurable, protected and reserved permissions", () => {
-  assert.equal(POLICY_VERSION, 2);
+  assert.equal(POLICY_VERSION, 3);
   assert.equal(
     classifyPermission("administrator", "users.read").category,
     "protected",
@@ -65,16 +65,28 @@ test("policy rejects permissions outside role ceiling and missing dependencies",
   );
 });
 
-test("reports.read is configurable only with its existing sales and warehouse dependencies", () => {
+test("reports.read requires warehouse scope but leaves each commercial permission to its report", () => {
   assert.throws(
     () => validatePermissionSet("auditor", ["reports.read"]),
     (error) => error.code === "ROLE_PERMISSION_DEPENDENCY_MISSING",
   );
   assert.deepEqual(
+    validatePermissionSet("auditor", ["reports.read", "warehouses.read"]),
+    [],
+  );
+  assert.deepEqual(
     validatePermissionSet("auditor", [
       "reports.read",
-      "sales.read",
       "warehouses.read",
+      "sales.read",
+    ]),
+    [],
+  );
+  assert.deepEqual(
+    validatePermissionSet("auditor", [
+      "reports.read",
+      "warehouses.read",
+      "purchases.read",
     ]),
     [],
   );
