@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
 import request from "supertest";
@@ -9,6 +10,10 @@ import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { createInventoryService } from "../../src/modules/inventory/inventory-service.js";
 import { createInventoryEngine } from "../../src/modules/inventory/inventory-engine.js";
+import {
+  buildPurchaseOrdersEligibleQuery,
+  createPurchaseOrdersService,
+} from "../../src/modules/reports/purchase-orders-service.js";
 import { IntegrationFixtures } from "../support/integration-fixtures.js";
 
 const origin = "http://127.0.0.1:5173";
@@ -1058,6 +1063,223 @@ test("partial purchase closure is idempotent, audited, versioned, and inventory-
       [4, 1, 3, 0],
       [3, 0, 3, 0],
     ],
+  );
+  const [[reportSession]] = await pool.execute(
+    "SELECT id FROM user_sessions WHERE user_id=? AND revoked_at IS NULL AND expires_at>UTC_TIMESTAMP(3) ORDER BY id DESC LIMIT 1",
+    [users.administrator],
+  );
+  const orderReport = createPurchaseOrdersService({ dbPool: pool });
+  const closedReport = await orderReport.summarize({
+    auth: {
+      user: { id: users.administrator, role: "administrator" },
+      sessionId: String(reportSession.id),
+    },
+    mode: "period",
+    dateFrom: "2026-10-29",
+    dateTo: "2026-10-29",
+    warehouseId,
+  });
+  const closedOrder = closedReport.orders.find(
+    ({ id }) => id === String(created.body.id),
+  );
+  assert.equal(closedOrder.situation, "closed_with_remnant");
+  assert.equal(closedOrder.receiptProgress, "partial");
+  assert.equal(closedOrder.orderedValue, "401.00");
+  assert.deepEqual(closedOrder.pendingByUnit, []);
+  assert.deepEqual(closedOrder.closedByUnit, [
+    { unit: "caja", quantity: "3" },
+    { unit: "unidad", quantity: "3" },
+  ]);
+  assert.equal(
+    closedOrder.lines.reduce(
+      (sum, line) => sum + BigInt(line.receivedQuantity),
+      0n,
+    ),
+    1n,
+  );
+
+  const readConnection = await pool.getConnection();
+  try {
+    await readConnection.query(
+      "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    );
+    await readConnection.query("SET TRANSACTION READ ONLY");
+    await readConnection.beginTransaction();
+    const criteria = {
+      connection: readConnection,
+      warehouseIds: [warehouseId],
+      mode: "period",
+      dateFrom: "2026-10-29",
+      dateTo: "2026-10-29",
+    };
+    const sqlSummary = await orderReport.summarizeEligible(criteria);
+    const sqlCount = await orderReport.countEligible(criteria);
+    const sqlPage = await orderReport.pageEligible({
+      ...criteria,
+      pageSize: 1,
+      offset: 0,
+    });
+    const sqlLines = await orderReport.linesForPage({
+      ...criteria,
+      ids: sqlPage.map(({ id }) => String(id)),
+    });
+    assert.equal(sqlSummary.verifiedOrders, sqlCount);
+    assert.equal(sqlSummary.verifiedOrders, String(closedReport.orders.length));
+    assert.equal(sqlPage.length, 1);
+    assert.equal(String(sqlPage[0].id), String(created.body.id));
+    assert.equal(sqlPage[0].situation, "closed_with_remnant");
+    assert.equal(sqlPage[0].ordered_value, "401.00");
+    assert.equal(sqlLines.length, 2);
+    assert.deepEqual(sqlSummary.closedByUnit, [
+      { unit: "caja", quantity: "3" },
+      { unit: "unidad", quantity: "3" },
+    ]);
+    const firstQuery = buildPurchaseOrdersEligibleQuery({
+      warehouseIds: [warehouseId],
+      mode: "period",
+      dateFrom: "2026-10-29",
+      dateTo: "2026-10-29",
+      pageSize: 1,
+      offset: 0,
+    });
+    const secondQuery = buildPurchaseOrdersEligibleQuery({
+      warehouseIds: [warehouseId],
+      mode: "period",
+      dateFrom: "2026-10-29",
+      dateTo: "2026-10-29",
+      pageSize: 1,
+      offset: 1,
+    });
+    assert.equal(firstQuery.sql, secondQuery.sql);
+    assert.deepEqual(
+      firstQuery.params.slice(0, -2),
+      secondQuery.params.slice(0, -2),
+    );
+    assert.deepEqual(firstQuery.params.slice(-2), [1, 0]);
+    assert.deepEqual(secondQuery.params.slice(-2), [1, 1]);
+    const laterPage = await orderReport.pageEligible({
+      ...criteria,
+      pageSize: 1,
+      offset: 1,
+    });
+    const laterPageLines = await orderReport.linesForPage({
+      ...criteria,
+      ids: laterPage.map(({ id }) => String(id)),
+    });
+    const lastPage = await orderReport.pageEligible({
+      ...criteria,
+      pageSize: 1,
+      offset: Number(sqlCount) - 1,
+    });
+    const beyondPage = await orderReport.pageEligible({
+      ...criteria,
+      pageSize: 1,
+      offset: Number(sqlCount),
+    });
+    assert.equal(lastPage.length, 1);
+    assert.equal(beyondPage.length, 0);
+    assert.ok(Number(sqlCount) > 1);
+    assert.equal(laterPage.length, 1);
+    const laterPageOrder = closedReport.orders.find(
+      ({ id }) => id === String(laterPage[0].id),
+    );
+    assert.ok(laterPageOrder);
+    assert.deepEqual(
+      laterPageLines.map(
+        ({ product_id, quantity, received_quantity, unit_snapshot }) => [
+          String(product_id),
+          String(quantity),
+          String(received_quantity),
+          unit_snapshot,
+        ],
+      ),
+      laterPageOrder.lines.map(
+        ({ productId, quantity, receivedQuantity, unit }) => [
+          productId,
+          quantity,
+          receivedQuantity,
+          unit,
+        ],
+      ),
+    );
+    const pageIds = [sqlPage, laterPage].flat().map(({ id }) => String(id));
+    assert.equal(new Set(pageIds).size, pageIds.length);
+    const everyPageOrderId = [];
+    for (let offset = 0; offset < Number(sqlCount); offset += 1) {
+      const page = await orderReport.pageEligible({
+        ...criteria,
+        pageSize: 1,
+        offset,
+      });
+      assert.equal(page.length, 1);
+      everyPageOrderId.push(String(page[0].id));
+    }
+    assert.equal(everyPageOrderId.length, Number(sqlCount));
+    assert.equal(new Set(everyPageOrderId).size, everyPageOrderId.length);
+    assert.deepEqual(
+      everyPageOrderId,
+      [...closedReport.orders]
+        .map(({ id }) => String(id))
+        .sort((left, right) => (BigInt(left) > BigInt(right) ? -1 : 1)),
+    );
+    assert.equal(
+      (await orderReport.summarizeEligible(criteria)).verifiedOrders,
+      sqlSummary.verifiedOrders,
+    );
+    const pendingReport = await orderReport.summarize({
+      auth: {
+        user: { id: users.administrator, role: "administrator" },
+        sessionId: String(reportSession.id),
+      },
+      mode: "pending",
+      warehouseId,
+    });
+    const pendingCriteria = {
+      connection: readConnection,
+      warehouseIds: [warehouseId],
+      mode: "pending",
+    };
+    const pendingCount = await orderReport.countEligible(pendingCriteria);
+    assert.equal(pendingCount, String(pendingReport.orders.length));
+    const pendingIds = [];
+    for (let offset = 0; offset < Number(pendingCount); offset += 1) {
+      const [order] = await orderReport.pageEligible({
+        ...pendingCriteria,
+        pageSize: 1,
+        offset,
+      });
+      assert.ok(order);
+      pendingIds.push(String(order.id));
+    }
+    assert.deepEqual(
+      pendingIds,
+      pendingReport.orders.map(({ id }) => String(id)),
+    );
+    await readConnection.commit();
+  } catch (error) {
+    await readConnection.rollback();
+    throw error;
+  } finally {
+    readConnection.release();
+  }
+
+  const closedOverHttp = await get(
+    `/api/v1/reports/purchase-orders?mode=period&dateFrom=2026-10-29&dateTo=2026-10-29&warehouseId=${warehouseId}&q=${created.body.number}`,
+  ).expect(200);
+  assert.equal(closedOverHttp.body.summary.ordersClosedWithRemnant, "1");
+  assert.deepEqual(closedOverHttp.body.summary.pendingByUnit, []);
+  assert.deepEqual(closedOverHttp.body.summary.closedByUnit, [
+    { unit: "caja", quantity: "3" },
+    { unit: "unidad", quantity: "3" },
+  ]);
+  assert.equal(closedOverHttp.body.orders[0].situation, "closed_with_remnant");
+  assert.equal(closedOverHttp.body.orders[0].receiptProgress, "partial");
+  assert.equal(closedOverHttp.body.orders[0].orderedValue, "401.00");
+  assert.ok(
+    closedOverHttp.body.orders[0].lines.every(
+      ({ pendingQuantity, closedQuantity }) =>
+        pendingQuantity === "0" && BigInt(closedQuantity) >= 0n,
+    ),
   );
 
   const replay = await mutate(
@@ -2245,4 +2467,490 @@ test("inventory-engine failure rolls back the pending receipt document", async (
     ],
     [0, Number(inventoryBefore.balances), Number(inventoryBefore.movements)],
   );
+});
+
+test("purchase orders report returns a scoped, SQL-paginated pending order over HTTP", async () => {
+  async function timedGet(path, session = sessions.administrator) {
+    const started = performance.now();
+    const response = await get(path, session).expect(200);
+    return {
+      response,
+      latencyMs: Number((performance.now() - started).toFixed(2)),
+    };
+  }
+  const created = await mutate(
+    "post",
+    "/api/v1/purchase-orders",
+    orderInput({
+      orderDate: "2025-01-02",
+      lines: [{ productId, quantity: 4, unitCost: "100.25" }],
+    }),
+  ).expect(201);
+  const confirmed = await mutate(
+    "post",
+    `/api/v1/purchase-orders/${created.body.id}/confirmation`,
+    { expectedVersion: created.body.version, confirmZeroCost: false },
+  ).expect(200);
+  const path =
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}` +
+    `&q=${encodeURIComponent(created.body.number)}&page=1&pageSize=1`;
+  const measuredSearch = await timedGet(path);
+  const response = measuredSearch.response;
+  assert.equal(response.headers["cache-control"], "private, no-store");
+  assert.deepEqual(response.body.criteria, {
+    mode: "pending",
+    period: null,
+    warehouseId,
+    warehouseScope: "selected",
+    filters: { situation: null, q: created.body.number },
+    currency: "COP",
+    timeZone: "America/Bogota",
+    periodSemantics: null,
+    pendingSemantics:
+      "Pendientes operativos actuales, sin límite de antigüedad, dentro del alcance de bodegas autorizadas.",
+    situationSemantics:
+      "Situación actual del documento al momento de la consulta.",
+    documentCoverage:
+      "Solo incluye órdenes cuya integridad documental puede verificarse completamente.",
+  });
+  assert.equal(response.body.summary.verifiedOrders, "1");
+  assert.equal(response.body.summary.ordersWithPending, "1");
+  assert.equal(response.body.summary.originalConfirmedOrderValue, "401.00");
+  assert.deepEqual(response.body.summary.pendingByUnit, [
+    { unit: "caja", quantity: "4" },
+  ]);
+  assert.equal(response.body.orders.length, 1);
+  assert.deepEqual(response.body.orders[0], {
+    id: created.body.id,
+    commercialCode: created.body.number,
+    orderDate: "2025-01-02",
+    warehouse: {
+      id: warehouseId,
+      code: `P-${suffix}`,
+      name: `Bodega compras ${suffix}`,
+      isActive: true,
+    },
+    status: "confirmed",
+    situation: "confirmed_without_receipts",
+    confirmedAt: confirmed.body.confirmedAt,
+    cancelledAt: null,
+    closedAt: null,
+    orderedValue: "401.00",
+    receiptProgress: "none",
+    hasClosure: false,
+    lines: [
+      {
+        id: created.body.lines[0].id,
+        productId,
+        sku: `PUR-${suffix}`,
+        name: `Producto compras ${suffix}`,
+        unit: "caja",
+        quantity: "4",
+        receivedQuantity: "0",
+        pendingQuantity: "4",
+        closedQuantity: "0",
+        unitCost: "100.25",
+        lineTotal: "401.00",
+      },
+    ],
+  });
+  assert.deepEqual(response.body.pagination, {
+    page: 1,
+    pageSize: 1,
+    total: "1",
+    totalPages: "1",
+  });
+  assert.equal(typeof response.body.generatedAt, "string");
+  await get(
+    `/api/v1/reports/purchase-orders?mode=period&dateFrom=2025-01-02&dateTo=2025-01-02&warehouseId=${warehouseId}&q=${encodeURIComponent(created.body.number)}`,
+  )
+    .expect(200)
+    .then(({ body }) => {
+      assert.deepEqual(body.criteria.period, {
+        dateFrom: "2025-01-02",
+        dateTo: "2025-01-02",
+      });
+      assert.equal(body.orders[0].situation, "confirmed_without_receipts");
+      assert.equal(body.summary.verifiedOrders, "1");
+    });
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&page=1&pageSize=1&pageSize=2`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&dateFrom=2025-01-02`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=period&dateFrom=2025-01-01&dateTo=2025-04-04&warehouseId=${warehouseId}`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=period&dateFrom=2025-02-30&dateTo=2025-03-01&warehouseId=${warehouseId}`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&situation=closed_with_remnant`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&unknown=x`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&page=501&pageSize=50`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&pageSize=51`,
+  ).expect(400);
+  const escapedSearch = await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&q=%25_%5C`,
+  ).expect(200);
+  assert.equal(escapedSearch.body.summary.verifiedOrders, "0");
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&q=${"x".repeat(101)}`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&q=`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&q=${encodeURIComponent("\u0001")}`,
+  ).expect(400);
+  await get(
+    `/api/v1/reports/purchase-orders?mode=unknown&warehouseId=${warehouseId}`,
+  ).expect(400);
+  const period92 = await timedGet(
+    `/api/v1/reports/purchase-orders?mode=period&dateFrom=2025-01-01&dateTo=2025-04-02&warehouseId=${warehouseId}`,
+  );
+  assert.deepEqual(period92.response.body.criteria.period, {
+    dateFrom: "2025-01-01",
+    dateTo: "2025-04-02",
+  });
+  const situationFilter = await timedGet(
+    `/api/v1/reports/purchase-orders?mode=period&dateFrom=2025-01-02&dateTo=2025-01-02&warehouseId=${warehouseId}&situation=confirmed_without_receipts`,
+  );
+  assert.equal(situationFilter.response.body.summary.verifiedOrders, "1");
+  assert.equal(
+    situationFilter.response.body.orders[0].situation,
+    "confirmed_without_receipts",
+  );
+  await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    sessions.auditor,
+  ).expect(200);
+  const sellerDenied = await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    sessions.seller,
+  ).expect(403);
+  assert.equal(sellerDenied.body.error.code, "PERMISSION_DENIED");
+  assert.equal(sellerDenied.headers["cache-control"], "private, no-store");
+  assert.equal(Object.hasOwn(sellerDenied.body, "summary"), false);
+  const warehouseDenied = await get(
+    `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    sessions.warehouse,
+  ).expect(403);
+  assert.equal(warehouseDenied.body.error.code, "PERMISSION_DENIED");
+  assert.equal(Object.hasOwn(warehouseDenied.body, "orders"), false);
+  const anonymous = await request(app)
+    .get(
+      `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    )
+    .expect(401);
+  assert.equal(anonymous.headers["cache-control"], "private, no-store");
+
+  const pendingBase = "/api/v1/reports/purchase-orders?mode=pending&pageSize=1";
+  const [[otherWarehouse]] = await pool.execute(
+    `SELECT DISTINCT po.warehouse_id AS id FROM purchase_orders po
+      WHERE po.warehouse_id<>? AND po.status='confirmed' AND po.closed_at IS NULL
+      ORDER BY po.warehouse_id LIMIT 1`,
+    [warehouseId],
+  );
+  assert.ok(
+    otherWarehouse,
+    "La prueba requiere una segunda bodega con órdenes abiertas candidatas.",
+  );
+  let temporaryWarehouseAssignment;
+  if (otherWarehouse) {
+    temporaryWarehouseAssignment = String(otherWarehouse.id);
+    await pool.execute(
+      "INSERT INTO user_warehouses (user_id,warehouse_id,assigned_by) VALUES (?,?,?)",
+      [users.administrator, temporaryWarehouseAssignment, users.administrator],
+    );
+  }
+  const sqlMetrics = {
+    executions: 0,
+    transferredRows: 0,
+    pageRows: 0,
+    lineRows: 0,
+  };
+  const originalGetConnection = pool.getConnection;
+  pool.getConnection = async (...args) => {
+    const connection = await originalGetConnection.apply(pool, args);
+    return new Proxy(connection, {
+      get(target, property) {
+        const value = Reflect.get(target, property, target);
+        if (property === "execute") {
+          return async (...executeArgs) => {
+            sqlMetrics.executions += 1;
+            const [rows, ...rest] = await value.apply(target, executeArgs);
+            sqlMetrics.transferredRows += Array.isArray(rows) ? rows.length : 0;
+            if (
+              executeArgs[0].includes(
+                "ORDER BY order_date ASC, id ASC LIMIT ? OFFSET ?",
+              )
+            ) {
+              sqlMetrics.pageRows += rows.length;
+            }
+            if (executeArgs[0].startsWith("SELECT po.id, po.commercial_code")) {
+              sqlMetrics.lineRows += rows.length;
+            }
+            return [rows, ...rest];
+          };
+        }
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  };
+  const [[writesBefore]] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM purchase_orders) purchase_orders,
+            (SELECT COUNT(*) FROM purchase_receipts) purchase_receipts,
+            (SELECT COUNT(*) FROM inventory_operations) inventory_operations,
+            (SELECT COUNT(*) FROM inventory_movements) inventory_movements,
+            (SELECT COUNT(*) FROM audit_events) audit_events`,
+  );
+  const memoryBefore = process.memoryUsage().heapUsed;
+  const requestStarted = performance.now();
+  let measuredPendingPage;
+  let measuredMultiWarehouse;
+  let multiWarehouseLatencyMs;
+  let measuredSqlMetrics;
+  try {
+    measuredPendingPage = await get(
+      "/api/v1/reports/purchase-orders?mode=pending&pageSize=2&page=1",
+    ).expect(200);
+    measuredSqlMetrics = { ...sqlMetrics };
+    sqlMetrics.executions = 0;
+    sqlMetrics.transferredRows = 0;
+    sqlMetrics.pageRows = 0;
+    sqlMetrics.lineRows = 0;
+    const multiWarehouseStarted = performance.now();
+    measuredMultiWarehouse = await get(
+      "/api/v1/reports/purchase-orders?mode=pending&pageSize=50&page=1",
+    ).expect(200);
+    multiWarehouseLatencyMs = Number(
+      (performance.now() - multiWarehouseStarted).toFixed(2),
+    );
+  } finally {
+    pool.getConnection = originalGetConnection;
+    if (temporaryWarehouseAssignment) {
+      await pool.execute(
+        "DELETE FROM user_warehouses WHERE user_id=? AND warehouse_id=?",
+        [users.administrator, temporaryWarehouseAssignment],
+      );
+    }
+  }
+  const httpLatencyMs = Number((performance.now() - requestStarted).toFixed(2));
+  const memoryDeltaBytes = process.memoryUsage().heapUsed - memoryBefore;
+  const [[writesAfter]] = await pool.query(
+    `SELECT (SELECT COUNT(*) FROM purchase_orders) purchase_orders,
+            (SELECT COUNT(*) FROM purchase_receipts) purchase_receipts,
+            (SELECT COUNT(*) FROM inventory_operations) inventory_operations,
+            (SELECT COUNT(*) FROM inventory_movements) inventory_movements,
+            (SELECT COUNT(*) FROM audit_events) audit_events`,
+  );
+  assert.deepEqual(writesAfter, writesBefore);
+  const pendingPageOne = await get(`${pendingBase}&page=1`).expect(200);
+  const pendingPageTwoTimed = await timedGet(`${pendingBase}&page=2`);
+  const pendingPageTwo = pendingPageTwoTimed.response;
+  const pendingLast = await get(
+    `${pendingBase}&page=${pendingPageOne.body.pagination.total}`,
+  ).expect(200);
+  const pendingBeyond = await get(`${pendingBase}&page=501`).expect(200);
+  assert.deepEqual(pendingPageOne.body.summary, pendingPageTwo.body.summary);
+  assert.equal(pendingPageOne.body.orders.length, 1);
+  assert.equal(pendingPageTwo.body.orders.length, 1);
+  assert.ok(pendingPageOne.body.orders[0].lines.length > 0);
+  assert.ok(pendingPageTwo.body.orders[0].lines.length > 0);
+  assert.notEqual(
+    pendingPageOne.body.orders[0].id,
+    pendingPageTwo.body.orders[0].id,
+  );
+  assert.equal(pendingLast.body.orders.length, 1);
+  assert.deepEqual(pendingBeyond.body.orders, []);
+  assert.equal(measuredPendingPage.body.orders.length, 2);
+  assert.ok(
+    new Set(
+      measuredMultiWarehouse.body.orders.map(({ warehouse }) => warehouse.id),
+    ).size >= 2,
+    "El endpoint debe devolver órdenes pendientes de más de una bodega autorizada.",
+  );
+  assert.equal(measuredSqlMetrics.executions, 9);
+  assert.equal(measuredSqlMetrics.pageRows, 2);
+  assert.ok(measuredSqlMetrics.lineRows > 0);
+  assert.ok(
+    BigInt(measuredSqlMetrics.transferredRows) <
+      BigInt(measuredPendingPage.body.summary.verifiedOrders) + 20n,
+  );
+  console.info(
+    `ℹ purchase orders HTTP: pending page-1=${httpLatencyMs}ms, pending multi-warehouse=${multiWarehouseLatencyMs}ms, page-2=${pendingPageTwoTimed.latencyMs}ms, period-92-days=${period92.latencyMs}ms, situation=${situationFilter.latencyMs}ms, q=${measuredSearch.latencyMs}ms, SQL(page-1)=${measuredSqlMetrics.executions}, pageRows=${measuredSqlMetrics.pageRows}, lineRows=${measuredSqlMetrics.lineRows}, transferredRows=${measuredSqlMetrics.transferredRows}, heapDelta=${memoryDeltaBytes}B`,
+  );
+
+  const tiedPeriod =
+    "/api/v1/reports/purchase-orders?mode=period&dateFrom=2026-10-29" +
+    "&dateTo=2026-10-29&pageSize=1";
+  const tiedPageOne = await get(`${tiedPeriod}&page=1`).expect(200);
+  const tiedPageTwo = await get(`${tiedPeriod}&page=2`).expect(200);
+  assert.ok(
+    BigInt(tiedPageOne.body.orders[0].id) >
+      BigInt(tiedPageTwo.body.orders[0].id),
+  );
+  assert.deepEqual(tiedPageOne.body.summary, tiedPageTwo.body.summary);
+
+  const unassigned = await get(
+    "/api/v1/reports/purchase-orders?mode=pending",
+    sessions.unassignedAdministrator,
+  ).expect(200);
+  assert.deepEqual(unassigned.body.orders, []);
+  assert.equal(unassigned.body.summary.verifiedOrders, "0");
+  const foreignWarehouse = await get(
+    "/api/v1/reports/purchase-orders?mode=pending&warehouseId=999999999999999999",
+  ).expect(404);
+  const missingWarehouse = await get(
+    "/api/v1/reports/purchase-orders?mode=pending&warehouseId=999999999999999998",
+  ).expect(404);
+  assert.equal(
+    foreignWarehouse.body.error.code,
+    missingWarehouse.body.error.code,
+  );
+  assert.equal(Object.hasOwn(foreignWarehouse.body, "summary"), false);
+
+  const [[auditorRole]] = await pool.execute(
+    "SELECT id FROM roles WHERE code='auditor'",
+  );
+  const [[salesGrant]] = await pool.execute(
+    `SELECT rp.permission_id,rp.created_at FROM role_permissions rp
+       JOIN permissions p ON p.id=rp.permission_id
+      WHERE rp.role_id=? AND p.code='sales.read'`,
+    [auditorRole.id],
+  );
+  if (salesGrant) {
+    try {
+      await pool.execute(
+        "DELETE FROM role_permissions WHERE role_id=? AND permission_id=?",
+        [auditorRole.id, salesGrant.permission_id],
+      );
+      await get(
+        `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+        sessions.auditor,
+      ).expect(200);
+    } finally {
+      await pool.execute(
+        "INSERT INTO role_permissions (role_id,permission_id,created_at) VALUES (?,?,?)",
+        [auditorRole.id, salesGrant.permission_id, salesGrant.created_at],
+      );
+    }
+  }
+
+  for (const permission of [
+    "reports.read",
+    "warehouses.read",
+    "purchases.read",
+  ]) {
+    const [[role]] = await pool.execute(
+      "SELECT id FROM roles WHERE code='auditor'",
+    );
+    const [[grant]] = await pool.execute(
+      `SELECT rp.permission_id,rp.created_at FROM role_permissions rp
+         JOIN permissions p ON p.id=rp.permission_id
+        WHERE rp.role_id=? AND p.code=?`,
+      [role.id, permission],
+    );
+    assert.ok(grant, `El auditor debe tener inicialmente ${permission}`);
+    try {
+      await pool.execute(
+        "DELETE FROM role_permissions WHERE role_id=? AND permission_id=?",
+        [role.id, grant.permission_id],
+      );
+      const denied = await get(
+        `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+        sessions.auditor,
+      ).expect(403);
+      assert.equal(denied.body.error.code, "PERMISSION_DENIED");
+      assert.equal(Object.hasOwn(denied.body, "summary"), false);
+    } finally {
+      await pool.execute(
+        "INSERT INTO role_permissions (role_id,permission_id,created_at) VALUES (?,?,?)",
+        [role.id, grant.permission_id, grant.created_at],
+      );
+    }
+  }
+
+  const [[adminSession]] = await pool.execute(
+    `SELECT id,expires_at,revoked_at FROM user_sessions
+      WHERE user_id=? ORDER BY id DESC LIMIT 1`,
+    [users.administrator],
+  );
+  try {
+    await pool.execute(
+      "UPDATE user_sessions SET revoked_at=UTC_TIMESTAMP(3) WHERE id=?",
+      [adminSession.id],
+    );
+    await get(
+      `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    ).expect(401);
+  } finally {
+    await pool.execute("UPDATE user_sessions SET revoked_at=? WHERE id=?", [
+      adminSession.revoked_at,
+      adminSession.id,
+    ]);
+  }
+  try {
+    await pool.execute(
+      "UPDATE user_sessions SET expires_at='2000-01-01 00:00:00' WHERE id=?",
+      [adminSession.id],
+    );
+    await get(
+      `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    ).expect(401);
+  } finally {
+    await pool.execute("UPDATE user_sessions SET expires_at=? WHERE id=?", [
+      adminSession.expires_at,
+      adminSession.id,
+    ]);
+  }
+
+  try {
+    await pool.execute(
+      "UPDATE users SET password_change_required=1 WHERE id=?",
+      [users.administrator],
+    );
+    await get(
+      `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    ).expect(403);
+  } finally {
+    await pool.execute(
+      "UPDATE users SET password_change_required=0 WHERE id=?",
+      [users.administrator],
+    );
+  }
+  try {
+    await pool.execute("UPDATE users SET is_active=0 WHERE id=?", [
+      users.administrator,
+    ]);
+    await get(
+      `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}`,
+    ).expect(401);
+  } finally {
+    await pool.execute("UPDATE users SET is_active=1 WHERE id=?", [
+      users.administrator,
+    ]);
+  }
+
+  try {
+    await pool.execute("UPDATE warehouses SET is_active=0 WHERE id=?", [
+      warehouseId,
+    ]);
+    const inactiveAssigned = await get(
+      `/api/v1/reports/purchase-orders?mode=pending&warehouseId=${warehouseId}&q=${created.body.number}`,
+    ).expect(200);
+    assert.equal(inactiveAssigned.body.orders[0].warehouse.isActive, false);
+  } finally {
+    await pool.execute("UPDATE warehouses SET is_active=1 WHERE id=?", [
+      warehouseId,
+    ]);
+  }
 });

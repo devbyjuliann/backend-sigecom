@@ -13,8 +13,40 @@ import {
 } from "../../src/modules/reports/purchase-receipts-service.js";
 import { bogotaUtcBoundaries } from "../../src/modules/reports/sales-activity-service.js";
 import { createSalesActivityService } from "../../src/modules/reports/sales-activity-service.js";
+import {
+  buildPurchaseOrdersFactsQuery,
+  createPurchaseOrdersService,
+} from "../../src/modules/reports/purchase-orders-service.js";
 
 const suffix = randomBytes(8).toString("hex");
+const currentBogotaDate = "2026-11-06";
+const scenarioInstantUtc = new Date("2026-11-06T17:00:00.000Z");
+let supplierReturnTimestampSequence = 0;
+function utcTimestampBefore(milliseconds) {
+  return new Date(scenarioInstantUtc.getTime() - milliseconds)
+    .toISOString()
+    .slice(0, 23)
+    .replace("T", " ");
+}
+function nextSupplierReturnTimestamp() {
+  const value = new Date(
+    scenarioInstantUtc.getTime() + supplierReturnTimestampSequence,
+  );
+  supplierReturnTimestampSequence += 1;
+  return value.toISOString().slice(0, 23).replace("T", " ");
+}
+function civilDateOffset(date, days) {
+  const value = new Date(`${date}T00:00:00.000Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+function bogotaDateForUtc(timestamp) {
+  return new Date(
+    new Date(`${timestamp.replace(" ", "T")}Z`).getTime() - 5 * 60 * 60 * 1000,
+  )
+    .toISOString()
+    .slice(0, 10);
+}
 const centsAsDecimal = (cents) =>
   `${cents / 100n}.${String(cents % 100n).padStart(2, "0")}`;
 let pool;
@@ -37,7 +69,6 @@ let validReceiptForReturn;
 let validReceiptLineIds;
 let receiptWithInvalidMovements;
 let invalidReceiptLineId;
-let currentBogotaDate;
 let app;
 const httpOrigin = "http://127.0.0.1:5173";
 
@@ -172,20 +203,26 @@ async function createWarehouseReceipt({
   tag,
   quantity,
   unitCost,
+  receivedAt = utcTimestampBefore(20 * 60 * 1000),
 }) {
-  const code = targetWarehouseId === secondWarehouseId ? "MS" : "FR";
+  const code = `${tag
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 6)}-${targetWarehouseId}`;
   const [order] = await connection.execute(
     `INSERT INTO purchase_orders
        (commercial_code,supplier_id,warehouse_id,order_date,status,created_by,
         updated_by,confirmed_by,confirmed_at)
-     VALUES (?, ?, ?, UTC_DATE(), 'confirmed', ?, ?, ?, UTC_TIMESTAMP(3)-INTERVAL 1 DAY)`,
+      VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)`,
     [
       `OC-${code}-${suffix.slice(0, 8)}`,
       supplierId,
       targetWarehouseId,
+      currentBogotaDate,
       auth.user.id,
       auth.user.id,
       auth.user.id,
+      utcTimestampBefore(24 * 60 * 60 * 1000),
     ],
   );
   const warehouseOrderId = String(order.insertId);
@@ -217,8 +254,8 @@ async function createWarehouseReceipt({
   const [receipt] = await connection.execute(
     `INSERT INTO purchase_receipts
        (purchase_order_id,reference,received_by,received_at)
-     VALUES (?, ?, ?, UTC_TIMESTAMP(3)-INTERVAL 20 MINUTE)`,
-    [warehouseOrderId, `receipt-${tag}-${suffix}`, auth.user.id],
+      VALUES (?, ?, ?, ?)`,
+    [warehouseOrderId, `receipt-${tag}-${suffix}`, auth.user.id, receivedAt],
   );
   const receiptId = String(receipt.insertId);
   const [operation] = await connection.execute(
@@ -280,12 +317,13 @@ async function createSupplierReturn({
   snapshotUnit,
   omitOperation = false,
   omittedMovementIndexes = [],
+  returnedAt = nextSupplierReturnTimestamp(),
 }) {
   const [returnResult] = await connection.execute(
     `INSERT INTO supplier_returns
        (purchase_order_id, purchase_receipt_id, reference, reason,
-        idempotency_key, request_hash, returned_by)
-     VALUES (?, ?, ?, 'Fixture de reporte', ?, ?, ?)`,
+         idempotency_key, request_hash, returned_by, returned_at)
+      VALUES (?, ?, ?, 'Fixture de reporte', ?, ?, ?, ?)`,
     [
       receipt.purchaseOrderId ?? orderId,
       receipt.id,
@@ -293,6 +331,7 @@ async function createSupplierReturn({
       `report-return-${suffix}-${returnTag}`,
       "b".repeat(64),
       auth.user.id,
+      returnedAt,
     ],
   );
   const returnId = String(returnResult.insertId);
@@ -392,14 +431,16 @@ async function createPriorPeriodReturn() {
   const [orderResult] = await connection.execute(
     `INSERT INTO purchase_orders
        (commercial_code,supplier_id,warehouse_id,order_date,status,created_by,updated_by,confirmed_by,confirmed_at)
-     VALUES (?, ?, ?, UTC_DATE() - INTERVAL 12 DAY, 'confirmed', ?, ?, ?, UTC_TIMESTAMP(3) - INTERVAL 12 DAY)`,
+     VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)`,
     [
       `OC-RPH-${suffix}`,
       supplierId,
       warehouseId,
+      civilDateOffset(currentBogotaDate, -12),
       auth.user.id,
       auth.user.id,
       auth.user.id,
+      utcTimestampBefore(12 * 24 * 60 * 60 * 1000),
     ],
   );
   orderId = String(orderResult.insertId);
@@ -417,7 +458,7 @@ async function createPriorPeriodReturn() {
   const receipt = await createReceipt({
     reference: `prior-${suffix}`,
     quantities: [5],
-    receivedAt: new Date(Date.now() - 10 * 86400000),
+    receivedAt: utcTimestampBefore(10 * 24 * 60 * 60 * 1000),
   });
   const [[receiptLine]] = await connection.execute(
     "SELECT id FROM purchase_receipt_lines WHERE purchase_receipt_id = ?",
@@ -579,14 +620,16 @@ before(async () => {
   const [orderResult] = await connection.execute(
     `INSERT INTO purchase_orders
        (commercial_code,supplier_id,warehouse_id,order_date,status,created_by,updated_by,confirmed_by,confirmed_at)
-     VALUES (?, ?, ?, UTC_DATE(), 'confirmed', ?, ?, ?, UTC_TIMESTAMP(3) - INTERVAL 1 DAY)`,
+     VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)`,
     [
       `OC-RP-${suffix}`,
       supplierResult.insertId,
       warehouseId,
+      currentBogotaDate,
       userId,
       userId,
       userId,
+      utcTimestampBefore(24 * 60 * 60 * 1000),
     ],
   );
   orderId = String(orderResult.insertId);
@@ -622,8 +665,17 @@ before(async () => {
   const [rogueOrder] = await connection.execute(
     `INSERT INTO purchase_orders
        (commercial_code,supplier_id,warehouse_id,order_date,status,created_by,updated_by,confirmed_by,confirmed_at)
-     VALUES (?, ?, ?, UTC_DATE(), 'confirmed', ?, ?, ?, UTC_TIMESTAMP(3) - INTERVAL 1 DAY)`,
-    [`OC-RPX-${suffix}`, supplierId, warehouseId, userId, userId, userId],
+     VALUES (?, ?, ?, ?, 'confirmed', ?, ?, ?, ?)`,
+    [
+      `OC-RPX-${suffix}`,
+      supplierId,
+      warehouseId,
+      currentBogotaDate,
+      userId,
+      userId,
+      userId,
+      utcTimestampBefore(24 * 60 * 60 * 1000),
+    ],
   );
   rogueOrderId = String(rogueOrder.insertId);
   const [rogueLine] = await connection.execute(
@@ -640,9 +692,6 @@ before(async () => {
   );
   rogueOrderLineId = String(rogueLine.insertId);
 
-  const now = new Date();
-  const bogota = new Date(now.getTime() - 5 * 60 * 60 * 1000);
-  currentBogotaDate = bogota.toISOString().slice(0, 10);
   service = createPurchaseReceiptsService({ dbPool: pool });
   app = createApp({
     dbPool: pool,
@@ -723,7 +772,7 @@ test("MariaDB validates complete receipt and supplier-return facts without multi
   const first = await createReceipt({
     reference: `first-${suffix}`,
     quantities: [2, 2],
-    receivedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    receivedAt: utcTimestampBefore(2 * 60 * 60 * 1000),
   });
   const [firstLineRows] = await connection.execute(
     `SELECT id FROM purchase_receipt_lines WHERE purchase_receipt_id = ? ORDER BY id`,
@@ -734,7 +783,7 @@ test("MariaDB validates complete receipt and supplier-return facts without multi
   const second = await createReceipt({
     reference: `second-${suffix}`,
     quantities: [2, 1],
-    receivedAt: new Date(Date.now() - 60 * 60 * 1000),
+    receivedAt: utcTimestampBefore(60 * 60 * 1000),
   });
   validReceiptForReturn = second;
   const [secondLineRows] = await connection.execute(
@@ -742,6 +791,66 @@ test("MariaDB validates complete receipt and supplier-return facts without multi
     [second.id],
   );
   validReceiptLineIds = secondLineRows.map(({ id }) => String(id));
+
+  const purchaseOrders = createPurchaseOrdersService({ dbPool: pool });
+  const [[documentDate]] = await connection.execute(
+    "SELECT DATE_FORMAT(order_date, '%Y-%m-%d') AS order_date FROM purchase_orders WHERE id = ?",
+    [orderId],
+  );
+  const orderSummary = await purchaseOrders.summarize({
+    auth,
+    mode: "period",
+    dateFrom: documentDate.order_date,
+    dateTo: documentDate.order_date,
+    warehouseId,
+    connection,
+  });
+  const verifiedOrder = orderSummary.orders.find(({ id }) => id === orderId);
+  assert.ok(verifiedOrder, "la orden documentada debe ser elegible e íntegra");
+  assert.equal(verifiedOrder.situation, "fully_received");
+  assert.deepEqual(verifiedOrder.receivedByUnit, [
+    { unit: "caja", quantity: "4" },
+    { unit: "unidad", quantity: "3" },
+  ]);
+  assert.equal(verifiedOrder.orderedValue, "49.36");
+  assert.equal(
+    orderSummary.semantics,
+    "Órdenes fechadas durante el período seleccionado. Situación actual al consultar.",
+  );
+  const currentPending = await purchaseOrders.summarize({
+    auth,
+    mode: "pending",
+    warehouseId,
+    connection,
+  });
+  const noReceiptOrder = currentPending.orders.find(
+    ({ id }) => id === rogueOrderId,
+  );
+  assert.ok(
+    noReceiptOrder,
+    "la modalidad actual no debe imponer un corte por antigüedad",
+  );
+  assert.equal(noReceiptOrder.situation, "confirmed_without_receipts");
+  assert.equal(noReceiptOrder.pendingByUnit[0].quantity, "5");
+  for (const candidate of [
+    { warehouseIds: [warehouseId], mode: "pending" },
+    {
+      warehouseIds: [warehouseId],
+      mode: "period",
+      dateFrom: documentDate.order_date,
+      dateTo: documentDate.order_date,
+    },
+  ]) {
+    const query = buildPurchaseOrdersFactsQuery(candidate);
+    const [plan] = await connection.execute(
+      `EXPLAIN ${query.sql}`,
+      query.params,
+    );
+    assert.ok(plan.length > 0);
+    console.log(
+      `Motor de Órdenes (${candidate.mode}): EXPLAIN ${plan.length} filas`,
+    );
+  }
   await createSupplierReturn({
     receipt: first,
     receiptLineIds: firstLineRows.map(({ id }) => String(id)),
@@ -754,6 +863,22 @@ test("MariaDB validates complete receipt and supplier-return facts without multi
     returnTag: "second-partial",
   });
   await createPriorPeriodReturn();
+  const afterSupplierReturns = await purchaseOrders.summarize({
+    auth,
+    mode: "period",
+    dateFrom: documentDate.order_date,
+    dateTo: documentDate.order_date,
+    warehouseId,
+    connection,
+  });
+  const returnedOrder = afterSupplierReturns.orders.find(
+    ({ id }) => id === orderId,
+  );
+  assert.equal(returnedOrder.situation, "fully_received");
+  assert.deepEqual(returnedOrder.receivedByUnit, [
+    { unit: "caja", quantity: "4" },
+    { unit: "unidad", quantity: "3" },
+  ]);
 
   const boundaries = bogotaUtcBoundaries(currentBogotaDate, currentBogotaDate);
   const activityQuery = buildPurchaseReceiptActivitiesQuery({
@@ -807,9 +932,20 @@ test("MariaDB validates complete receipt and supplier-return facts without multi
     reference: `inconsistent-${suffix}`,
     quantities: [1, 1],
     movementQuantities: [2, 1],
-    receivedAt: new Date(Date.now() - 30 * 60 * 1000),
+    receivedAt: utcTimestampBefore(30 * 60 * 1000),
   });
   receiptWithInvalidMovements = inconsistent;
+  const afterInvalidReceipt = await purchaseOrders.summarize({
+    auth,
+    mode: "pending",
+    warehouseId,
+    connection,
+  });
+  assert.equal(
+    afterInvalidReceipt.orders.some(({ id }) => id === orderId),
+    false,
+  );
+  assert.ok(afterInvalidReceipt.diagnostics.excludedOrders >= 1);
   const [[badReceiptLine]] = await connection.execute(
     "SELECT id FROM purchase_receipt_lines WHERE purchase_receipt_id = ? ORDER BY id LIMIT 1",
     [inconsistent.id],
@@ -902,6 +1038,7 @@ test("MariaDB validates complete receipt and supplier-return facts without multi
 });
 
 test("purchase report permission is independent while sales still requires sales.read", async () => {
+  const ordersReport = createPurchaseOrdersService({ dbPool: pool });
   await connection.execute(
     `DELETE rp FROM role_permissions rp
        JOIN permissions p ON p.id = rp.permission_id
@@ -916,6 +1053,28 @@ test("purchase report permission is independent while sales still requires sales
     connection,
   });
   assert.ok(purchaseResult.summary);
+  const ordersResult = await ordersReport.summarize({
+    auth,
+    mode: "pending",
+    warehouseId,
+    connection,
+  });
+  assert.ok(ordersResult.summary, "el motor de Compras no requiere sales.read");
+  for (const role of ["seller", "warehouse"]) {
+    await assert.rejects(
+      ordersReport.summarize({
+        auth: {
+          user: { id: userIdsByRole[role], role },
+          sessionId: sessionIdsByRole[role],
+        },
+        mode: "pending",
+        warehouseId,
+        connection,
+      }),
+      (error) => error.status === 403 && error.code === "PERMISSION_DENIED",
+      `${role} debe rechazarse por rol en el motor de órdenes`,
+    );
+  }
 
   const salesService = createSalesActivityService({ dbPool: pool });
   await assert.rejects(
@@ -992,30 +1151,30 @@ test("receipts with missing operations, incomplete movements, or extra foreign-o
     reference: `no-operation-${suffix}`,
     quantities: [1],
     omitOperation: true,
-    receivedAt: new Date(Date.now() - 20 * 60 * 1000),
+    receivedAt: utcTimestampBefore(20 * 60 * 1000),
   });
   await createReceipt({
     reference: `missing-movement-${suffix}`,
     quantities: [1, 1],
     omittedMovementIndexes: [1],
-    receivedAt: new Date(Date.now() - 18 * 60 * 1000),
+    receivedAt: utcTimestampBefore(18 * 60 * 1000),
   });
   const wrongWarehouseOperation = await createReceipt({
     reference: `operation-other-warehouse-${suffix}`,
     quantities: [1],
     operationWarehouseId: secondWarehouseId,
-    receivedAt: new Date(Date.now() - 17 * 60 * 1000),
+    receivedAt: utcTimestampBefore(17 * 60 * 1000),
   });
   const extraLineReceipt = await createReceipt({
     reference: `foreign-order-line-${suffix}`,
     quantities: [1],
-    receivedAt: new Date(Date.now() - 16 * 60 * 1000),
+    receivedAt: utcTimestampBefore(16 * 60 * 1000),
   });
   await addMismatchedReceiptLine(extraLineReceipt, 1);
   const extraMovementReceipt = await createReceipt({
     reference: `extra-movement-${suffix}`,
     quantities: [1],
-    receivedAt: new Date(Date.now() - 15 * 60 * 1000),
+    receivedAt: utcTimestampBefore(15 * 60 * 1000),
   });
   await addUnjustifiedMovement(
     extraMovementReceipt,
@@ -1249,8 +1408,136 @@ test("assigned warehouses aggregate before totals while a foreign warehouse cont
   );
 });
 
+test("Bogotá midnight boundaries include each receipt exactly once on its local date", async () => {
+  const [beforeWarehouse] = await connection.execute(
+    "INSERT INTO warehouses (code,name,is_active) VALUES (?, ?, 1)",
+    [`RB1-${suffix}`, `Bodega límite anterior ${suffix}`],
+  );
+  const [afterWarehouse] = await connection.execute(
+    "INSERT INTO warehouses (code,name,is_active) VALUES (?, ?, 1)",
+    [`RB2-${suffix}`, `Bodega límite posterior ${suffix}`],
+  );
+  for (const warehouse of [beforeWarehouse, afterWarehouse]) {
+    await connection.execute(
+      "INSERT INTO user_warehouses (user_id,warehouse_id,assigned_by) VALUES (?,?,?)",
+      [auth.user.id, warehouse.insertId, auth.user.id],
+    );
+  }
+
+  const beforeMidnightUtc = "2026-11-07 04:59:59.000";
+  const afterMidnightUtc = "2026-11-07 05:00:01.000";
+  assert.equal(bogotaDateForUtc(beforeMidnightUtc), "2026-11-06");
+  assert.equal(bogotaDateForUtc(afterMidnightUtc), "2026-11-07");
+  const beforeReceipt = await createWarehouseReceipt({
+    targetWarehouseId: String(beforeWarehouse.insertId),
+    tag: "boundary-before-midnight",
+    quantity: 1,
+    unitCost: "10.01",
+    receivedAt: beforeMidnightUtc,
+  });
+  const afterReceipt = await createWarehouseReceipt({
+    targetWarehouseId: String(afterWarehouse.insertId),
+    tag: "boundary-after-midnight",
+    quantity: 2,
+    unitCost: "10.01",
+    receivedAt: afterMidnightUtc,
+  });
+
+  const queryActivities = async (date, scopedWarehouseId) => {
+    const boundaries = bogotaUtcBoundaries(date, date);
+    const query = buildPurchaseReceiptActivitiesQuery({
+      warehouseIds: [scopedWarehouseId],
+      ...boundaries,
+      pageSize: 10,
+      offset: 0,
+    });
+    const [[count]] = await connection.execute(query.countSql, query.params);
+    const [activities] = await connection.execute(
+      query.pageSql,
+      query.pageParams,
+    );
+    return { total: Number(count.total), activities, boundaries };
+  };
+  const beforeDay = await queryActivities(
+    "2026-11-06",
+    String(beforeWarehouse.insertId),
+  );
+  const beforeDayExcluded = await queryActivities(
+    "2026-11-07",
+    String(beforeWarehouse.insertId),
+  );
+  const afterDayExcluded = await queryActivities(
+    "2026-11-06",
+    String(afterWarehouse.insertId),
+  );
+  const afterDay = await queryActivities(
+    "2026-11-07",
+    String(afterWarehouse.insertId),
+  );
+  assert.deepEqual(beforeDay.boundaries, {
+    startUtc: "2026-11-06 05:00:00.000",
+    endUtc: "2026-11-07 05:00:00.000",
+  });
+  assert.deepEqual(afterDay.boundaries, {
+    startUtc: "2026-11-07 05:00:00.000",
+    endUtc: "2026-11-08 05:00:00.000",
+  });
+  assert.equal(beforeDay.total, 1);
+  assert.equal(beforeDay.activities.length, 1);
+  assert.equal(
+    beforeDay.activities[0].activity_id,
+    `purchase_receipt:${beforeReceipt.id}`,
+  );
+  assert.equal(String(beforeDay.activities[0].amount), "10.01");
+  assert.equal(beforeDayExcluded.total, 0);
+  assert.deepEqual(beforeDayExcluded.activities, []);
+  assert.equal(afterDayExcluded.total, 0);
+  assert.deepEqual(afterDayExcluded.activities, []);
+  assert.equal(afterDay.total, 1);
+  assert.equal(afterDay.activities.length, 1);
+  assert.equal(
+    afterDay.activities[0].activity_id,
+    `purchase_receipt:${afterReceipt.id}`,
+  );
+  assert.equal(String(afterDay.activities[0].amount), "20.02");
+
+  const beforeSummary = await service.summarize({
+    auth,
+    dateFrom: "2026-11-06",
+    dateTo: "2026-11-06",
+    warehouseId: String(beforeWarehouse.insertId),
+    connection,
+  });
+  const afterSummary = await service.summarize({
+    auth,
+    dateFrom: "2026-11-07",
+    dateTo: "2026-11-07",
+    warehouseId: String(afterWarehouse.insertId),
+    connection,
+  });
+  assert.equal(beforeSummary.summary.receivedValue, "10.01");
+  assert.deepEqual(beforeSummary.summary.quantitiesByUnit, [
+    {
+      unit: "unidad",
+      quantityReceived: "1",
+      quantityReturned: "0",
+      quantityDifference: "1",
+    },
+  ]);
+  assert.equal(afterSummary.summary.receivedValue, "20.02");
+  assert.deepEqual(afterSummary.summary.quantitiesByUnit, [
+    {
+      unit: "unidad",
+      quantityReceived: "2",
+      quantityReturned: "0",
+      quantityDifference: "2",
+    },
+  ]);
+});
+
 test("purchase service revalidates live sessions, account state, role, and each required permission", async () => {
   const validAuth = auth;
+  const ordersReport = createPurchaseOrdersService({ dbPool: pool });
   const summarize = (candidate = validAuth) =>
     service.summarize({
       auth: candidate,
@@ -1259,7 +1546,15 @@ test("purchase service revalidates live sessions, account state, role, and each 
       warehouseId,
       connection,
     });
+  const summarizeOrders = (candidate = validAuth) =>
+    ordersReport.summarize({
+      auth: candidate,
+      mode: "pending",
+      warehouseId,
+      connection,
+    });
   assert.ok((await summarize()).summary);
+  assert.ok((await summarizeOrders()).summary);
   await assert.rejects(summarize(null), (error) => error.status === 403);
   await assert.rejects(
     summarize({
@@ -1281,6 +1576,7 @@ test("purchase service revalidates live sessions, account state, role, and each 
     await connection.query("SAVEPOINT authorization_state_case");
     await connection.execute(sql, params);
     await assert.rejects(summarize(), (error) => error.status === 403);
+    await assert.rejects(summarizeOrders(), (error) => error.status === 403);
     await connection.query("ROLLBACK TO SAVEPOINT authorization_state_case");
   };
   await assertDeniedAfter(
@@ -1316,6 +1612,7 @@ test("purchase service revalidates live sessions, account state, role, and each 
       [validAuth.user.id, permission],
     );
     await assert.rejects(summarize(), (error) => error.status === 403);
+    await assert.rejects(summarizeOrders(), (error) => error.status === 403);
     await connection.query(
       "ROLLBACK TO SAVEPOINT authorization_permission_case",
     );
@@ -1328,6 +1625,7 @@ test("purchase service revalidates live sessions, account state, role, and each 
     [validAuth.user.id],
   );
   await assert.rejects(summarize(), (error) => error.status === 403);
+  await assert.rejects(summarizeOrders(), (error) => error.status === 403);
   await connection.query("ROLLBACK TO SAVEPOINT no_commercial_permission_case");
 
   for (const roleCode of ["seller", "warehouse"]) {
@@ -1346,6 +1644,13 @@ test("purchase service revalidates live sessions, account state, role, and each 
       }),
       (error) => error.status === 403,
     );
+    await assert.rejects(
+      summarizeOrders({
+        user: { id: roleUserId, role: roleCode },
+        sessionId: sessionIdsByRole[roleCode],
+      }),
+      (error) => error.status === 403,
+    );
     await connection.query(
       "ROLLBACK TO SAVEPOINT restricted_role_permission_case",
     );
@@ -1359,15 +1664,30 @@ test("purchase service revalidates live sessions, account state, role, and each 
       authorized.summary,
       `${roleCode} autorizado debe consultar Compras.`,
     );
+    const authorizedOrders = await summarizeOrders({
+      user: { id: userIdsByRole[roleCode], role: roleCode },
+      sessionId: sessionIdsByRole[roleCode],
+    });
+    assert.ok(authorizedOrders.summary);
   }
 });
 
 test("unassigned and foreign warehouses are not reported or distinguishable", async () => {
+  const ordersReport = createPurchaseOrdersService({ dbPool: pool });
   await assert.rejects(
     service.summarize({
       auth,
       dateFrom: currentBogotaDate,
       dateTo: currentBogotaDate,
+      warehouseId: foreignWarehouseId,
+      connection,
+    }),
+    (error) => error.status === 404 && error.code === "WAREHOUSE_NOT_FOUND",
+  );
+  await assert.rejects(
+    ordersReport.summarize({
+      auth,
+      mode: "pending",
       warehouseId: foreignWarehouseId,
       connection,
     }),
@@ -1402,6 +1722,13 @@ test("unassigned and foreign warehouses are not reported or distinguishable", as
   });
   assert.equal(empty.summary.receivedValue, "0.00");
   assert.deepEqual(empty.summary.quantitiesByUnit, []);
+  const emptyOrders = await ordersReport.summarize({
+    auth,
+    mode: "pending",
+    connection,
+  });
+  assert.equal(emptyOrders.summary.verifiedOrders, 0);
+  assert.deepEqual(emptyOrders.orders, []);
 });
 
 test("registered purchase report endpoints reject anonymous requests without caching", async () => {
