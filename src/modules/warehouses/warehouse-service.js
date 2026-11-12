@@ -327,6 +327,41 @@ export function createWarehouseService({ dbPool }) {
       const current = await lockAssignedWarehouse(connection, id, userId);
       if (Boolean(current.is_active) !== isActive) {
         if (!isActive) {
+          // Keep this as a consistent read, not a locking read: purchase
+          // confirmation locks its order before this warehouse. The warehouse
+          // lock above serializes both operations without reversing that order.
+          const [[pendingPurchases]] = await connection.execute(
+            `SELECT COUNT(*) AS blocking_orders
+             FROM purchase_orders AS po
+             WHERE po.warehouse_id = ?
+               AND po.status = 'confirmed'
+               AND po.closed_at IS NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM purchase_order_lines AS pol
+                 WHERE pol.purchase_order_id = po.id
+                   AND pol.is_active = 1
+                   AND pol.quantity > COALESCE(
+                     (
+                       SELECT SUM(prl.quantity)
+                       FROM purchase_receipt_lines AS prl
+                       WHERE prl.purchase_order_id = po.id
+                         AND prl.purchase_order_line_id = pol.id
+                     ),
+                     0
+                   )
+               )`,
+            [id],
+          );
+          const blockingOrderCount = Number(pendingPurchases.blocking_orders);
+          if (blockingOrderCount > 0) {
+            throw new HttpError(
+              409,
+              "WAREHOUSE_HAS_PENDING_PURCHASES",
+              `No puedes desactivar esta bodega: tiene ${blockingOrderCount} ${blockingOrderCount === 1 ? "orden de compra confirmada" : "órdenes de compra confirmadas"} con cantidades pendientes de recibir. Registra las recepciones o cierra las cantidades pendientes antes de volver a intentarlo.`,
+            );
+          }
+
           const [[stock]] = await connection.execute(
             "SELECT EXISTS(SELECT 1 FROM inventory_balances WHERE warehouse_id = ? AND quantity > 0) AS has_stock",
             [id],
