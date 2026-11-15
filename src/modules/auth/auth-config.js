@@ -47,6 +47,11 @@ export function getAuthConfig(env = process.env) {
   }
 
   const production = env.NODE_ENV === "production";
+  if (production && (!env.JWT_ISSUER?.trim() || !env.JWT_AUDIENCE?.trim())) {
+    throw new Error(
+      "JWT_ISSUER y JWT_AUDIENCE explícitos son obligatorios en producción.",
+    );
+  }
   if (
     env.COOKIE_SECURE !== undefined &&
     !["true", "false"].includes(env.COOKIE_SECURE)
@@ -84,6 +89,16 @@ export function getAuthConfig(env = process.env) {
     );
   }
 
+  const allowedOrigins = readOrigins(env.FRONTEND_ORIGIN);
+  if (
+    production &&
+    allowedOrigins.some((origin) => new URL(origin).protocol !== "https:")
+  ) {
+    throw new Error(
+      "FRONTEND_ORIGIN debe usar HTTPS para cookies y sesiones production.",
+    );
+  }
+
   return {
     jwtSecret,
     jwtIssuer: env.JWT_ISSUER || "sigecom",
@@ -94,7 +109,7 @@ export function getAuthConfig(env = process.env) {
     cookieSecure: env.COOKIE_SECURE === "true",
     cookieSameSite: "strict",
     cookiePath: "/api/v1",
-    allowedOrigins: readOrigins(env.FRONTEND_ORIGIN),
+    allowedOrigins,
     loginAttemptLimit,
     loginAccountAttemptLimit,
     loginWindowMs: 15 * 60 * 1000,

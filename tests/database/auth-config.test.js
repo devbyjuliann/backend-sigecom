@@ -53,6 +53,8 @@ test("requires secure session cookies in production", () => {
         ...validEnvironment,
         NODE_ENV: "production",
         COOKIE_SECURE: "false",
+        JWT_ISSUER: "sigecom-production",
+        JWT_AUDIENCE: "sigecom-api-production",
       }),
     /COOKIE_SECURE/,
   );
@@ -61,9 +63,60 @@ test("requires secure session cookies in production", () => {
       ...validEnvironment,
       NODE_ENV: "production",
       COOKIE_SECURE: "true",
+      FRONTEND_ORIGIN: "https://app.example.com",
+      JWT_ISSUER: "sigecom-production",
+      JWT_AUDIENCE: "sigecom-api-production",
     }).cookieSecure,
     true,
   );
+});
+
+test("production authentication requires HTTPS origins for credentialed cookies", () => {
+  assert.throws(
+    () =>
+      getAuthConfig({
+        ...validEnvironment,
+        NODE_ENV: "production",
+        COOKIE_SECURE: "true",
+        JWT_ISSUER: "sigecom-production",
+        JWT_AUDIENCE: "sigecom-api-production",
+      }),
+    /FRONTEND_ORIGIN.*HTTPS/i,
+  );
+  assert.equal(
+    getAuthConfig({
+      ...validEnvironment,
+      NODE_ENV: "production",
+      COOKIE_SECURE: "true",
+      FRONTEND_ORIGIN: "https://app.example.com",
+      JWT_ISSUER: "sigecom-production",
+      JWT_AUDIENCE: "sigecom-api-production",
+    }).allowedOrigins[0],
+    "https://app.example.com",
+  );
+});
+
+test("production JWT issuer and audience cannot use development defaults", () => {
+  assert.throws(
+    () =>
+      getAuthConfig({
+        ...validEnvironment,
+        NODE_ENV: "production",
+        COOKIE_SECURE: "true",
+        FRONTEND_ORIGIN: "https://app.example.com",
+      }),
+    /JWT_ISSUER.*JWT_AUDIENCE.*explícitos/i,
+  );
+  const config = getAuthConfig({
+    ...validEnvironment,
+    NODE_ENV: "production",
+    COOKIE_SECURE: "true",
+    FRONTEND_ORIGIN: "https://app.example.com",
+    JWT_ISSUER: "sigecom-production",
+    JWT_AUDIENCE: "sigecom-api-production",
+  });
+  assert.equal(config.jwtIssuer, "sigecom-production");
+  assert.equal(config.jwtAudience, "sigecom-api-production");
 });
 
 test("accepts only explicit HTTP or HTTPS origins without wildcard entries", () => {

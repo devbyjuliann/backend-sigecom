@@ -30,13 +30,14 @@ import { createLogger, requestLogger } from "./shared/logger.js";
 export function createApp({
   dbPool,
   authConfig,
+  trustProxy = false,
   logger = createLogger(),
 } = {}) {
   const app = express();
 
   app.disable("x-powered-by");
   app.disable("etag");
-  app.set("trust proxy", false);
+  app.set("trust proxy", trustProxy);
   app.use(helmet());
   app.use((request, response, next) => {
     request.requestId = randomUUID();

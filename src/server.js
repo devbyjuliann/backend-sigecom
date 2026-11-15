@@ -1,5 +1,9 @@
 import { createServer } from "node:http";
 import { createApp } from "./app.js";
+import {
+  getTrustedProxyAddresses,
+  resolveRuntimeDatabaseTarget,
+} from "./db/config.js";
 import { createDatabasePool } from "./db/pool.js";
 import { getAuthConfig } from "./modules/auth/auth-config.js";
 import { createLogger } from "./shared/logger.js";
@@ -7,18 +11,20 @@ import { createLogger } from "./shared/logger.js";
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 3001);
 const logger = createLogger();
+const databaseTarget = resolveRuntimeDatabaseTarget(process.env);
+const trustProxy = getTrustedProxyAddresses(process.env.TRUSTED_PROXY_IPS);
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   throw new Error("PORT debe ser un número entre 1 y 65535.");
 }
 
 const authConfig = getAuthConfig(process.env);
-const dbPool = createDatabasePool("development");
+const dbPool = createDatabasePool(databaseTarget);
 let server;
 
 try {
   await dbPool.query("SELECT 1");
-  server = createServer(createApp({ dbPool, authConfig, logger }));
+  server = createServer(createApp({ dbPool, authConfig, logger, trustProxy }));
   server.listen(port, host, () => {
     logger.info({ host, port }, "SIGECOM API listening");
   });
