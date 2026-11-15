@@ -103,6 +103,7 @@ function document(row, lines = []) {
     supplierIdentification: row.supplier_identification,
     warehouseId: String(row.warehouse_id),
     warehouseName: row.warehouse_name,
+    warehouseIsActive: Boolean(row.warehouse_is_active),
     orderDate: row.order_date,
     reference: row.reference,
     notes: row.notes,
@@ -144,7 +145,8 @@ function document(row, lines = []) {
 
 const orderSelect = `
   SELECT po.*, DATE_FORMAT(po.order_date, '%Y-%m-%d') AS order_date, s.business_name AS supplier_name,
-         s.identification_number AS supplier_identification, w.name AS warehouse_name,
+          s.identification_number AS supplier_identification, w.name AS warehouse_name,
+          w.is_active AS warehouse_is_active,
          closure_actor.display_name AS closed_by_name
   FROM purchase_orders AS po
   JOIN suppliers AS s ON s.id = po.supplier_id

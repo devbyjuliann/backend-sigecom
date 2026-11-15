@@ -197,20 +197,27 @@ export function createAuthService({ dbPool, config }) {
         [row.role_id],
       ),
       dbPool.execute(
-        `SELECT uw.warehouse_id FROM user_warehouses AS uw
+        `SELECT uw.warehouse_id, w.is_active FROM user_warehouses AS uw
          JOIN warehouses AS w ON w.id = uw.warehouse_id
-         WHERE uw.user_id = ? AND w.is_active = 1 ORDER BY uw.warehouse_id`,
+         WHERE uw.user_id = ? ORDER BY uw.warehouse_id`,
         [row.id],
       ),
     ]);
+
+    const historicalWarehouseIds = warehouseRows.map(({ warehouse_id }) =>
+      String(warehouse_id),
+    );
 
     return {
       user: safeUser(row),
       sessionId: String(row.session_id),
       permissions: new Set(permissionRows.map(({ code }) => code)),
       warehouseIds: new Set(
-        warehouseRows.map(({ warehouse_id }) => String(warehouse_id)),
+        warehouseRows
+          .filter(({ is_active }) => Boolean(is_active))
+          .map(({ warehouse_id }) => String(warehouse_id)),
       ),
+      historicalWarehouseIds: new Set(historicalWarehouseIds),
     };
   }
 

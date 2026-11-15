@@ -1325,8 +1325,10 @@ export function createSaleService({ dbPool }) {
     const direction = query.sortOrder === "asc" ? "ASC" : "DESC";
     const [rows] = await dbPool.execute(
       `SELECT s.*, DATE_FORMAT(s.sale_date, '%Y-%m-%d') AS sale_date,
-         CAST(COALESCE(SUM(sl.line_total), 0) AS CHAR) AS total
+          CAST(COALESCE(SUM(sl.line_total), 0) AS CHAR) AS total,
+          MAX(sale_warehouse.is_active) AS sale_warehouse_is_active
        FROM sales AS s LEFT JOIN sale_lines AS sl ON sl.sale_id = s.id
+       LEFT JOIN warehouses AS sale_warehouse ON sale_warehouse.id = s.warehouse_id
        WHERE ${filter} GROUP BY s.id ORDER BY ${sort} ${direction}, s.id ${direction}
        LIMIT ? OFFSET ?`,
       [...params, query.pageSize, (query.page - 1) * query.pageSize],
@@ -1341,6 +1343,7 @@ export function createSaleService({ dbPool }) {
         customerName: row.customer_name_snapshot,
         warehouseId: String(row.warehouse_id),
         warehouseName: row.warehouse_name_snapshot,
+        warehouseIsActive: Boolean(row.sale_warehouse_is_active),
         status: row.status,
         version: Number(row.version),
         total: money(cents(row.total)),

@@ -181,7 +181,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
       const query = parse(listSchema, request.query);
       response.json(
         await service.list({
-          warehouseIds: [...request.auth.warehouseIds],
+          warehouseIds: [...request.auth.historicalWarehouseIds],
           query,
         }),
       );
@@ -197,7 +197,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
         throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
       response.json(
         await service.getById(request.params.id, {
-          warehouseIds: [...request.auth.warehouseIds],
+          warehouseIds: [...request.auth.historicalWarehouseIds],
         }),
       );
     },
@@ -289,7 +289,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
       response.set("Cache-Control", "no-store").json(
         await service.getReversal({
           saleId: request.params.id,
-          warehouseIds: [...request.auth.warehouseIds],
+          warehouseIds: [...request.auth.historicalWarehouseIds],
         }),
       );
     },
@@ -304,7 +304,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
         throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
       const reversal = await service.getReversal({
         saleId: request.params.id,
-        warehouseIds: [...request.auth.warehouseIds],
+        warehouseIds: [...request.auth.historicalWarehouseIds],
       });
       const pdf = createSaleReversalPdf(reversal);
       response
@@ -363,7 +363,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
       response.set("Cache-Control", "no-store").json(
         await service.listCustomerReturns({
           saleId: request.params.id,
-          warehouseIds: [...request.auth.warehouseIds],
+          warehouseIds: [...request.auth.historicalWarehouseIds],
         }),
       );
     },
@@ -387,7 +387,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
         await service.getCustomerReturn({
           saleId: request.params.id,
           returnId: request.params.returnId,
-          warehouseIds: [...request.auth.warehouseIds],
+          warehouseIds: [...request.auth.historicalWarehouseIds],
         }),
       );
     },
@@ -410,7 +410,7 @@ export function createSaleRouter({ dbPool, authConfig }) {
       const pdf = await service.getCustomerReturnPdf({
         saleId: request.params.id,
         returnId: request.params.returnId,
-        warehouseIds: [...request.auth.warehouseIds],
+        warehouseIds: [...request.auth.historicalWarehouseIds],
       });
       response
         .set("Cache-Control", "no-store")

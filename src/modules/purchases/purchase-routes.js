@@ -351,7 +351,7 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
       const result = await service.list({
         ...query,
         query: query.q,
-        warehouseIds: [...request.auth.warehouseIds],
+        warehouseIds: [...request.auth.historicalWarehouseIds],
       });
       response.set("Cache-Control", "no-store").json(result);
     },
