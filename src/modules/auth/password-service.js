@@ -25,11 +25,11 @@ export async function changePassword({
   try {
     await connection.beginTransaction();
     const [users] = await connection.execute(
-      `SELECT password_hash, is_active FROM users WHERE id = ? FOR UPDATE`,
+      `SELECT password_hash, is_active, credential_state FROM users WHERE id = ? FOR UPDATE`,
       [userId],
     );
     const user = users[0];
-    if (!user || !user.is_active) {
+    if (!user || !user.is_active || user.credential_state !== "active") {
       await connection.rollback();
       throw new HttpError(
         401,

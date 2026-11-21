@@ -6,6 +6,7 @@ import {
   normalizeAdminEmail,
   validateTemporaryPassword,
 } from "../src/modules/users/admin-credentials.js";
+import { createInitialAdmin } from "../src/modules/users/initial-admin-bootstrap.js";
 
 function askHidden(label) {
   if (!stdin.isTTY || !stdout.isTTY || typeof stdin.setRawMode !== "function") {
@@ -62,88 +63,33 @@ try {
     parseEmailArgument() ||
     (await prompt.question("Correo del administrador: "));
   const email = normalizeAdminEmail(emailInput);
+  const displayName = (
+    await prompt.question("Nombre visible del administrador: ")
+  ).trim();
+  if (!displayName || displayName.length > 120) {
+    throw new Error("El nombre debe tener entre 1 y 120 caracteres.");
+  }
   prompt.close();
 
   const temporaryPassword = await askHidden(
-    "Contraseña temporal aleatoria (mínimo 24 caracteres, máximo 72 bytes; entrada oculta): ",
+    "Contraseña inicial aleatoria (mínimo 24 caracteres, máximo 72 bytes; entrada oculta): ",
   );
   const confirmation = await askHidden(
-    "Confirma la contraseña temporal (entrada oculta): ",
+    "Confirma la contraseña inicial (entrada oculta): ",
   );
   validateTemporaryPassword(temporaryPassword, confirmation);
   const passwordHash = await hashTemporaryPassword(temporaryPassword);
 
   pool = createDatabasePool("development");
-  const connection = await pool.getConnection();
-  const lockName = "sigecom:initial-admin:sigecom_dev";
-  let lockAcquired = false;
-
-  try {
-    const [[lock]] = await connection.query(
-      "SELECT GET_LOCK(?, 10) AS acquired",
-      [lockName],
-    );
-    if (lock.acquired !== 1)
-      throw new Error("No se pudo reservar el alta inicial del administrador.");
-    lockAcquired = true;
-    await connection.beginTransaction();
-
-    const [existingAdmin] = await connection.execute(
-      `SELECT u.id FROM users AS u JOIN roles AS r ON r.id = u.role_id
-       WHERE r.code = 'administrator' LIMIT 1 FOR UPDATE`,
-    );
-    if (existingAdmin.length)
-      throw new Error(
-        "Ya existe una cuenta administradora; no se modificó ninguna cuenta.",
-      );
-
-    const [existingEmail] = await connection.execute(
-      "SELECT id FROM users WHERE email = ? LIMIT 1",
-      [email],
-    );
-    if (existingEmail.length)
-      throw new Error(
-        "El correo indicado ya está registrado; no se modificó ninguna cuenta.",
-      );
-
-    const [roleRows] = await connection.execute(
-      "SELECT id FROM roles WHERE code = 'administrator'",
-    );
-    if (!roleRows.length)
-      throw new Error(
-        "Aplique las migraciones y semillas antes de crear el administrador.",
-      );
-
-    const [userResult] = await connection.execute(
-      `INSERT INTO users (role_id, email, password_hash, is_active, password_change_required)
-       VALUES (?, ?, ?, 1, 1)`,
-      [roleRows[0].id, email, passwordHash],
-    );
-    await connection.execute(
-      `INSERT INTO audit_events (user_id, action, module, entity_type, entity_id, details)
-       VALUES (?, 'initial_admin.created', 'users', 'users', ?, ?)`,
-      [
-        userResult.insertId,
-        String(userResult.insertId),
-        JSON.stringify({
-          role: "administrator",
-          password_change_required: true,
-        }),
-      ],
-    );
-
-    await connection.commit();
-    console.log(
-      `Administrador ${email} creado. La contraseña temporal no se mostró ni se guardó en texto plano; el cambio será obligatorio en el primer acceso.`,
-    );
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally {
-    if (lockAcquired)
-      await connection.query("SELECT RELEASE_LOCK(?)", [lockName]);
-    connection.release();
-  }
+  const created = await createInitialAdmin({
+    dbPool: pool,
+    email,
+    displayName,
+    passwordHash,
+  });
+  console.log(
+    `Administrador ${created.email} creado con acceso a ${created.warehouseIds.length} bodega(s) activa(s). La contraseña inicial no se mostró ni se guardó en texto plano; el cambio será obligatorio en el primer acceso.`,
+  );
 } catch (error) {
   prompt.close();
   console.error(`No se creó el administrador: ${error.message}`);

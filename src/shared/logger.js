@@ -15,6 +15,12 @@ const redactPaths = [
   "jwt",
   "csrfToken",
   "csrf_token",
+  "tokenHash",
+  "token_hash",
+  "recoveryToken",
+  "recoveryUrl",
+  "recoveryLink",
+  "resetUrl",
   "*.password",
   "*.password_hash",
   "*.passwordHash",
@@ -22,6 +28,12 @@ const redactPaths = [
   "*.token",
   "*.jwt",
   "*.cookie",
+  "*.tokenHash",
+  "*.token_hash",
+  "*.recoveryToken",
+  "*.recoveryUrl",
+  "*.recoveryLink",
+  "*.resetUrl",
 ];
 
 export function createLogger({

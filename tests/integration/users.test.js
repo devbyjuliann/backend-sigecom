@@ -2,21 +2,31 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
+import mysql from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { IntegrationFixtures } from "../support/integration-fixtures.js";
+import { getAccountAccessE2EConfig } from "../../scripts/account-access-email-e2e-runner.js";
 
 const origin = "http://127.0.0.1:5173";
-const unique = randomBytes(8).toString("hex");
+const isolatedRun =
+  process.env.SIGECOM_ACCOUNT_ACCESS_MODE === "RUN"
+    ? getAccountAccessE2EConfig("RUN")
+    : null;
+const databaseName = isolatedRun?.schema ?? "sigecom_test";
+const unique = isolatedRun?.attemptId ?? randomBytes(8).toString("hex");
 const adminEmail = `users-admin-${unique}@sigecom.invalid`;
 const targetEmail = `users-target-${unique}@sigecom.invalid`;
 let pool;
 let authConfig;
 let adminId;
-const fixtures = new IntegrationFixtures({ suite: "users" });
+const fixtures = new IntegrationFixtures({
+  suite: "users",
+  databaseName,
+});
 let warehouseId;
 let adminPassword;
 let app;
@@ -25,10 +35,20 @@ let secondWarehouseId;
 const extraWarehouseIds = [];
 let createdUserId;
 const extraCreatedUserIds = [];
+const capturedAccessMessages = [];
+const mailTransport = {
+  type: "simulated",
+  async send(message, options) {
+    capturedAccessMessages.push({ message, options });
+    return { accepted: true, simulated: true };
+  },
+};
 const changedTargetPassword = "Changed-Temporary-Password-2026!";
 
-async function csrf() {
-  const response = await request(app).get("/api/v1/auth/csrf").expect(200);
+async function csrf(appInstance = app) {
+  const response = await request(appInstance)
+    .get("/api/v1/auth/csrf")
+    .expect(200);
   return {
     cookie: response.headers["set-cookie"]
       .find((value) => value.startsWith("sigecom_csrf="))
@@ -37,9 +57,9 @@ async function csrf() {
   };
 }
 
-async function login(email, password) {
-  const token = await csrf();
-  const response = await request(app)
+async function login(email, password, appInstance = app) {
+  const token = await csrf(appInstance);
+  const response = await request(appInstance)
     .post("/api/v1/auth/login")
     .set("Origin", origin)
     .set("Cookie", token.cookie)
@@ -78,13 +98,86 @@ function createFreshApp() {
     dbPool: pool,
     authConfig,
     logger: createLogger({ level: "silent" }),
+    mailTransport,
+  });
+}
+
+function latestEmailToken(path) {
+  const captured = [...capturedAccessMessages]
+    .reverse()
+    .find(({ message }) => message.text.includes(path));
+  assert.ok(captured, `Expected an email containing ${path}`);
+  const match = /#token=([A-Za-z0-9_-]{43})/.exec(captured.message.text);
+  assert.ok(match, "Expected an opaque token in the captured test email");
+  return match[1];
+}
+
+async function completeAccessLink({
+  appInstance = app,
+  email,
+  path,
+  endpoint,
+  password,
+}) {
+  const captured = [...capturedAccessMessages]
+    .reverse()
+    .find(({ message }) => message.text.includes(path));
+  assert.ok(captured, `Expected an email containing ${path}`);
+  assert.equal(captured.message.to, email);
+  const token = latestEmailToken(path);
+  const tokenCsrf = await csrf(appInstance);
+  return request(appInstance)
+    .post(endpoint)
+    .set("Origin", origin)
+    .set("Cookie", tokenCsrf.cookie)
+    .set("X-CSRF-Token", tokenCsrf.token)
+    .send({
+      token,
+      newPassword: password,
+      confirmPassword: password,
+    })
+    .expect(200);
+}
+
+function acceptLatestInvitation(email, password, appInstance = app) {
+  return completeAccessLink({
+    appInstance,
+    email,
+    path: "/aceptar-invitacion#token=",
+    endpoint: "/api/v1/auth/invitations/complete",
+    password,
+  });
+}
+
+function completeLatestAdminReset(email, password, appInstance = app) {
+  return completeAccessLink({
+    appInstance,
+    email,
+    path: "/restablecer-contrasena?modo=administrativo#token=",
+    endpoint: "/api/v1/auth/admin-password-reset/complete",
+    password,
   });
 }
 
 before(async () => {
-  pool = createDatabasePool("test");
+  if (isolatedRun) {
+    pool = mysql.createPool({
+      host: "127.0.0.1",
+      port: 3306,
+      database: isolatedRun.schema,
+      user: `sgapp_${isolatedRun.runId}`,
+      password: isolatedRun.credentials.appPassword,
+      charset: "utf8mb4",
+      timezone: "Z",
+      connectionLimit: 5,
+      connectTimeout: 5000,
+      multipleStatements: false,
+    });
+  } else {
+    pool = createDatabasePool("test");
+  }
   const [[database]] = await pool.query("SELECT DATABASE() AS name");
-  assert.equal(database.name, "sigecom_test");
+  assert.equal(database.name, databaseName);
   authConfig = getAuthConfig({
     JWT_SECRET: randomBytes(48).toString("base64url"),
     FRONTEND_ORIGIN: `${origin},http://localhost:5173`,
@@ -94,6 +187,7 @@ before(async () => {
     dbPool: pool,
     authConfig,
     logger: createLogger({ level: "silent" }),
+    mailTransport,
   });
 
   const [[administrator]] = await pool.execute(
@@ -144,7 +238,7 @@ after(async () => {
   }
 });
 
-test("administrator creates a user with a one-time temporary password", async () => {
+test("administrator creates an invitation-only account without returning a password", async () => {
   const response = await api("post", "/api/v1/users", {
     email: targetEmail.toUpperCase(),
     displayName: "Cuenta de prueba",
@@ -152,14 +246,16 @@ test("administrator creates a user with a one-time temporary password", async ()
     warehouseIds: [warehouseId],
   }).expect(201);
 
-  const { user, temporaryPassword } = response.body;
+  const { user } = response.body;
   createdUserId = user.id;
   fixtures.user(createdUserId);
   assert.equal(user.email, targetEmail);
   assert.equal(user.roleCode, "seller");
   assert.equal(user.isActive, true);
   assert.equal(user.passwordChangeRequired, true);
-  assert.ok(temporaryPassword.length >= 32);
+  assert.equal(user.credentialState, "pending_invitation");
+  assert.equal(response.body.invitation.deliveryStatus, "simulated");
+  assert.equal("temporaryPassword" in response.body, false);
   assert.equal("passwordHash" in user, false);
   assert.equal("password_hash" in user, false);
   assert.doesNotMatch(
@@ -168,33 +264,36 @@ test("administrator creates a user with a one-time temporary password", async ()
   );
 
   const [[stored]] = await pool.execute(
-    "SELECT password_hash, password_change_required FROM users WHERE email = ?",
+    "SELECT password_hash, password_change_required, credential_state FROM users WHERE email = ?",
     [targetEmail],
   );
   assert.equal(stored.password_change_required, 1);
-  assert.notEqual(stored.password_hash, temporaryPassword);
+  assert.equal(stored.credential_state, "pending_invitation");
+  assert.match(stored.password_hash, /^\$2[aby]\$12\$/);
+  const invitationToken = latestEmailToken("/aceptar-invitacion#token=");
   assert.equal(
-    await bcrypt.compare(temporaryPassword, stored.password_hash),
-    true,
+    await bcrypt.compare(invitationToken, stored.password_hash),
+    false,
+  );
+  assert.doesNotMatch(
+    JSON.stringify(response.body),
+    new RegExp(invitationToken),
   );
 
-  const signIn = await login(targetEmail, temporaryPassword);
-  await api("get", "/api/v1/users", undefined, signIn).expect(403);
-  const changeResponse = await request(app)
-    .post("/api/v1/auth/change-password")
+  const pendingCsrf = await csrf();
+  await request(app)
+    .post("/api/v1/auth/login")
     .set("Origin", origin)
-    .set("Cookie", signIn.cookies.join("; "))
-    .set("X-CSRF-Token", signIn.csrfToken)
-    .send({
-      currentPassword: temporaryPassword,
-      newPassword: changedTargetPassword,
-      confirmPassword: changedTargetPassword,
-    })
-    .expect(200);
-  assert.equal(changeResponse.body.changed, true);
+    .set("Cookie", pendingCsrf.cookie)
+    .set("X-CSRF-Token", pendingCsrf.token)
+    .send({ email: targetEmail, password: changedTargetPassword })
+    .expect(401);
+  await acceptLatestInvitation(targetEmail, changedTargetPassword);
+  const signIn = await login(targetEmail, changedTargetPassword);
+  await api("get", "/api/v1/users", undefined, signIn).expect(403);
 });
 
-test("administrator resets an active account and receives its temporary password once", async () => {
+test("administrator resets an active account by email and revokes previous access", async () => {
   const detail = await api("get", `/api/v1/users/${createdUserId}`).expect(200);
   const previousSession = await login(targetEmail, changedTargetPassword);
   const response = await api(
@@ -205,38 +304,41 @@ test("administrator resets an active account and receives its temporary password
 
   assert.equal(response.headers["cache-control"], "no-store");
   assert.equal(response.body.user.passwordChangeRequired, true);
+  assert.equal(response.body.user.credentialState, "pending_admin_reset");
   assert.equal(response.body.user.email, targetEmail);
-  assert.notEqual(response.body.temporaryPassword, changedTargetPassword);
-  assert.match(response.body.temporaryPassword, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(response.body.deliveryStatus, "simulated");
+  assert.equal("temporaryPassword" in response.body, false);
   assert.equal(response.body.revokedSessions, 1);
   const auditSecretCheck = JSON.stringify(response.body);
   assert.doesNotMatch(auditSecretCheck, /password_hash|passwordHash/);
   assert.equal("passwordHash" in response.body.user, false);
   const [[stored]] = await pool.execute(
-    "SELECT password_hash, password_change_required FROM users WHERE id = ?",
+    "SELECT password_hash, password_change_required, credential_state FROM users WHERE id = ?",
     [createdUserId],
   );
   assert.equal(stored.password_change_required, 1);
+  assert.equal(stored.credential_state, "pending_admin_reset");
   assert.match(stored.password_hash, /^\$2[aby]\$12\$/);
   assert.equal(
-    await bcrypt.compare(response.body.temporaryPassword, stored.password_hash),
-    true,
+    await bcrypt.compare(changedTargetPassword, stored.password_hash),
+    false,
   );
   const [[resetAudit]] = await pool.execute(
     `SELECT action, details FROM audit_events
-     WHERE action = 'users.password_reset' AND entity_id = ?
+     WHERE action = 'users.password_reset_requested' AND entity_id = ?
      ORDER BY id DESC LIMIT 1`,
     [createdUserId],
   );
-  assert.equal(resetAudit.action, "users.password_reset");
+  assert.equal(resetAudit.action, "users.password_reset_requested");
   assert.deepEqual(JSON.parse(resetAudit.details), {
     revokedSessions: 1,
     passwordChangeRequired: true,
+    credentialState: "pending_admin_reset",
   });
-  assert.equal(
-    resetAudit.details.includes(response.body.temporaryPassword),
-    false,
+  const resetToken = latestEmailToken(
+    "/restablecer-contrasena?modo=administrativo#token=",
   );
+  assert.equal(resetAudit.details.includes(resetToken), false);
 
   await request(app)
     .get("/api/v1/auth/me")
@@ -251,21 +353,8 @@ test("administrator resets an active account and receives its temporary password
     .send({ email: targetEmail, password: changedTargetPassword })
     .expect(401);
 
-  const temporarySession = await login(
-    targetEmail,
-    response.body.temporaryPassword,
-  );
-  await request(app)
-    .post("/api/v1/auth/change-password")
-    .set("Origin", origin)
-    .set("Cookie", temporarySession.cookies.join("; "))
-    .set("X-CSRF-Token", temporarySession.csrfToken)
-    .send({
-      currentPassword: response.body.temporaryPassword,
-      newPassword: changedTargetPassword,
-      confirmPassword: changedTargetPassword,
-    })
-    .expect(200);
+  await completeLatestAdminReset(targetEmail, changedTargetPassword);
+  await login(targetEmail, changedTargetPassword);
 });
 
 test("password reset rolls back credential and session changes when revocation or audit fails", async () => {
@@ -278,7 +367,7 @@ test("password reset rolls back credential and session changes when revocation o
       200,
     );
     const [[before]] = await pool.execute(
-      `SELECT password_hash, password_change_required,
+      `SELECT password_hash, password_change_required, credential_state,
               (SELECT COUNT(*) FROM user_sessions
                WHERE user_id = users.id AND revoked_at IS NULL) AS active_sessions
        FROM users WHERE id = ?`,
@@ -313,6 +402,7 @@ test("password reset rolls back credential and session changes when revocation o
       dbPool: faultPool,
       authConfig,
       logger: createLogger({ level: "silent" }),
+      mailTransport,
     });
     const failed = await request(faultApp)
       .post(`/api/v1/users/${createdUserId}/password-reset`)
@@ -323,13 +413,14 @@ test("password reset rolls back credential and session changes when revocation o
       .expect(500);
     assert.equal(failed.headers["cache-control"], "no-store");
     const [[afterFailure]] = await pool.execute(
-      `SELECT password_hash, password_change_required,
+      `SELECT password_hash, password_change_required, credential_state,
               (SELECT COUNT(*) FROM user_sessions
                WHERE user_id = users.id AND revoked_at IS NULL) AS active_sessions
        FROM users WHERE id = ?`,
       [createdUserId],
     );
     assert.equal(afterFailure.password_hash, before.password_hash);
+    assert.equal(afterFailure.credential_state, before.credential_state);
     assert.equal(
       Number(afterFailure.password_change_required),
       Number(before.password_change_required),
@@ -381,21 +472,8 @@ test("a concurrent login with the old password cannot create a session surviving
     assert.equal(oldLogin.body.error.code, "INVALID_CREDENTIALS");
   }
 
-  const temporarySession = await login(
-    targetEmail,
-    reset.body.temporaryPassword,
-  );
-  await request(app)
-    .post("/api/v1/auth/change-password")
-    .set("Origin", origin)
-    .set("Cookie", temporarySession.cookies.join("; "))
-    .set("X-CSRF-Token", temporarySession.csrfToken)
-    .send({
-      currentPassword: reset.body.temporaryPassword,
-      newPassword: changedTargetPassword,
-      confirmPassword: changedTargetPassword,
-    })
-    .expect(200);
+  await completeLatestAdminReset(targetEmail, changedTargetPassword, raceApp);
+  await login(targetEmail, changedTargetPassword, raceApp);
 });
 
 test("password reset rejects self-targets and stale credential revisions", async () => {
@@ -445,11 +523,11 @@ test("password reset rejects self-targets and stale credential revisions", async
   ]);
 });
 
-test("an active account with a required password change can receive a replacement temporary password", async () => {
+test("an invitation-pending account can receive a replacement invitation", async () => {
   const resetApp = createFreshApp();
   const created = await api("post", "/api/v1/users", {
     email: `users-pending-reset-${unique}@sigecom.invalid`,
-    displayName: "Cuenta con temporal pendiente",
+    displayName: "Cuenta con invitación pendiente",
     roleCode: "seller",
     warehouseIds: [warehouseId],
   }).expect(201);
@@ -459,14 +537,16 @@ test("an active account with a required password change can receive a replacemen
     "get",
     `/api/v1/users/${created.body.user.id}`,
   ).expect(200);
-  const reset = await apiWith(
+  assert.equal(detail.body.credentialState, "pending_invitation");
+  const invitation = await apiWith(
     resetApp,
     "post",
-    `/api/v1/users/${created.body.user.id}/password-reset`,
-    { expectedRevision: detail.body.revision, confirmReset: true },
+    `/api/v1/users/${created.body.user.id}/invitation/resend`,
+    { expectedRevision: detail.body.revision, confirmResend: true },
   ).expect(200);
-  assert.equal(reset.body.user.passwordChangeRequired, true);
-  assert.notEqual(reset.body.temporaryPassword, created.body.temporaryPassword);
+  assert.equal(invitation.body.user.credentialState, "pending_invitation");
+  assert.equal(invitation.body.invitation.deliveryStatus, "simulated");
+  assert.equal("temporaryPassword" in created.body, false);
 
   const oldCsrf = await csrf();
   await request(app)
@@ -476,13 +556,11 @@ test("an active account with a required password change can receive a replacemen
     .set("X-CSRF-Token", oldCsrf.token)
     .send({
       email: created.body.user.email,
-      password: created.body.temporaryPassword,
+      password: "Not-A-Valid-Password-2026!",
     })
     .expect(401);
-  const current = await login(
-    created.body.user.email,
-    reset.body.temporaryPassword,
-  );
+  await acceptLatestInvitation(created.body.user.email, "Invited-User-2026!");
+  const current = await login(created.body.user.email, "Invited-User-2026!");
   await api("get", "/api/v1/users", undefined, current).expect(403);
 });
 
@@ -540,6 +618,7 @@ test("password reset rate limit applies ten attempts per administrator in fiftee
     dbPool: pool,
     authConfig,
     logger: createLogger({ level: "silent" }),
+    mailTransport,
   });
   const responses = [];
   for (let attempt = 0; attempt < 11; attempt += 1) {
@@ -578,23 +657,16 @@ test("mutual administrator password resets serialize and cannot invalidate the s
     admins.push(created.body.user.id);
     extraCreatedUserIds.push(created.body.user.id);
     fixtures.user(created.body.user.id);
-    initialPasswords.push(created.body.temporaryPassword);
+    const initialPassword = `Initial-Admin-${suffix}-2026!`;
+    await acceptLatestInvitation(
+      `users-reset-${suffix}-${unique}@sigecom.invalid`,
+      initialPassword,
+    );
+    initialPasswords.push(initialPassword);
   }
   for (let index = 0; index < admins.length; index += 1) {
     const email = `users-reset-${index === 0 ? "left" : "right"}-${unique}@sigecom.invalid`;
-    const pending = await login(email, initialPasswords[index]);
-    await request(app)
-      .post("/api/v1/auth/change-password")
-      .set("Origin", origin)
-      .set("Cookie", pending.cookies.join("; "))
-      .set("X-CSRF-Token", pending.csrfToken)
-      .send({
-        currentPassword: initialPasswords[index],
-        newPassword: `Reset-Admin-${index}-Secure-2026!`,
-        confirmPassword: `Reset-Admin-${index}-Secure-2026!`,
-      })
-      .expect(200);
-    sessions.push(await login(email, `Reset-Admin-${index}-Secure-2026!`));
+    sessions.push(await login(email, initialPasswords[index]));
   }
   const details = await Promise.all(
     admins.map((id) => api("get", `/api/v1/users/${id}`)),
@@ -661,21 +733,8 @@ test("a concurrent password reset and normal password change cannot restore a re
   if (reset.status === 200) {
     assert.equal(changed.status, 401);
     assert.equal(changed.body.error.code, "SESSION_INVALID");
-    const temporarySession = await login(
-      targetEmail,
-      reset.body.temporaryPassword,
-    );
-    await request(app)
-      .post("/api/v1/auth/change-password")
-      .set("Origin", origin)
-      .set("Cookie", temporarySession.cookies.join("; "))
-      .set("X-CSRF-Token", temporarySession.csrfToken)
-      .send({
-        currentPassword: reset.body.temporaryPassword,
-        newPassword: changedTargetPassword,
-        confirmPassword: changedTargetPassword,
-      })
-      .expect(200);
+    await completeLatestAdminReset(targetEmail, changedTargetPassword, raceApp);
+    await login(targetEmail, changedTargetPassword, raceApp);
   } else {
     assert.equal(changed.status, 200, JSON.stringify(changed.body));
     assert.equal(reset.status, 409, JSON.stringify(reset.body));
@@ -684,7 +743,7 @@ test("a concurrent password reset and normal password change cannot restore a re
       "get",
       `/api/v1/users/${createdUserId}`,
     ).expect(200);
-    const recovery = await apiWith(
+    await apiWith(
       raceApp,
       "post",
       `/api/v1/users/${createdUserId}/password-reset`,
@@ -693,21 +752,8 @@ test("a concurrent password reset and normal password change cannot restore a re
         confirmReset: true,
       },
     ).expect(200);
-    const recoverySession = await login(
-      targetEmail,
-      recovery.body.temporaryPassword,
-    );
-    await request(raceApp)
-      .post("/api/v1/auth/change-password")
-      .set("Origin", origin)
-      .set("Cookie", recoverySession.cookies.join("; "))
-      .set("X-CSRF-Token", recoverySession.csrfToken)
-      .send({
-        currentPassword: recovery.body.temporaryPassword,
-        newPassword: changedTargetPassword,
-        confirmPassword: changedTargetPassword,
-      })
-      .expect(200);
+    await completeLatestAdminReset(targetEmail, changedTargetPassword, raceApp);
+    await login(targetEmail, changedTargetPassword, raceApp);
   }
 });
 
@@ -858,14 +904,10 @@ test("creates accounts only with each of the four existing roles and rejects uns
     fixtures.user(response.body.user.id);
     assert.equal(response.body.user.roleCode, roleCode);
     assert.equal(response.body.user.passwordChangeRequired, true);
-    await pool.execute(
-      "UPDATE users SET password_change_required = 0 WHERE id = ?",
-      [response.body.user.id],
-    );
-    const session = await login(
-      `users-${roleCode}-${unique}@sigecom.invalid`,
-      response.body.temporaryPassword,
-    );
+    const email = `users-${roleCode}-${unique}@sigecom.invalid`;
+    const password = `Users-${roleCode}-Password-2026!`;
+    await acceptLatestInvitation(email, password);
+    const session = await login(email, password);
     const access = await api("get", "/api/v1/users", undefined, session);
     assert.equal(access.status, roleCode === "administrator" ? 200 : 403);
   }
@@ -946,27 +988,10 @@ test("serializes simultaneous administrator offboarding and prevents mutual deac
   const secondAdminId = response.body.user.id;
   extraCreatedUserIds.push(secondAdminId);
   fixtures.user(secondAdminId);
-  const initialPassword = response.body.temporaryPassword;
-  const pendingSession = await login(
-    `users-concurrent-admin-${unique}@sigecom.invalid`,
-    initialPassword,
-  );
-  const passwordResponse = await request(app)
-    .post("/api/v1/auth/change-password")
-    .set("Origin", origin)
-    .set("Cookie", pendingSession.cookies.join("; "))
-    .set("X-CSRF-Token", pendingSession.csrfToken)
-    .send({
-      currentPassword: initialPassword,
-      newPassword: "Concurrent-Admin-Changed-2026!",
-      confirmPassword: "Concurrent-Admin-Changed-2026!",
-    })
-    .expect(200);
-  assert.equal(passwordResponse.body.changed, true);
-  const secondAdminSession = await login(
-    `users-concurrent-admin-${unique}@sigecom.invalid`,
-    "Concurrent-Admin-Changed-2026!",
-  );
+  const initialPassword = "Concurrent-Admin-Changed-2026!";
+  const concurrentAdminEmail = `users-concurrent-admin-${unique}@sigecom.invalid`;
+  await acceptLatestInvitation(concurrentAdminEmail, initialPassword);
+  const secondAdminSession = await login(concurrentAdminEmail, initialPassword);
   const [firstDetails, secondDetails] = await Promise.all([
     api("get", `/api/v1/users/${adminId}`),
     api("get", `/api/v1/users/${secondAdminId}`),

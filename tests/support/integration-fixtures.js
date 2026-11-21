@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 export class IntegrationFixtures {
-  constructor({ suite }) {
+  constructor({ suite, databaseName = "sigecom_test" }) {
     if (!suite) throw new Error("Each integration fixture needs a suite name.");
     this.suite = suite;
+    this.databaseName = databaseName;
     this.runId = randomUUID();
     this.users = new Set();
     this.warehouses = new Set();
@@ -62,8 +63,10 @@ export class IntegrationFixtures {
   async cleanupUserAssignments(pool) {
     if (!pool) return;
     const [[identity]] = await pool.query("SELECT DATABASE() AS name");
-    if (identity.name !== "sigecom_test") {
-      throw new Error(`Refusing ${this.suite} cleanup outside sigecom_test.`);
+    if (identity.name !== this.databaseName) {
+      throw new Error(
+        `Refusing ${this.suite} cleanup outside its explicit database target.`,
+      );
     }
     for (const userId of this.users) {
       await pool.execute(

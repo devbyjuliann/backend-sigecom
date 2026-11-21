@@ -96,6 +96,7 @@ export function createAuthService({ dbPool, config }) {
   async function login({ email, password, request }) {
     const [userRows] = await dbPool.execute(
       `SELECT u.id, u.email, u.display_name, u.password_hash, u.is_active,
+              u.credential_state,
               u.password_change_required, r.code AS role_code
        FROM users AS u JOIN roles AS r ON r.id = u.role_id
        WHERE u.email = ? LIMIT 1`,
@@ -105,7 +106,12 @@ export function createAuthService({ dbPool, config }) {
     const passwordHash = user?.password_hash || (await dummyPasswordHash);
     const passwordMatches = await bcrypt.compare(password, passwordHash);
 
-    if (!user || !passwordMatches || !user.is_active) {
+    if (
+      !user ||
+      !passwordMatches ||
+      !user.is_active ||
+      user.credential_state !== "active"
+    ) {
       await recordFailedLogin(dbPool, user?.id, request);
       throw invalidCredentials();
     }
@@ -128,7 +134,7 @@ export function createAuthService({ dbPool, config }) {
     try {
       await connection.beginTransaction();
       const [currentRows] = await connection.execute(
-        "SELECT password_hash, is_active FROM users WHERE id = ? FOR UPDATE",
+        "SELECT password_hash, is_active, credential_state FROM users WHERE id = ? FOR UPDATE",
         [user.id],
       );
       const current = currentRows[0];
@@ -136,6 +142,7 @@ export function createAuthService({ dbPool, config }) {
       if (
         !current ||
         !current.is_active ||
+        current.credential_state !== "active" ||
         current.password_hash !== user.password_hash
       ) {
         await connection.rollback();
@@ -177,12 +184,14 @@ export function createAuthService({ dbPool, config }) {
     const hash = tokenHash(claims.jti);
     const [rows] = await dbPool.execute(
       `SELECT s.id AS session_id, u.id, u.email, u.display_name,
-              u.password_change_required, r.id AS role_id, r.code AS role_code
+              u.password_change_required, u.credential_state,
+              r.id AS role_id, r.code AS role_code
        FROM user_sessions AS s
        JOIN users AS u ON u.id = s.user_id
        JOIN roles AS r ON r.id = u.role_id
        WHERE s.token_hash = ? AND s.revoked_at IS NULL
-         AND s.expires_at > UTC_TIMESTAMP(3) AND u.is_active = 1
+          AND s.expires_at > UTC_TIMESTAMP(3) AND u.is_active = 1
+          AND u.credential_state = 'active'
        LIMIT 1`,
       [hash],
     );

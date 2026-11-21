@@ -1,0 +1,162 @@
+INVENTARIO AISLADO PARA LAS MIGRACIONES 0018–0019
+
+Esta nota describe el runner y prepara una futura revisión SQL. No concede
+autorización para crear esquemas, usuarios, aplicar migraciones, ejecutar
+fixtures o aceptar el flujo integral. El arnés protegido privacy-e2e no forma
+parte de este worktree y no se modifica en esta etapa.
+
+El runner de recuperación separa cuatro modos explícitos:
+
+- PRE-FLIGHT: revisión visual/interactiva sin conexión SQL, sin exigir
+  credenciales válidas y sin pasarlas al proceso hijo. El proceso hijo recibe
+  únicamente el modo y variables de sistema necesarias. El destino centinela
+  `sigecom_e2e_tmp_00000000000000_00000000` sólo se usa para validar Vite; el
+  dbPool del API de preflight falla si se intenta consultar.
+- PROVISION: exige RUN_ID y un ATTEMPT_ID de aprovisionamiento distinto,
+  credenciales aisladas y una aprobación cuyo RUN_ID coincida exactamente.
+  Crea un esquema y usuarios
+  nuevos, aplica migraciones y prepara fixtures; aborta si ya existe cualquiera
+  de los recursos esperados. El modo se selecciona explícitamente; no se ejecuta
+  desde PRE-FLIGHT, DDL-CHECK ni RUN. Requiere SIGECOM_ACCOUNT_ACCESS_PROVISIONER_USER
+  y SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD explícitos; rechaza `root`,
+  contraseñas débiles/reutilizadas y destinos que no deriven del RUN_ID. No carga
+  .env ni recibe credenciales administrativas distintas de esa identidad. Antes
+  de cualquier DDL registra durablemente el propietario y el objetivo en un
+  archivo local. Cada CREATE/GRANT/migración/fixture queda pendiente antes de
+  ejecutarse y se marca exitoso o desconocido después. No hay reintento ni
+  limpieza automática ante fallo parcial.
+- DDL-CHECK: exige una aprobación independiente y exacta de RUN_ID, ATTEMPT_ID
+  y esquema existente, además de la credencial MIGRATOR. Lee el registro durable
+  listo antes de conectar. Ejecuta únicamente sondas explícitas de DDL/trigger
+  en ese esquema; no provisiona, migra ni ejecuta la aceptación funcional.
+- RUN: cada ejecución exige un ATTEMPT_ID nuevo, autorización exacta de
+  RUN_ID/ATTEMPT_ID/esquema y un registro durable listo que acredita la propiedad
+  del RUN_ID, las cuentas derivadas y las 19 migraciones/checksums. El registro
+  conserva el ATTEMPT_ID original de PROVISION y reclama cada ATTEMPT_ID RUN una
+  sola vez antes de conectar. Dos ejecuciones autorizadas pueden compartir el
+  mismo RUN_ID/esquema, pero no el ATTEMPT_ID. RUN sólo usa APP/fixtures; no
+  crea esquemas ni cuentas SQL, no migra ni ejecuta DDL. Ejecuta pruebas
+  funcionales que escriben datos en ese esquema y crea fixtures con nombres
+  ligados al ATTEMPT_ID. No es una operación de sólo lectura.
+
+Un fallo conserva los recursos y puede dejar datos parciales. No repetir un
+ATTEMPT_ID ya reclamado ni editar el registro durable; cualquier reintento debe
+tener ATTEMPT_ID nuevo y autorización independiente para el mismo RUN_ID.
+
+RUN usa exclusivamente APP, con SELECT, INSERT y UPDATE limitados al esquema,
+más DELETE limitado a las tablas `user_warehouses` y `role_permissions` para
+asignaciones y administración RBAC. El verificador rechaza grants globales y
+cualquier permiso o tabla adicional.
+Las sondas `CREATE`/`ALTER`/`DROP` de tabla y `CREATE`/`DROP TRIGGER` viven en
+DDL-CHECK y requieren aprobación independiente. MIGRATOR sólo es usado por
+PROVISION para migraciones y por DDL-CHECK para verificar esas capacidades.
+Ningún grant de APP o MIGRATOR se concede globalmente.
+
+Las variables de aprobación son guardas locales de coincidencia exacta, no
+firmas criptográficas ni sustitutos de la autorización explícita del propietario.
+La configuración rechaza la mezcla de aprobaciones entre PROVISION, DDL-CHECK y
+RUN, discrepancias entre modo explícito y modo de entorno, y
+`NODE_ENV=production` para PROVISION, DDL-CHECK y RUN. Los objetos de
+configuración generados son inmutables y el dispatcher rechaza configuraciones
+construidas manualmente.
+
+El identificador `00000000000000_00000000` y el esquema centinela derivado están
+reservados para PRE-FLIGHT. PROVISION/DDL-CHECK/RUN los rechazan si aparecen
+como RUN_ID o ATTEMPT_ID antes de iniciar el proceso de integración. El proceso
+hijo de PRE-FLIGHT no recibe IDs, autorizaciones ni secretos SQL. Las
+credenciales requeridas deben ser distintas, URL-safe y tener al menos 32
+caracteres; no se escriben en Git ni en los registros durables.
+
+Comandos disponibles (ninguno ejecuta SQL sin aprobación explícita del modo):
+
+- npm run test:account-access-email:preflight
+- npm run test:account-access-email:provision
+- npm run test:account-access-email:ddl-check
+- npm run test:account-access-email:run
+
+PROVISION requiere RUN_ID, ATTEMPT_ID, contraseñas APP/MIGRATOR/fixtures,
+SIGECOM_ACCOUNT_ACCESS_PROVISIONER_USER y
+SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD, más
+SIGECOM_ACCOUNT_ACCESS_PROVISION_APPROVED_RUN_ID igual al RUN_ID. El usuario
+provisioner no puede ser `root`; la contraseña debe ser URL-safe, tener al menos
+32 caracteres y ser distinta de las demás.
+
+DDL-CHECK requiere RUN_ID, ATTEMPT_ID, SIGECOM_ACCOUNT_ACCESS_MIGRATOR_PASSWORD,
+SIGECOM_ACCOUNT_ACCESS_DDL_APPROVED_RUN_ID igual al RUN_ID,
+SIGECOM_ACCOUNT_ACCESS_DDL_APPROVED_ATTEMPT_ID igual al ATTEMPT_ID y
+SIGECOM_ACCOUNT_ACCESS_DDL_APPROVED_SCHEMA igual a
+sigecom_e2e_tmp_<RUN_ID>. RUN requiere RUN_ID, ATTEMPT_ID, contraseñas APP y
+fixtures, SIGECOM_ACCOUNT_ACCESS_AUTHORIZED_RUN_ID igual al RUN_ID,
+SIGECOM_ACCOUNT_ACCESS_AUTHORIZED_ATTEMPT_ID igual al ATTEMPT_ID y
+SIGECOM_ACCOUNT_ACCESS_AUTHORIZED_SCHEMA igual a sigecom_e2e_tmp_<RUN_ID>.
+RUN no requiere ni recibe contraseñas MIGRATOR/provisioner.
+
+Los comandos no cargan .env automáticamente. No pasar credenciales mediante
+`NODE_OPTIONS`, `--env-file` ni argumentos de línea de comandos. Los cambios de
+guardas, el registro durable y los tests con dobles no ejecutan SQL; esta
+intervención tampoco ejecuta PROVISION, DDL-CHECK, RUN ni aceptación integral.
+
+Antes de una prueba SQL autorizada:
+
+1. Usar exclusivamente los worktrees `feature/account-access-email` de backend
+   y frontend; preservar `main`, `E2E/privacy` y los worktrees visuales.
+2. Verificar que el manifiesto aprobado contiene las 19 migraciones 0001–0019,
+   con los checksums actuales. No reutilizar aprobaciones anteriores a 0019.
+3. Reconciliar primero los seis RUN_ID históricos mediante una identidad SQL
+   autorizada; no reutilizarlos ni asumir que están ausentes.
+4. Generar identificadores y credenciales nuevos fuera de Git y solicitar
+   aprobaciones exactas independientes para PROVISION y para cada RUN_ID/
+   ATTEMPT_ID/esquema. No copiar aprobaciones ni reutilizar ATTEMPT_ID.
+5. Autorizar PROVISION, migraciones/fixtures y RUN por separado. DDL-CHECK
+   permanece separado y requiere autorización propia; ningún paso se activa
+   automáticamente por otro modo.
+
+La aceptación RUN verifica que APP tenga SELECT/INSERT/UPDATE limitados al
+esquema, más DELETE limitado a `user_warehouses` y `role_permissions`; el
+verificador rechaza cualquier permiso, tabla o grant global adicional. MIGRATOR
+se reserva para migraciones en PROVISION y sondas DDL en DDL-CHECK. La aceptación
+también comprueba identidad del servidor, esquema seleccionado, CURRENT_USER(),
+grants, 19 migraciones/checksums y aislamiento frente a
+`sigecom_dev`, `sigecom_test`, `sigecom_h2_concurrency` y cualquier destino fuera
+de la allowlist exacta.
+
+FALLOS PARCIALES Y PROPIEDAD
+
+El aprovisionamiento no es atómico: MariaDB puede confirmar cada DDL por
+separado. No hay eliminación automática ni reintento. Antes de conectar, PROVISION
+crea en exclusiva un registro local durable en
+`%LOCALAPPDATA%\SIGECOM\account-access-email\resource-ownership\<RUN_ID>.json`.
+El registro vincula RUN_ID, ATTEMPT_ID, esquema, cuentas/host y grants derivados.
+No contiene contraseñas, tokens, correos ni mensajes de error. Se actualiza
+atómicamente y con vaciado del archivo; cada paso se escribe como pendiente antes
+de enviar SQL, y después como exitoso o desconocido. DDL, fila de migración y
+fixtures son etapas distintas, de modo que un fallo parcial o corte deja una
+reconciliación local incluso si el proceso no alcanza su resumen final.
+
+Un `pending` o `unknown` no prueba que el recurso exista ni que esté ausente. El
+registro `ready` sólo permite DDL-CHECK/RUN con la misma propiedad y destino; no
+reemplaza la inspección SQL de metadatos. Un archivo ausente, incompleto o con
+otro ATTEMPT_ID bloquea la reutilización. No borrar ni editar el registro para
+volver a provisionar. Los seis RUN_ID históricos no tienen propiedad verificada
+por este registro y siguen sujetos a reconciliación.
+
+Si el registro no puede escribirse antes de un paso, la operación SQL no se
+ejecuta. Si falla la escritura posterior, se detiene; el último estado durable
+puede seguir como pendiente y debe tratarse como desconocido. El resumen JSON
+final sigue siendo sólo informativo y nunca declara ausente un recurso por falta
+de marca.
+
+Ante cualquier fallo: conservar el mismo RUN_ID/ATTEMPT_ID, detenerse, guardar
+el diagnóstico ya emitido y no repetir PROVISION. Identificar recursos parciales
+mediante la inspección autorizada de metadatos exactos; registrar cada esquema,
+cuenta/host, grant y etapa, todos como candidatos no verificados hasta leerlos.
+Solicitar autorización independiente que enumere explícitamente las acciones
+permitidas sobre cada recurso antes de reparar o limpiar. No emitir DROP ni
+crear un RUN_ID nuevo para ocultar el estado parcial.
+
+Reversión: detener el backend 0018, volver al backend anterior, verificar que no
+existan cuentas pending_invitation y ejecutar sólo entonces el SQL manual
+database/rollback/0018-account-access-email.sql. El procedimiento revoca todos
+los tokens no consumidos antes de eliminar la tabla. Si existen cuentas
+pending_invitation, el procedimiento aborta: no eliminar credential_state ni
+activar esas cuentas automáticamente; reconciliar las cuentas primero.

@@ -3,6 +3,7 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 import { createAuthRouter } from "./modules/auth/auth-routes.js";
+import { createSimulatedMailTransport } from "./modules/auth/mail-transport.js";
 import { createProfileRouter } from "./modules/profile/profile-routes.js";
 import { createCategoryRouter } from "./modules/categories/category-routes.js";
 import { createWarehouseRouter } from "./modules/warehouses/warehouse-routes.js";
@@ -32,8 +33,22 @@ export function createApp({
   authConfig,
   trustProxy = false,
   logger = createLogger(),
+  mailTransport,
 } = {}) {
   const app = express();
+  const configuredMailTransport =
+    mailTransport ||
+    (process.env.NODE_ENV === "production"
+      ? null
+      : createSimulatedMailTransport());
+  if (
+    process.env.NODE_ENV === "production" &&
+    (!configuredMailTransport || configuredMailTransport.type === "simulated")
+  ) {
+    throw new Error(
+      "En producción se debe inyectar un transporte de correo real configurado.",
+    );
+  }
 
   app.disable("x-powered-by");
   app.disable("etag");
@@ -49,7 +64,8 @@ export function createApp({
     if (
       /^\/api\/v1\/(roles|permissions)(\/|$)/.test(request.path) ||
       /^\/api\/v1\/audit-events(\/|$)/.test(request.path) ||
-      /^\/api\/v1\/users\/[^/]+\/password-reset$/.test(request.path)
+      /^\/api\/v1\/users\/[^/]+\/password-reset$/.test(request.path) ||
+      /^\/api\/v1\/auth(?:\/|$)/.test(request.path)
     ) {
       response.set("Cache-Control", "no-store");
     }
@@ -82,7 +98,15 @@ export function createApp({
 
   if (dbPool && authConfig) {
     const apiRouter = express.Router();
-    apiRouter.use("/auth", createAuthRouter({ dbPool, authConfig }));
+    apiRouter.use(
+      "/auth",
+      createAuthRouter({
+        dbPool,
+        authConfig,
+        mailTransport: configuredMailTransport,
+        logger,
+      }),
+    );
     apiRouter.use("/profile", createProfileRouter({ dbPool, authConfig }));
     apiRouter.use("/categories", createCategoryRouter({ dbPool, authConfig }));
     apiRouter.use("/warehouses", createWarehouseRouter({ dbPool, authConfig }));
@@ -96,7 +120,15 @@ export function createApp({
       createPurchaseRouter({ dbPool, authConfig }),
     );
     apiRouter.use("/sales", createSaleRouter({ dbPool, authConfig }));
-    apiRouter.use("/users", createUserRouter({ dbPool, authConfig }));
+    apiRouter.use(
+      "/users",
+      createUserRouter({
+        dbPool,
+        authConfig,
+        mailTransport: configuredMailTransport,
+        logger,
+      }),
+    );
     apiRouter.use("/roles", createRoleRouter({ dbPool, authConfig }));
     apiRouter.use(
       "/permissions",

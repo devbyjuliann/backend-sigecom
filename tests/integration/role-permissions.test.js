@@ -2,15 +2,22 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import bcrypt from "bcrypt";
+import mysql from "mysql2/promise";
 import request from "supertest";
 import { createApp } from "../../src/app.js";
 import { createDatabasePool } from "../../src/db/pool.js";
 import { getAuthConfig } from "../../src/modules/auth/auth-config.js";
 import { createLogger } from "../../src/shared/logger.js";
 import { IntegrationFixtures } from "../support/integration-fixtures.js";
+import { getAccountAccessE2EConfig } from "../../scripts/account-access-email-e2e-runner.js";
 
 const origin = "http://127.0.0.1:5173";
-const unique = randomBytes(8).toString("hex");
+const isolatedRun =
+  process.env.SIGECOM_ACCOUNT_ACCESS_MODE === "RUN"
+    ? getAccountAccessE2EConfig("RUN")
+    : null;
+const databaseName = isolatedRun?.schema ?? "sigecom_test";
+const unique = isolatedRun?.attemptId ?? randomBytes(8).toString("hex");
 let pool;
 let app;
 let adminId;
@@ -25,7 +32,10 @@ let originalRoleMetadata;
 let originalAdminMetadata;
 let adminPassword;
 let sellerPassword;
-const fixtures = new IntegrationFixtures({ suite: "role-permissions" });
+const fixtures = new IntegrationFixtures({
+  suite: "role-permissions",
+  databaseName,
+});
 
 async function csrf() {
   const response = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -77,9 +87,24 @@ function sessionTokenHash(session) {
 }
 
 before(async () => {
-  pool = createDatabasePool("test");
+  if (isolatedRun) {
+    pool = mysql.createPool({
+      host: "127.0.0.1",
+      port: 3306,
+      database: isolatedRun.schema,
+      user: `sgapp_${isolatedRun.runId}`,
+      password: isolatedRun.credentials.appPassword,
+      charset: "utf8mb4",
+      timezone: "Z",
+      connectionLimit: 5,
+      connectTimeout: 5000,
+      multipleStatements: false,
+    });
+  } else {
+    pool = createDatabasePool("test");
+  }
   const [[database]] = await pool.query("SELECT DATABASE() AS name");
-  assert.equal(database.name, "sigecom_test");
+  assert.equal(database.name, databaseName);
   const authConfig = getAuthConfig({
     JWT_SECRET: randomBytes(48).toString("base64url"),
     FRONTEND_ORIGIN: origin,

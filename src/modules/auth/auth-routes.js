@@ -7,6 +7,12 @@ import { createCsrfToken, readCookie, setCsrfCookie } from "./csrf.js";
 import { authenticate } from "./auth-middleware.js";
 import { HttpError } from "../../shared/http-error.js";
 import { changePassword } from "./password-service.js";
+import {
+  passwordChangeSchema,
+  passwordRecoveryCompletionSchema,
+  passwordValidationMessage,
+} from "./password-policy.js";
+import { createPasswordRecoveryService } from "./password-recovery-service.js";
 
 const loginSchema = z
   .object({
@@ -19,30 +25,26 @@ const loginSchema = z
   })
   .strict();
 
-const passwordChangeSchema = z
+const recoveryEmailSchema = z
   .object({
-    currentPassword: z
-      .string()
-      .min(1)
-      .max(72)
-      .refine((value) => Buffer.byteLength(value, "utf8") <= 72),
-    newPassword: z
-      .string()
-      .min(12, "La nueva contraseña debe tener al menos 12 caracteres.")
-      .max(72)
-      .refine((value) => Buffer.byteLength(value, "utf8") <= 72)
-      .refine((value) => /[a-z]/.test(value), "Incluye al menos una minúscula.")
-      .refine((value) => /[A-Z]/.test(value), "Incluye al menos una mayúscula.")
-      .refine((value) => /\d/.test(value), "Incluye al menos un número."),
-    confirmPassword: z.string().min(1).max(72),
+    email: z.string().trim().toLowerCase().email().max(254),
   })
-  .strict()
-  .refine((value) => value.newPassword === value.confirmPassword, {
-    message: "La confirmación no coincide con la nueva contraseña.",
-  })
-  .refine((value) => value.newPassword !== value.currentPassword, {
-    message: "La nueva contraseña debe ser diferente de la actual.",
+  .strict();
+
+const recoveryAcceptedResponse = {
+  accepted: true,
+  message:
+    "Si la cuenta está activa, enviaremos instrucciones al correo registrado.",
+};
+
+const recoveryRateLimitResponse = (_request, response) => {
+  response.status(429).json({
+    error: {
+      code: "PASSWORD_RECOVERY_RATE_LIMITED",
+      message: "Se alcanzó el límite de solicitudes. Inténtalo más tarde.",
+    },
   });
+};
 
 function cookieOptions(config) {
   return {
@@ -52,9 +54,24 @@ function cookieOptions(config) {
   };
 }
 
-export function createAuthRouter({ dbPool, authConfig }) {
+export function createAuthRouter({
+  dbPool,
+  authConfig,
+  mailTransport,
+  logger,
+}) {
   const router = Router();
+  router.use((_request, response, next) => {
+    response.set("Cache-Control", "no-store");
+    next();
+  });
   const service = createAuthService({ dbPool, config: authConfig });
+  const passwordRecovery = createPasswordRecoveryService({
+    dbPool,
+    mailTransport,
+    logger,
+    publicAppOrigin: authConfig.publicAppOrigin,
+  });
   const requireSessionWithPendingPassword = authenticate({
     dbPool,
     authConfig,
@@ -92,6 +109,34 @@ export function createAuthRouter({ dbPool, authConfig }) {
     },
     handler: loginRateLimitResponse,
   });
+  const recoveryIpLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: recoveryRateLimitResponse,
+  });
+  const recoveryAccountLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000,
+    limit: 3,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (request) => {
+      const email =
+        typeof request.body?.email === "string"
+          ? request.body.email.trim().toLowerCase().slice(0, 254)
+          : "<invalid-email>";
+      return createHash("sha256").update(email).digest("hex");
+    },
+    handler: recoveryRateLimitResponse,
+  });
+  const recoveryCompletionIpLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: recoveryRateLimitResponse,
+  });
 
   router.get("/csrf", (_request, response) => {
     const csrfToken = createCsrfToken();
@@ -127,6 +172,149 @@ export function createAuthRouter({ dbPool, authConfig }) {
     },
   );
 
+  router.post(
+    "/password-recovery",
+    recoveryIpLimiter,
+    recoveryAccountLimiter,
+    (request, response) => {
+      const parsed = recoveryEmailSchema.safeParse(request.body);
+      if (!parsed.success) {
+        throw new HttpError(
+          400,
+          "INVALID_REQUEST",
+          "Indica un correo electrónico válido.",
+        );
+      }
+
+      response.set("Cache-Control", "no-store");
+      response.status(202).json(recoveryAcceptedResponse);
+      setImmediate(() => {
+        void passwordRecovery
+          .requestRecovery({ email: parsed.data.email, request })
+          .catch(() => {
+            logger?.warn(
+              {
+                requestId: request.requestId,
+                event: "auth.password_recovery_processing_failed",
+              },
+              "password recovery request processing failed",
+            );
+          });
+      });
+    },
+  );
+
+  router.post(
+    "/password-recovery/complete",
+    recoveryCompletionIpLimiter,
+    async (request, response) => {
+      const parsed = passwordRecoveryCompletionSchema.safeParse(request.body);
+      if (!parsed.success) {
+        const tokenIssue = parsed.error.issues.some(
+          (issue) => issue.path[0] === "token",
+        );
+        throw new HttpError(
+          400,
+          tokenIssue
+            ? "PASSWORD_RECOVERY_LINK_INVALID"
+            : "INVALID_PASSWORD_CHANGE",
+          tokenIssue
+            ? "El enlace no es válido, venció o ya fue utilizado. Solicita uno nuevo."
+            : passwordValidationMessage(parsed.error),
+        );
+      }
+
+      await passwordRecovery.completeRecovery({
+        ...parsed.data,
+        request,
+      });
+      response.clearCookie(authConfig.cookieName, {
+        ...cookieOptions(authConfig),
+        httpOnly: true,
+      });
+      response.clearCookie(authConfig.csrfCookieName, {
+        ...cookieOptions(authConfig),
+        httpOnly: false,
+      });
+      response.set("Cache-Control", "no-store");
+      response.json({ changed: true });
+    },
+  );
+
+  router.post(
+    "/invitations/complete",
+    recoveryCompletionIpLimiter,
+    async (request, response) => {
+      const parsed = passwordRecoveryCompletionSchema.safeParse(request.body);
+      if (!parsed.success) {
+        const tokenIssue = parsed.error.issues.some(
+          (issue) => issue.path[0] === "token",
+        );
+        throw new HttpError(
+          400,
+          tokenIssue
+            ? "PASSWORD_RECOVERY_LINK_INVALID"
+            : "INVALID_PASSWORD_CHANGE",
+          tokenIssue
+            ? "El enlace no es válido, venció o ya fue utilizado. Solicita uno nuevo."
+            : passwordValidationMessage(parsed.error),
+        );
+      }
+
+      await passwordRecovery.completeInvitation({
+        ...parsed.data,
+        request,
+      });
+      response.clearCookie(authConfig.cookieName, {
+        ...cookieOptions(authConfig),
+        httpOnly: true,
+      });
+      response.clearCookie(authConfig.csrfCookieName, {
+        ...cookieOptions(authConfig),
+        httpOnly: false,
+      });
+      response.set("Cache-Control", "no-store");
+      response.json({ changed: true });
+    },
+  );
+
+  router.post(
+    "/admin-password-reset/complete",
+    recoveryCompletionIpLimiter,
+    async (request, response) => {
+      const parsed = passwordRecoveryCompletionSchema.safeParse(request.body);
+      if (!parsed.success) {
+        const tokenIssue = parsed.error.issues.some(
+          (issue) => issue.path[0] === "token",
+        );
+        throw new HttpError(
+          400,
+          tokenIssue
+            ? "PASSWORD_RECOVERY_LINK_INVALID"
+            : "INVALID_PASSWORD_CHANGE",
+          tokenIssue
+            ? "El enlace no es válido, venció o ya fue utilizado. Solicita uno nuevo."
+            : passwordValidationMessage(parsed.error),
+        );
+      }
+
+      await passwordRecovery.completeAdminPasswordReset({
+        ...parsed.data,
+        request,
+      });
+      response.clearCookie(authConfig.cookieName, {
+        ...cookieOptions(authConfig),
+        httpOnly: true,
+      });
+      response.clearCookie(authConfig.csrfCookieName, {
+        ...cookieOptions(authConfig),
+        httpOnly: false,
+      });
+      response.set("Cache-Control", "no-store");
+      response.json({ changed: true });
+    },
+  );
+
   router.get("/me", requireSessionWithPendingPassword, (request, response) => {
     response.set("Cache-Control", "no-store");
     response.json({
@@ -145,8 +333,7 @@ export function createAuthRouter({ dbPool, authConfig }) {
         throw new HttpError(
           400,
           "INVALID_PASSWORD_CHANGE",
-          parsed.error.issues[0]?.message ||
-            "La contraseña nueva no cumple la política de seguridad.",
+          passwordValidationMessage(parsed.error),
         );
       }
 

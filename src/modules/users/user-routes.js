@@ -63,6 +63,12 @@ const passwordResetSchema = z
     confirmReset: z.literal(true),
   })
   .strict();
+const invitationResendSchema = z
+  .object({
+    expectedRevision: z.string().min(20).max(128),
+    confirmResend: z.literal(true),
+  })
+  .strict();
 
 function parse(schema, input, message) {
   const result = schema.safeParse(input);
@@ -89,9 +95,19 @@ function requireAdministrator(request, _response, next) {
   return next();
 }
 
-export function createUserRouter({ dbPool, authConfig }) {
+export function createUserRouter({
+  dbPool,
+  authConfig,
+  mailTransport,
+  logger,
+}) {
   const router = Router();
-  const service = createUserService({ dbPool });
+  const service = createUserService({
+    dbPool,
+    authConfig,
+    mailTransport,
+    logger,
+  });
   const requireSession = authenticate({ dbPool, authConfig });
   router.use((_request, response, next) => {
     response.set("Cache-Control", "no-store");
@@ -110,6 +126,21 @@ export function createUserRouter({ dbPool, authConfig }) {
           code: "PASSWORD_RESET_RATE_LIMITED",
           message:
             "Se alcanzó el límite de restablecimientos. Inténtalo más tarde.",
+          requestId: request.requestId,
+        },
+      }),
+  });
+  const invitationResendLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    keyGenerator: (request) => String(request.auth.user.id),
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (request, response) =>
+      response.status(429).json({
+        error: {
+          code: "INVITATION_RESEND_RATE_LIMITED",
+          message: "Se alcanzó el límite de invitaciones. Inténtalo más tarde.",
           requestId: request.requestId,
         },
       }),
@@ -186,6 +217,28 @@ export function createUserRouter({ dbPool, authConfig }) {
           updateSchema,
           request.body,
           "Revisa los datos y la revisión de la cuenta.",
+        ),
+        actor: request.auth,
+        request,
+      });
+      response.set("Cache-Control", "no-store").json(result);
+    },
+  );
+
+  router.post(
+    "/:userId/invitation/resend",
+    requirePermission("users.read"),
+    requirePermission("users.manage"),
+    requirePermission("roles.manage"),
+    requirePermission("warehouses.read"),
+    invitationResendLimiter,
+    async (request, response) => {
+      const result = await service.resendInvitation({
+        id: parseId(request.params.userId),
+        input: parse(
+          invitationResendSchema,
+          request.body,
+          "Confirma el reenvío con la revisión actual de la cuenta.",
         ),
         actor: request.auth,
         request,

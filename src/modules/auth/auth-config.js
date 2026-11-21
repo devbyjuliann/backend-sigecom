@@ -37,6 +37,51 @@ function readOrigins(value) {
   ];
 }
 
+function readPublicAppOrigin(value, allowedOrigins, production) {
+  const candidate =
+    typeof value === "string" && value.trim()
+      ? value.trim()
+      : production
+        ? null
+        : allowedOrigins[0];
+  if (!candidate) {
+    throw new Error(
+      "PUBLIC_APP_ORIGIN debe declararse explícitamente en producción.",
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error("PUBLIC_APP_ORIGIN no es un origen válido.");
+  }
+
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.origin === "null" ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.username ||
+    parsed.password
+  ) {
+    throw new Error(
+      "PUBLIC_APP_ORIGIN debe ser un origen HTTP o HTTPS sin ruta ni credenciales.",
+    );
+  }
+  if (production && parsed.protocol !== "https:") {
+    throw new Error("PUBLIC_APP_ORIGIN debe usar HTTPS en producción.");
+  }
+  if (!allowedOrigins.includes(parsed.origin)) {
+    throw new Error(
+      "PUBLIC_APP_ORIGIN debe estar incluido en FRONTEND_ORIGIN.",
+    );
+  }
+
+  return parsed.origin;
+}
+
 export function getAuthConfig(env = process.env) {
   const jwtSecret = env.JWT_SECRET;
   if (
@@ -98,6 +143,11 @@ export function getAuthConfig(env = process.env) {
       "FRONTEND_ORIGIN debe usar HTTPS para cookies y sesiones production.",
     );
   }
+  const publicAppOrigin = readPublicAppOrigin(
+    env.PUBLIC_APP_ORIGIN,
+    allowedOrigins,
+    production,
+  );
 
   return {
     jwtSecret,
@@ -110,6 +160,7 @@ export function getAuthConfig(env = process.env) {
     cookieSameSite: "strict",
     cookiePath: "/api/v1",
     allowedOrigins,
+    publicAppOrigin,
     loginAttemptLimit,
     loginAccountAttemptLimit,
     loginWindowMs: 15 * 60 * 1000,

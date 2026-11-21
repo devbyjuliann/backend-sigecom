@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import bcrypt from "bcrypt";
 import { HttpError } from "../../shared/http-error.js";
+import { createAccountAccessTokenService } from "../auth/account-access-token-service.js";
 
 const requiredAdminPermissions = [
   "users.read",
@@ -29,6 +30,7 @@ function userRevision(user, assignments) {
         displayName: user.display_name,
         isActive: Boolean(user.is_active),
         passwordChangeRequired: Boolean(user.password_change_required),
+        credentialState: user.credential_state,
         credentialRevision: user.password_hash,
         updatedAt: user.updated_at,
         assignments: assignments.map((item) => ({
@@ -55,6 +57,7 @@ function rowUser(
     roleName: roleNames[row.role_code] || row.role_name,
     isActive: Boolean(row.is_active),
     passwordChangeRequired: Boolean(row.password_change_required),
+    credentialState: row.credential_state,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     warehouseCount: Number(totalWarehouseCount ?? row.warehouse_count ?? 0),
@@ -76,11 +79,23 @@ function auditMetadata(request) {
   };
 }
 
-export function createUserService({ dbPool }) {
+export function createUserService({
+  dbPool,
+  authConfig,
+  mailTransport,
+  logger,
+}) {
+  const accessTokens = createAccountAccessTokenService({
+    dbPool,
+    mailTransport,
+    logger,
+    publicAppOrigin: authConfig.publicAppOrigin,
+  });
+
   async function readState(connection, id) {
     const [users] = await connection.execute(
       `SELECT u.id, u.role_id, u.email, u.display_name, u.is_active,
-               u.password_change_required,
+               u.password_change_required, u.credential_state,
                u.password_hash,
               DATE_FORMAT(u.updated_at, '%Y-%m-%d %H:%i:%s.%f') AS updated_at,
               r.code AS role_code, r.name AS role_name
@@ -359,6 +374,15 @@ export function createUserService({ dbPool }) {
     }
   }
 
+  async function revokeAccountAccessTokens(connection, userId) {
+    await connection.execute(
+      `UPDATE account_access_tokens
+       SET revoked_at = UTC_TIMESTAMP(3)
+       WHERE user_id = ? AND consumed_at IS NULL AND revoked_at IS NULL`,
+      [userId],
+    );
+  }
+
   async function list({
     page,
     pageSize,
@@ -402,6 +426,7 @@ export function createUserService({ dbPool }) {
     const offset = (page - 1) * pageSize;
     const [rows] = await dbPool.execute(
       `SELECT u.id, u.email, u.display_name, u.is_active, u.password_change_required,
+              u.credential_state,
               u.created_at, u.updated_at, r.code AS role_code, r.name AS role_name,
               (SELECT COUNT(*) FROM user_warehouses uw WHERE uw.user_id = u.id) AS warehouse_count,
               (SELECT COUNT(*) FROM user_warehouses uw JOIN user_warehouses own
@@ -469,9 +494,9 @@ export function createUserService({ dbPool }) {
   }
 
   async function create({ input, actor: auth, request }) {
-    const temporaryPassword = randomBytes(32).toString("base64url");
-    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
-    const userId = await withTransaction(async (connection) => {
+    const unusablePassword = randomBytes(48).toString("base64url");
+    const passwordHash = await bcrypt.hash(unusablePassword, 12);
+    const result = await withTransaction(async (connection) => {
       await lockAdministratorRole(connection);
       const actor = await assertActorSessionPermissions(connection, auth, [
         "users.read",
@@ -500,8 +525,8 @@ export function createUserService({ dbPool }) {
       try {
         [result] = await connection.execute(
           `INSERT INTO users (role_id, email, display_name, password_hash, is_active,
-                              password_change_required, created_by)
-           VALUES (?, ?, ?, ?, 1, 1, ?)`,
+                              credential_state, password_change_required, created_by)
+           VALUES (?, ?, ?, ?, 1, 'pending_invitation', 1, ?)`,
           [
             rolesFound[0].id,
             input.email,
@@ -532,6 +557,12 @@ export function createUserService({ dbPool }) {
           [id, warehouseId, actor.id],
         );
       }
+      const delivery = await accessTokens.prepare(connection, {
+        userId: id,
+        email: input.email,
+        displayName: input.displayName,
+        purpose: "account_invitation",
+      });
       await writeAudit(connection, {
         actorId: actor.id,
         targetId: id,
@@ -540,13 +571,86 @@ export function createUserService({ dbPool }) {
           email: input.email,
           roleCode: rolesFound[0].code,
           warehouseIds: input.warehouseIds,
+          credentialState: "pending_invitation",
         },
         request,
       });
       await assertAdministratorContinuity(connection);
-      return id;
+      return { id, delivery };
     });
-    return { user: await getById(userId, auth.user.id), temporaryPassword };
+    const deliveryStatus = await accessTokens.deliver(result.delivery);
+    return {
+      user: await getById(result.id, auth.user.id),
+      invitation: { deliveryStatus },
+    };
+  }
+
+  async function resendInvitation({ id, input, actor: auth, request }) {
+    const result = await withTransaction(async (connection) => {
+      await lockAdministratorRole(connection);
+      const actor = await assertActorSessionPermissions(
+        connection,
+        auth,
+        requiredAdminPermissions,
+      );
+      const [targetLocks] = await connection.execute(
+        "SELECT id FROM users WHERE id = ? FOR UPDATE",
+        [id],
+      );
+      if (!targetLocks[0])
+        throw failure(
+          404,
+          "USER_NOT_FOUND",
+          "No se encontró la cuenta solicitada.",
+        );
+      await checkTargetScope(connection, id, actor);
+      const state = await readState(connection, id);
+      if (!state)
+        throw failure(
+          404,
+          "USER_NOT_FOUND",
+          "No se encontró la cuenta solicitada.",
+        );
+      if (state.revision !== input.expectedRevision)
+        throw failure(
+          409,
+          "USER_REVISION_CONFLICT",
+          "La cuenta cambió. Actualiza sus datos antes de reenviar la invitación.",
+        );
+      if (!state.user.is_active)
+        throw failure(
+          409,
+          "INACTIVE_USER_INVITATION_DENIED",
+          "Activa la cuenta antes de reenviar su invitación.",
+        );
+      if (state.user.credential_state !== "pending_invitation")
+        throw failure(
+          409,
+          "USER_INVITATION_NOT_PENDING",
+          "La cuenta ya no tiene una invitación pendiente.",
+        );
+
+      const delivery = await accessTokens.prepare(connection, {
+        userId: id,
+        email: state.user.email,
+        displayName: state.user.display_name,
+        purpose: "account_invitation",
+      });
+      await writeAudit(connection, {
+        actorId: actor.id,
+        targetId: id,
+        action: "users.invitation_resent",
+        details: { deliveryRequested: true },
+        request,
+      });
+      await assertAdministratorContinuity(connection);
+      return { id: String(id), actorId: auth.user.id, delivery };
+    });
+    const deliveryStatus = await accessTokens.deliver(result.delivery);
+    return {
+      user: await getById(result.id, result.actorId),
+      invitation: { deliveryStatus },
+    };
   }
 
   async function update({ id, input, actor: auth, request }) {
@@ -758,6 +862,7 @@ export function createUserService({ dbPool }) {
           "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
           [id],
         );
+      if (accessChanged) await revokeAccountAccessTokens(connection, id);
       const details = {
         fields: [...changes],
         ...(changes.has("email")
@@ -832,6 +937,7 @@ export function createUserService({ dbPool }) {
         "UPDATE user_sessions SET revoked_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL",
         [id],
       );
+      await revokeAccountAccessTokens(connection, id);
       await writeAudit(connection, {
         actorId: actor.id,
         targetId: id,
@@ -853,8 +959,8 @@ export function createUserService({ dbPool }) {
         "No puedes restablecer tu propia contraseña desde la administración.",
       );
 
-    const temporaryPassword = randomBytes(32).toString("base64url");
-    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
+    const unusablePassword = randomBytes(48).toString("base64url");
+    const passwordHash = await bcrypt.hash(unusablePassword, 12);
     const result = await withTransaction(async (connection) => {
       await lockAdministratorRole(connection);
       const actor = await assertActorSessionPermissions(
@@ -872,7 +978,7 @@ export function createUserService({ dbPool }) {
           "USER_NOT_FOUND",
           "No se encontró la cuenta solicitada.",
         );
-      const assignments = await checkTargetScope(connection, id, actor);
+      await checkTargetScope(connection, id, actor);
       const state = await readState(connection, id);
       if (!state)
         throw failure(
@@ -892,9 +998,19 @@ export function createUserService({ dbPool }) {
           "INACTIVE_USER_PASSWORD_RESET_DENIED",
           "Activa la cuenta antes de restablecer su contraseña.",
         );
+      if (
+        !["active", "pending_admin_reset"].includes(state.user.credential_state)
+      )
+        throw failure(
+          409,
+          "USER_INVITATION_PENDING",
+          "La cuenta aún no aceptó su invitación. Reenvía la invitación en lugar de restablecer la contraseña.",
+        );
 
       await connection.execute(
-        `UPDATE users SET password_hash = ?, password_change_required = 1
+        `UPDATE users
+         SET password_hash = ?, password_change_required = 1,
+             credential_state = 'pending_admin_reset'
          WHERE id = ?`,
         [passwordHash, id],
       );
@@ -903,26 +1019,94 @@ export function createUserService({ dbPool }) {
          WHERE user_id = ? AND revoked_at IS NULL`,
         [id],
       );
+      await revokeAccountAccessTokens(connection, id);
+      const delivery = await accessTokens.prepare(connection, {
+        userId: id,
+        email: state.user.email,
+        displayName: state.user.display_name,
+        purpose: "admin_password_reset",
+      });
       await assertAdministratorContinuity(connection);
       await writeAudit(connection, {
         actorId: actor.id,
         targetId: id,
-        action: "users.password_reset",
+        action: "users.password_reset_requested",
         details: {
           revokedSessions: revoked.affectedRows,
           passwordChangeRequired: true,
+          credentialState: "pending_admin_reset",
         },
         request,
       });
-      const updated = await readState(connection, id);
-      const user = rowUser(updated.user, updated.revision, {
-        totalWarehouseCount: assignments.length,
-        visibleWarehouseCount: assignments.length,
-      });
-      return { user, revokedSessions: revoked.affectedRows };
+      return {
+        id: String(id),
+        actorId: auth.user.id,
+        revokedSessions: revoked.affectedRows,
+        delivery,
+        previousCredential: {
+          passwordHash: state.user.password_hash,
+          passwordChangeRequired: Boolean(state.user.password_change_required),
+          credentialState: state.user.credential_state,
+        },
+      };
     });
-    return { ...result, temporaryPassword };
+    const deliveryStatus = await accessTokens.deliver(result.delivery);
+    let credentialRestored = null;
+    if (deliveryStatus === "failed") {
+      try {
+        credentialRestored = await withTransaction(async (connection) => {
+          const [restored] = await connection.execute(
+            `UPDATE users
+             SET password_hash = ?, password_change_required = ?,
+                 credential_state = ?
+             WHERE id = ? AND password_hash = ?
+               AND credential_state = 'pending_admin_reset'`,
+            [
+              result.previousCredential.passwordHash,
+              result.previousCredential.passwordChangeRequired ? 1 : 0,
+              result.previousCredential.credentialState,
+              result.id,
+              passwordHash,
+            ],
+          );
+          if (restored.affectedRows) {
+            await writeAudit(connection, {
+              actorId: auth.user.id,
+              targetId: result.id,
+              action: "users.password_reset_delivery_failed",
+              details: {
+                credentialStateRestored:
+                  result.previousCredential.credentialState,
+                sessionsRemainRevoked: true,
+              },
+              request,
+            });
+          }
+          return restored.affectedRows === 1;
+        });
+      } catch {
+        logger?.warn(
+          { event: "users.password_reset_delivery_restore_failed" },
+          "user credential restoration after failed delivery failed",
+        );
+      }
+    }
+    return {
+      user: await getById(result.id, result.actorId),
+      revokedSessions: result.revokedSessions,
+      deliveryStatus,
+      ...(deliveryStatus === "failed" ? { credentialRestored } : {}),
+    };
   }
 
-  return { list, roles, getById, create, update, setStatus, resetPassword };
+  return {
+    list,
+    roles,
+    getById,
+    create,
+    resendInvitation,
+    update,
+    setStatus,
+    resetPassword,
+  };
 }

@@ -25,6 +25,8 @@ test("loads versioned migrations in order with stable checksums", async () => {
       "0015",
       "0016",
       "0017",
+      "0018",
+      "0019",
     ],
   );
   for (const migration of migrations) {
@@ -157,4 +159,34 @@ test("loads versioned migrations in order with stable checksums", async () => {
   assert.match(customerReturns, /role_permissions/i);
   assert.match(customerReturns, /role\.code = 'administrator'/i);
   assert.doesNotMatch(customerReturns, /DROP\s+(?:TABLE|COLUMN)/i);
+
+  const accountAccess = migrations.find(
+    ({ version }) => version === "0018",
+  ).sql;
+  assert.match(
+    accountAccess,
+    /credential_state ENUM\('active', 'pending_invitation'\)/i,
+  );
+  assert.match(accountAccess, /CREATE TABLE account_access_tokens/i);
+  assert.match(accountAccess, /token_hash CHAR\(64\)/i);
+  assert.match(accountAccess, /purpose VARCHAR\(32\)/i);
+  assert.match(accountAccess, /consumed_at DATETIME\(3\)/i);
+  assert.match(accountAccess, /revoked_at DATETIME\(3\)/i);
+  assert.match(accountAccess, /CHECK \(purpose = 'password_recovery'\)/i);
+  assert.doesNotMatch(
+    accountAccess,
+    /\b(?:token|recovery_url)\s+(?:VARCHAR|TEXT)/i,
+  );
+  assert.doesNotMatch(accountAccess, /DROP\s+(?:TABLE|COLUMN)/i);
+
+  const accountAccessExtensions = migrations.find(
+    ({ version }) => version === "0019",
+  ).sql;
+  assert.match(accountAccessExtensions, /pending_admin_reset/i);
+  assert.match(accountAccessExtensions, /account_invitation/i);
+  assert.match(accountAccessExtensions, /password_recovery/i);
+  assert.doesNotMatch(
+    accountAccessExtensions,
+    /\b(?:DROP\s+TABLE|TRUNCATE|DELETE\s+FROM)\b/i,
+  );
 });

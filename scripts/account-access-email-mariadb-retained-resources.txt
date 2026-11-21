@@ -1,0 +1,434 @@
+INVENTARIO DE RECURSOS MARIADB RETENIDOS — INCREMENTO 1B
+
+Estado: inventario documental y reconciliación bloqueada, sólo de lectura. El
+2026-11-19 se inspeccionaron archivos/configuración local y código, pero no se
+identificó una identidad autorizada para leer los metadatos SQL. No se cargó .env
+ni se ejecutó SQL, migraciones, aprovisionamiento, aceptación integral, limpieza
+o contacto externo. El cambio posterior de guardas y documentación tampoco
+ejecutó SQL. Este documento no autoriza crear, reutilizar ni eliminar recursos.
+
+IDENTIDAD HISTÓRICA Y OBSERVACIÓN LOCAL DEL SERVIDOR
+
+Datos históricos del inventario; no equivalen a una identidad SQL actual:
+
+- Motor/versión: 10.4.32-MariaDB
+- Host: 127.0.0.1:3306
+- Nombre del equipo: DESKTOP-8MEFFV0
+- Directorio de datos: C:\xampp\mysql\data\
+- Cuenta local con privilegios administrativos reportada históricamente:
+  root@localhost
+- Esquemas protegidos que nunca son objetivos de limpieza:
+  sigecom_dev, sigecom_test, sigecom_h2_concurrency
+
+La inspección local del 2026-11-19 observó el ejecutable
+C:\xampp\mysql\bin\mysqld.exe (versión de archivo 10.4.32.0), configuración
+C:\xampp\mysql\bin\my.ini con puerto 3306 y directorio de datos
+C:\xampp\mysql\data, y un listener de ese puerto propiedad de dicho ejecutable
+(PID 4448). Esto no verifica por SQL VERSION(), @@hostname, @@port, @@datadir ni
+CURRENT_USER(); no se conectó a la instancia.
+
+No se identificó una cuenta de sólo lectura autorizada para la inspección global
+de metadatos. No se usaron credenciales de desarrollo/prueba ni la cuenta
+administrativa histórica. No se concedieron privilegios.
+
+RUN_ID COMUNICADOS Y RESULTADO DE RECONCILIACIÓN
+
+No se ejecutó ninguna consulta SQL. Por tanto, para los seis RUN_ID siguientes
+la existencia actual de esquema/cuentas, sus nombres reales, hosts, grants y
+conexiones activas quedan NO VERIFICADOS. “No verificado” no significa
+“inexistente”. Los dos primeros tienen nombres y grants anotados históricamente;
+esa documentación tampoco prueba su estado actual. Para los otros RUN_ID no se
+inventan nombres de esquema ni de cuentas.
+
+RUN_ID 20261118175122_fef206a6
+- Documentación histórica (no verificada actualmente): esquema
+  sigecom_e2e_tmp_20261118175122_fef206a6; aplicación
+  sgapp_20261118175122_fef206a6@localhost; migraciones
+  sgmig_20261118175122_fef206a6@localhost.
+- Grants históricos reportados: aplicación SELECT, INSERT, UPDATE; migraciones
+  SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
+  TRIGGER; sólo en el esquema anotado.
+- Estado actual: esquema, cuentas, grants y conexiones NO VERIFICADOS.
+
+MENCIONES HISTÓRICAS NO VERIFICADAS
+
+- En el contexto previo también aparece el RUN_ID 20261119034440_d879b37f. El
+  directorio temporal de artefactos visuales anotado históricamente no prueba
+  recursos SQL ni nombres de cuentas asociados.
+- No inferir usuarios ni marcar menciones como verificadas. Los recursos
+  desconocidos quedan fuera de cualquier autorización y de cualquier operación.
+
+RUN_ID 20261118175214_44a69166
+- Documentación histórica (no verificada actualmente): esquema
+  sigecom_e2e_tmp_20261118175214_44a69166; aplicación
+  sgapp_20261118175214_44a69166@localhost; migraciones
+  sgmig_20261118175214_44a69166@localhost.
+- Grants históricos reportados: aplicación SELECT, INSERT, UPDATE; migraciones
+  SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES,
+  TRIGGER; sólo en el esquema anotado.
+- Estado actual: esquema, cuentas, grants y conexiones NO VERIFICADOS.
+
+RUN_ID 20261119002343_75cc33ba
+- Comunicado para reconciliación; no hay nombre de esquema/cuentas respaldado
+  por evidencia SQL disponible.
+- Estado actual: esquema, cuentas, grants y conexiones NO VERIFICADOS.
+
+RUN_ID 20261119023151_dac2c6b1
+- Comunicado para reconciliación; no hay nombre de esquema/cuentas respaldado
+  por evidencia SQL disponible.
+- Estado actual: esquema, cuentas, grants y conexiones NO VERIFICADOS.
+
+RUN_ID 20261119025542_8a3c9523
+- Comunicado para reconciliación; no hay nombre de esquema/cuentas respaldado
+  por evidencia SQL disponible.
+- Estado actual: esquema, cuentas, grants y conexiones NO VERIFICADOS.
+
+RUN_ID 20261119034440_d879b37f
+- Comunicado para reconciliación; la mención histórica al directorio de
+  artefactos visuales no prueba existencia de esquema ni nombres de cuentas.
+- Estado actual: esquema, cuentas, grants y conexiones NO VERIFICADOS.
+
+Resultado de conexiones activas: NO VERIFICADO; no se consultó PROCESSLIST ni
+metadatos equivalentes. La inspección del listener local no identifica sesiones
+MariaDB por RUN_ID.
+
+Los seis RUN_ID están enumerados aquí. No se interpretan como seis esquemas ni
+como seis recursos SQL existentes; todos permanecen pendientes de reconciliación.
+
+INVENTARIO DE LA EJECUCIÓN DE PRUEBAS
+
+La salida conservada reportó 14 nodos: una suite contenedora y 13 grupos
+funcionales. Los grupos fueron:
+1. Preflight, aislamiento, migraciones 0001–0018 y cuenta legacy active.
+2. DDL parcial no registra la migración fallida.
+3. Login HTTP de cuenta legacy.
+4. Respuesta equivalente para cuenta existente/inexistente.
+5. Cuentas inactivas y pendientes no reciben correo.
+6. Solicitudes repetidas crean tokens distintos y conservan sesiones.
+7. CSRF negativo en solicitud de recuperación.
+8. Rechazo de contraseña débil sin consumir el enlace.
+9. Rollback transaccional y finalización exitosa.
+10. Rechazo de token alterado, expirado o de otro propósito.
+11. Dos consumos concurrentes producen un solo éxito.
+12. Fallo del transporte simulado sin filtrar información ni dejar token activo.
+13. Respuestas y registros sin credenciales ni enlaces de recuperación.
+
+La aceptación posterior debe añadir CSRF negativo en la ruta de finalización y
+un flujo navegador→backend aislado; las pruebas actuales de UI interceptan la
+API. El incremento actual de código no vuelve a ejecutar esta suite porque el
+arnés crea esquemas y cuentas.
+
+REVISIÓN ESTÁTICA DEL RUNNER ANTES DEL INCREMENTO 1D — 2026-11-19
+(HISTÓRICA; EL ESTADO ACTUAL SE REGISTRA EN LA SECCIÓN INCREMENTO 1D)
+
+- PRE-FLIGHT: el flujo visual usa un dbPool que lanza error ante cualquier
+  acceso; el test retorna antes de despachar acciones SQL. No conecta a MariaDB,
+  no exige credenciales y el proceso hijo recibe sólo modo y variables de
+  sistema necesarias.
+- PROVISION: requiere modo explícito, RUN_ID/ATTEMPT_ID distintos, credenciales
+  aisladas y aprobación exacta del RUN_ID. No se activa implícitamente. Abre una
+  sesión administrativa y crea sólo el esquema/cuentas calculados para ese
+  RUN_ID. Un fallo después de comenzar DDL puede dejar recursos parciales; no hay
+  limpieza automática. La aprobación local es una guarda de coincidencia, no una
+   firma criptográfica. La conexión administrativa continúa codificada en el
+   arnés como `root` sin contraseña; no se ejecutó PROVISION y debe sustituirse
+   por una fuente de credenciales operativa autorizada antes de una futura
+   ejecución. No usar `root` para la inspección de metadatos.
+- RUN: requiere autorización exacta de RUN_ID, ATTEMPT_ID y esquema; despacha
+  reuseAuthorizedResources, no provisionIsolatedResources, y usa las cuentas
+  APP/MIGRATOR del esquema, no la identidad administrativa. Verifica identidad,
+  grants, migraciones y fixtures antes de las pruebas. Escribe datos de prueba y
+  puede dejar cambios parciales; no crea esquemas/cuentas ni aplica migraciones.
+- Hallazgo corregido: `00000000000000_00000000` y su esquema centinela
+  `sigecom_e2e_tmp_00000000000000_00000000` están reservados para PRE-FLIGHT.
+  PROVISION/RUN rechazan el valor como RUN_ID o ATTEMPT_ID antes de iniciar el
+  proceso de integración. La configuración también rechaza modos explícito y de
+  entorno discordantes, aprobaciones mezcladas, producción y objetos de
+  configuración no validados.
+- El proceso hijo se construye desde una allowlist de variables de sistema más
+  sólo el modo y los valores ya validados que requiere esa ejecución. PRE-FLIGHT
+  no hereda credenciales ni identificadores SQL; RUN no hereda variables de
+  administrador ni aprobación PROVISION.
+- Los esquemas protegidos no pueden generarse con el prefijo fijo de esquema y
+  RUN_ID validado; el chequeo adicional de igualdad del runner es redundante.
+  RUN enlaza exclusivamente el esquema derivado con la autorización exacta.
+- Tests unitarios con dobles verifican rechazo de centinela, modos y
+  autorizaciones incorrectas, no despacho de PROVISION desde RUN, aislamiento de
+  entorno PRE-FLIGHT/RUN, compatibilidad de IDs válidos y propagación de un
+  fallo parcial sin retry, fallback ni limpieza.
+
+PERMISOS POR MODO Y RIESGOS DE PROVISION ANTES DEL INCREMENTO 1D
+(HISTÓRICO; NO DESCRIBE EL RUNNER ACTUAL)
+
+- PRE-FLIGHT: ningún permiso SQL; no abre conexión ni transmite secretos SQL.
+- PROVISION: requiere privilegios administrativos suficientes para crear un
+  esquema, crear dos cuentas y asignar grants. La identidad de aprovisionamiento
+  actual está codificada en el arnés (`root` sin contraseña); los grants de APP
+  y MIGRATOR resultantes se limitan al esquema derivado. La guarda de RUN_ID no
+  reemplaza aprobación operativa ni almacenamiento seguro de credenciales.
+- RUN: conecta con APP y MIGRATOR del esquema autorizado. MIGRATOR se usa para
+  consultar schema_migrations/metadatos, insertar un token negativo y ejecutar
+  sondas técnicas DDL: CREATE/ALTER/DROP de tabla y CREATE/DROP de trigger. RUN no
+  aplica migraciones.
+- La verificación actual de grants de MIGRATOR en RUN exige también UPDATE,
+  DELETE, INDEX y REFERENCES. El SQL de los escenarios RUN inspeccionado no los
+  usa directamente. Una reducción candidata para esas pruebas sería
+  SELECT/INSERT más CREATE/ALTER/DROP/TRIGGER, siempre limitada al esquema; debe
+  confirmarse cada privilegio con la versión real y un test aislado.
+- No se puede ejecutar la suite RUN completa con DML solamente mientras incluya
+  esas sondas DDL/trigger. Propuesta de reducción para una etapa posterior:
+  separar las sondas DDL en una ejecución explícita y aprobada, y comprobar si
+  los escenarios funcionales restantes pueden usar exclusivamente APP. No se
+  cambió aquí el diseño de permisos ni el esquema productivo.
+
+FALLOS PARCIALES Y PROPIEDAD ANTES DEL INCREMENTO 1D
+(HISTÓRICO; EL REGISTRO LOCAL DURABLE SE DESCRIBE EN LA SECCIÓN INCREMENTO 1D)
+
+El DDL de aprovisionamiento no es atómico y no existe limpieza automática:
+
+- CREATE DATABASE: si hay error o se pierde la respuesta, el esquema puede
+  existir aunque `resources.retained.schema` no quede marcado.
+- CREATE USER APP/MIGRATOR: los objetos creados antes del fallo se conservan;
+  una respuesta perdida puede volver incierta la marca `retained`.
+- GRANT: puede quedar aplicado sólo uno de los dos grants. El objeto de usuario
+  sí se registra como retenido, pero no hay marcas por grant.
+- CREATE TABLE schema_migrations o aplicación de migraciones: DDL puede
+  persistir aunque falle el registro de versión. `appliedMigrations` sólo agrega
+  una versión tras insertar su fila, por lo que no prueba ausencia de DDL parcial.
+- Fixtures: las filas insertadas antes de un fallo quedan retenidas.
+- Registro de propiedad: no existe un registro duradero separado. El proceso
+  imprime RUN_ID, esquema, nombres derivados y marcas de recursos al cerrar
+  normalmente; un corte forzado puede impedir ese resumen. No marcar una
+  ejecución como limpia a partir de la ausencia del resumen.
+
+El fallo de aprovisionamiento inicial se reduce a operación/código SQL y el
+`finally` cierra la conexión administrativa; el dispatcher devuelve el fallo y
+no reintenta ni cambia RUN_ID. Los recursos se conservan. Ante un error:
+detenerse, preservar el mismo RUN_ID/ATTEMPT_ID y el diagnóstico emitido, hacer
+reconciliación exacta de metadatos y solicitar autorización independiente que
+enumere recursos y reparación permitida. No volver a ejecutar PROVISION ni
+iniciar otro RUN_ID para eludir el estado parcial.
+
+REVISIÓN ESTÁTICA DEL INCREMENTO 1D — 2026-11-19
+
+Esta revisión se hizo sólo sobre código y pruebas con dobles. No abrió conexión
+SQL, no ejecutó consultas de lectura/escritura, migraciones, fixtures, PRE-FLIGHT,
+PROVISION, DDL-CHECK, RUN ni E2E real. No verifica los grants instalados ni el
+estado actual del servidor.
+
+- PROVISION exige usuario y contraseña explícitos mediante
+  SIGECOM_ACCOUNT_ACCESS_PROVISIONER_USER y
+  SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD. Rechaza `root`, usuarios con
+  sintaxis no permitida, contraseñas menores a 32 caracteres y secretos
+  reutilizados. El proceso hijo sólo recibe estas credenciales en PROVISION.
+  El código compara el nombre de CURRENT_USER() con el usuario configurado y
+  aborta si es root. Los privilegios efectivos del provisioner no se han
+  verificado en MariaDB; una denegación durante CREATE/GRANT registra la etapa
+  como desconocida y detiene el flujo.
+- PROVISION consulta por igualdad el esquema y las dos cuentas derivadas antes
+  de CREATE; si el destino existe o no puede inspeccionarse, no continúa.
+- Antes de conectar, PROVISION crea en exclusiva el registro local
+  `%LOCALAPPDATA%\SIGECOM\account-access-email\resource-ownership\<RUN_ID>.json`.
+  Vincula RUN_ID/ATTEMPT_ID con esquema, cuentas/host, grants, migraciones y
+  etapas de fixtures. Cada operación se registra pendiente antes del SQL y como
+  exitosa/desconocida después. Las actualizaciones son atómicas y se sincroniza
+  el archivo. No contiene contraseñas, tokens, correos ni mensajes de error.
+- RUN requiere un registro `ready` coincidente y reclama durablemente un
+  ATTEMPT_ID nuevo antes de conectar. Conecta sólo como APP y verifica
+  SELECT/INSERT/UPDATE limitados al esquema, más DELETE limitado a
+  `user_warehouses` y `role_permissions`; rechaza otros permisos/tablas y grants
+  globales. No requiere ni recibe contraseñas de MIGRATOR/provisioner. No ejecuta
+  CREATE/ALTER/DROP/TRIGGER ni aplica migraciones; usa APP para verificar
+  identidad, grants, las 19 migraciones/checksums y metadatos.
+- DDL-CHECK requiere aprobación exacta independiente para RUN_ID/ATTEMPT_ID/
+  esquema y el registro durable listo. Usa MIGRATOR y ejecuta exclusivamente las
+  sondas CREATE/ALTER/DROP y CREATE/DROP TRIGGER. No provisiona, migra ni ejecuta
+  la aceptación funcional. No se ejecutó este modo.
+- La prueba de rollback de recuperación que inyectaba fallos mediante trigger se
+  retiró de RUN; se conserva el recorrido de recuperación exitosa. La verificación
+  de rollback transaccional contra MariaDB queda pendiente de otra etapa
+  explícitamente aprobada.
+- Tests con dobles cubren credenciales ausentes/inseguras y rechazo de root,
+  aislamiento por modo, autorizaciones/destinos, grants acotados al esquema,
+  denegaciones de privilegios y parada ante fallo parcial, propiedad durable y
+  ausencia de secretos en el registro. No ejecutan SQL.
+
+CIERRE DE PREPARACIÓN DEL RUN — 2026-11-20
+
+Esta actualización corresponde sólo a código y pruebas. No se cargó `.env`, no
+se abrió conexión SQL, no se ejecutaron migraciones, fixtures reales,
+PROVISION, DDL-CHECK, RUN ni correos externos. Ninguna identidad, grant,
+checksum instalado o recurso MariaDB se considera verificado por este cambio.
+
+- El ledger conserva la propiedad del esquema bajo el ATTEMPT_ID original de
+  PROVISION y registra cada ATTEMPT_ID RUN una sola vez. Un intento repetido o
+  igual al de PROVISION se rechaza; los intentos nuevos pueden compartir el
+  mismo RUN_ID/esquema.
+- El runner RUN queda ordenado en serie: bootstrap aislado, aceptación
+  account-access, suite de usuarios y suite de roles/permisos. Las suites
+  existentes de usuarios/roles usan exclusivamente el esquema RUN autorizado y
+  su limpieza comprueba el nombre exacto de la base; fuera de RUN conservan
+  `sigecom_test`.
+- Las fixtures funcionales del intento usan emails ligados al ATTEMPT_ID nuevo.
+  La cuenta legacy usada para comprobar compatibilidad continúa ligada al
+  intento de PROVISION y no se vuelve a crear ni a asumir propiedad de RUN.
+- Se añadió la prueba de navegador para comprobar cambio de identidad,
+  navegación/consulta administrativa y ausencia de datos administrativos en la
+  identidad vendedora. Está pendiente de ejecución visual; el navegador no se
+  inició por recursos locales insuficientes.
+- La concurrencia real de bootstrap y toda la aceptación MariaDB siguen
+  pendientes de una autorización RUN exacta. Los seis RUN_ID históricos siguen
+  sin reconciliar; cada futuro RUN debe usar ATTEMPT_ID nuevo y autorización
+  independiente. DDL-CHECK continúa siendo una autorización separada.
+
+PRIVILEGIOS Y PROCEDIMIENTO LOCAL DE INSPECCIÓN DE SÓLO LECTURA
+
+Comprobaciones y visibilidad:
+
+- SELECT VERSION(), @@hostname, @@port, @@datadir, CURRENT_USER(): disponible a
+  una sesión autenticada normal; no demuestra por sí solo visibilidad de otros
+  esquemas o cuentas.
+- INFORMATION_SCHEMA.SCHEMATA: consultar igualdad por los seis esquemas
+  esperados. MariaDB puede ocultar esquemas sobre los que la cuenta no tiene
+  privilegio; un resultado vacío sin visibilidad global no demuestra ausencia.
+- Cuentas/hosts y grants: los candidatos de nombres se derivan de las
+  convenciones del runner (`sgapp_<RUN_ID>` y `sgmig_<RUN_ID>`), no son
+  identidades verificadas. En MariaDB 10.4 `mysql.user` es una vista de
+  compatibilidad de privilegios; consultar sólo User/Host para los candidatos
+  exactos. `mysql.db`/INFORMATION_SCHEMA.SCHEMA_PRIVILEGES filtrados por los seis
+  esquemas exactos pueden revelar otros grantees con permisos de esquema; para
+  detectar excepciones por objeto, consultar también
+  INFORMATION_SCHEMA.TABLE_PRIVILEGES, COLUMN_PRIVILEGES y ROUTINE_PRIVILEGES
+  con esos mismos filtros. La provisión del arnés sólo crea grants de esquema.
+  `SHOW GRANTS FOR` cada cuenta/host real confirma sus grants; la visibilidad de
+  cuentas ajenas y grants globales puede requerir privilegios adicionales de
+  lectura del sistema. No conceder SELECT amplio sobre `mysql.*` para facilitar
+  la inspección.
+- Conexiones: INFORMATION_SCHEMA.PROCESSLIST filtrado por DB y usuarios
+  candidatos, seleccionando sólo ID, USER, HOST, DB, COMMAND, TIME y STATE (no
+  INFO, que contiene texto SQL). Sin PROCESS, MariaDB limita la vista a las
+  conexiones propias. PROCESS permite ver todas las conexiones y requiere
+  aprobación aparte; si no existe, informar la limitación.
+
+Procedimiento para que el propietario lo ejecute localmente con una identidad
+que controle y esté autorizada. No se ejecutó en esta intervención:
+
+1. En una consola local, iniciar `C:\xampp\mysql\bin\mysql.exe` con
+   `--protocol=TCP --host=127.0.0.1 --port=3306
+   --user=<identidad-autorizada> --password`; omitir el valor de contraseña
+   para que el cliente lo solicite sin eco. No usar el login del backend,
+   credenciales dev/test ni root por conveniencia.
+2. Ejecutar primero sólo:
+   `SELECT VERSION(), @@hostname, @@port, @@datadir, CURRENT_USER();`
+   Abortar si motor/instancia difieren de los datos históricos. No cambiar de
+   servidor para obtener una respuesta.
+3. Consultar `INFORMATION_SCHEMA.SCHEMATA` con WHERE SCHEMA_NAME IN (...) usando
+   exactamente los seis nombres candidatos `sigecom_e2e_tmp_<RUN_ID>` que se
+   derivan uno a uno de los RUN_ID comunicados arriba. Son objetivos de búsqueda,
+   no resultados confirmados. Si la cuenta no puede ver todos, registrar
+   “no verificable”, no “inexistente”.
+4. Consultar por igualdad las doce cuentas candidatas del runner en
+   `mysql.user` seleccionando únicamente User, Host; consultar `mysql.db` o
+   SCHEMA_PRIVILEGES sólo para esos seis esquemas exactos para identificar
+   grantees adicionales. No usar LIKE, `%`, listados globales ni SELECT *.
+5. Para cada par User/Host realmente devuelto, ejecutar SHOW GRANTS con el
+   nombre y host exactos. Si no se permite inspeccionar cuentas/grants ajenos,
+   detenerse y pedir al propietario una ejecución local de esas mismas consultas;
+   no elevar permisos automáticamente.
+6. Si PROCESS está autorizado, consultar PROCESSLIST por igualdad de esos seis
+   DB y las cuentas candidatas, omitiendo INFO. Sin PROCESS, registrar que sólo
+   se observaron las conexiones propias.
+7. Registrar identidad SQL, consulta exacta, cuenta que consultó y resultados
+   sin secretos. No consultar tablas comerciales ni datos de negocio. No ejecutar
+   DDL, DML, migraciones, fixtures, cambios de grants ni limpieza.
+
+Consultas de referencia para preparar esa sesión (sólo lectura; no ejecutadas).
+Los nombres de esquema/cuenta de estos predicados son candidatos derivados del
+formato del runner, no resultados SQL confirmados:
+
+    SELECT SCHEMA_NAME
+    FROM INFORMATION_SCHEMA.SCHEMATA
+    WHERE SCHEMA_NAME IN (
+      'sigecom_e2e_tmp_20261118175122_fef206a6',
+      'sigecom_e2e_tmp_20261118175214_44a69166',
+      'sigecom_e2e_tmp_20261119002343_75cc33ba',
+      'sigecom_e2e_tmp_20261119023151_dac2c6b1',
+      'sigecom_e2e_tmp_20261119025542_8a3c9523',
+      'sigecom_e2e_tmp_20261119034440_d879b37f'
+    );
+
+    SELECT User, Host
+    FROM mysql.user
+    WHERE User IN (
+      'sgapp_20261118175122_fef206a6', 'sgmig_20261118175122_fef206a6',
+      'sgapp_20261118175214_44a69166', 'sgmig_20261118175214_44a69166',
+      'sgapp_20261119002343_75cc33ba', 'sgmig_20261119002343_75cc33ba',
+      'sgapp_20261119023151_dac2c6b1', 'sgmig_20261119023151_dac2c6b1',
+      'sgapp_20261119025542_8a3c9523', 'sgmig_20261119025542_8a3c9523',
+      'sgapp_20261119034440_d879b37f', 'sgmig_20261119034440_d879b37f'
+    )
+    ORDER BY User, Host;
+
+    SELECT User, Host, Db
+    FROM mysql.db
+    WHERE Db IN (
+      'sigecom_e2e_tmp_20261118175122_fef206a6',
+      'sigecom_e2e_tmp_20261118175214_44a69166',
+      'sigecom_e2e_tmp_20261119002343_75cc33ba',
+      'sigecom_e2e_tmp_20261119023151_dac2c6b1',
+      'sigecom_e2e_tmp_20261119025542_8a3c9523',
+      'sigecom_e2e_tmp_20261119034440_d879b37f'
+    )
+    ORDER BY Db, User, Host;
+
+    SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE
+    FROM INFORMATION_SCHEMA.PROCESSLIST
+    WHERE DB IN (
+      'sigecom_e2e_tmp_20261118175122_fef206a6',
+      'sigecom_e2e_tmp_20261118175214_44a69166',
+      'sigecom_e2e_tmp_20261119002343_75cc33ba',
+      'sigecom_e2e_tmp_20261119023151_dac2c6b1',
+      'sigecom_e2e_tmp_20261119025542_8a3c9523',
+      'sigecom_e2e_tmp_20261119034440_d879b37f'
+    )
+    OR USER IN (
+      'sgapp_20261118175122_fef206a6', 'sgmig_20261118175122_fef206a6',
+      'sgapp_20261118175214_44a69166', 'sgmig_20261118175214_44a69166',
+      'sgapp_20261119002343_75cc33ba', 'sgmig_20261119002343_75cc33ba',
+      'sgapp_20261119023151_dac2c6b1', 'sgmig_20261119023151_dac2c6b1',
+      'sgapp_20261119025542_8a3c9523', 'sgmig_20261119025542_8a3c9523',
+      'sgapp_20261119034440_d879b37f', 'sgmig_20261119034440_d879b37f'
+    )
+    ORDER BY ID;
+
+El resultado de mysql.user sólo debe solicitar User/Host, nunca Password ni
+authentication_string. Si mysql.user/mysql.db o SHOW GRANTS no son visibles,
+no ampliar permisos: el propietario debe ejecutar localmente esas consultas con
+una identidad que controle o autorizar una lectura de metadatos adicional. Este
+procedimiento se limita a los seis esquemas y cuentas candidatas; no demuestra
+que no existan otros principals con grants globales. No realizar un listado
+global para suplir esa limitación: solicitar autorización separada si esa
+conclusión es necesaria.
+
+ESTADO Y CONDICIONES PARA CONTINUAR
+
+- Sólo se inspeccionaron archivos/configuración local y código; no se ejecutó
+  ninguna sentencia SQL, de lectura o escritura. No hubo conexión SQL, migración,
+  fixture, aceptación integral ni limpieza.
+- No se confirmó ningún recurso inexistente, existente o con privilegios
+  inesperados; tampoco se detectaron conexiones activas por SQL.
+- No hay recursos elegibles para limpieza posterior con la evidencia actual.
+  Los seis RUN_ID no deben reutilizarse ni eliminarse basándose en este
+  inventario.
+- Para reconciliar, el propietario debe usar una identidad local autorizada. La
+  visibilidad de esquemas/cuentas/grants ajenos y PROCESSLIST puede requerir
+  privilegios adicionales; no se concedieron ni solicitaron por chat.
+- La próxima aceptación E2E requiere, además, reconciliar primero los recursos,
+  usar credenciales de aprovisionamiento gestionadas localmente, revisar la
+  retención de DDL/datos ante fallos y recibir autorización independiente que
+  identifique un esquema existente y ATTEMPT_ID no reutilizado. Las guardas del
+  centinela se probaron sólo en configuración, sin SQL. No ejecutar RUN en esta
+  intervención.
+
+Una posible eliminación requiere autorización independiente y reconciliación
+completa. No se preparó ni ejecutó SQL destructivo.
