@@ -10,6 +10,7 @@ const RESOURCE_BY_STEP = new Map([
   ["user.app.create", ["resources", "appUser"]],
   ["user.migrator.create", ["resources", "migratorUser"]],
   ["grant.app", ["grants", "app"]],
+  ["grant.app.tables", ["grants", "app"]],
   ["grant.migrator", ["grants", "migrator"]],
 ]);
 const REQUIRED_PROVISIONING_STEPS = [
@@ -17,6 +18,7 @@ const REQUIRED_PROVISIONING_STEPS = [
   "user.app.create",
   "user.migrator.create",
   "grant.app",
+  "grant.app.tables",
   "grant.migrator",
   "migrations.table",
   ...Array.from(
@@ -396,6 +398,150 @@ export async function createResourceOwnershipLedger({
   return Object.freeze({
     path: filePath,
     recordStep,
+    markReady,
+    snapshot: () => clone(record),
+  });
+}
+
+export async function resumeResourceOwnershipLedger({
+  directory = defaultResourceOwnershipDirectory(),
+  runId,
+  ownerAttemptId,
+  schema,
+  appUser,
+  migratorUser,
+}) {
+  const target = validateTarget({
+    runId,
+    attemptId: ownerAttemptId,
+    schema,
+    appUser,
+    migratorUser,
+  });
+  const filePath = resourceLedgerPath(path.resolve(directory), target.runId);
+  let record;
+  try {
+    record = assertRecord(JSON.parse(await readFile(filePath, "utf8")));
+  } catch {
+    throw new Error("El registro parcial de propiedad no es válido.");
+  }
+
+  const expectedSteps = [
+    "schema.create",
+    "user.app.create",
+    "user.migrator.create",
+    "grant.app",
+  ];
+  if (
+    record.state !== "provisioning" ||
+    record.owner.runId !== target.runId ||
+    record.owner.attemptId !== target.attemptId ||
+    record.resources.schema.name !== target.schema ||
+    record.resources.appUser.name !== target.appUser ||
+    record.resources.migratorUser.name !== target.migratorUser ||
+    Object.keys(record.steps).length !== expectedSteps.length ||
+    expectedSteps.some((step) => !Object.hasOwn(record.steps, step)) ||
+    ["schema.create", "user.app.create", "user.migrator.create"].some(
+      (step) => record.steps[step].status !== "succeeded",
+    ) ||
+    record.steps["grant.app"].status !== "unknown" ||
+    record.resources.schema.status !== "succeeded" ||
+    record.resources.appUser.status !== "succeeded" ||
+    record.resources.migratorUser.status !== "succeeded" ||
+    record.grants.app.status !== "unknown" ||
+    record.grants.migrator.status !== "planned"
+  ) {
+    throw new Error(
+      "El registro no coincide con el único estado parcial autorizado para recuperación.",
+    );
+  }
+
+  async function persist() {
+    record.updatedAt = new Date().toISOString();
+    await replaceRecord(filePath, record);
+    return clone(record);
+  }
+
+  async function runStep(name, operation, { retryUnknown = false } = {}) {
+    if (
+      typeof name !== "string" ||
+      !STEP_PATTERN.test(name) ||
+      typeof operation !== "function"
+    ) {
+      throw new Error("El paso durable de recuperación no es válido.");
+    }
+    let step = record.steps[name];
+    if (step) {
+      if (!retryUnknown || name !== "grant.app" || step.status !== "unknown") {
+        throw new Error(`El paso durable ${name} ya está registrado.`);
+      }
+      step = { status: "pending", startedAt: new Date().toISOString() };
+      record.steps[name] = step;
+      record.grants.app.status = "pending";
+    } else {
+      step = { status: "pending", startedAt: new Date().toISOString() };
+      record.steps[name] = step;
+      const resourcePath = RESOURCE_BY_STEP.get(name);
+      if (resourcePath) {
+        record[resourcePath[0]][resourcePath[1]].status = "pending";
+      }
+    }
+    await persist();
+
+    try {
+      const result = await operation();
+      step.status = "succeeded";
+      step.completedAt = new Date().toISOString();
+      const resourcePath = RESOURCE_BY_STEP.get(name);
+      if (resourcePath) {
+        record[resourcePath[0]][resourcePath[1]].status = "succeeded";
+      }
+      await persist();
+      return result;
+    } catch (error) {
+      step.status = "unknown";
+      const code = error?.code;
+      if (typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code)) {
+        step.errorCode = code;
+      } else if (Number.isInteger(error?.errno)) {
+        step.errorCode = String(error.errno);
+      }
+      const resourcePath = RESOURCE_BY_STEP.get(name);
+      if (resourcePath) {
+        record[resourcePath[0]][resourcePath[1]].status = "unknown";
+      }
+      await persist();
+      throw error;
+    }
+  }
+
+  async function markReady() {
+    const steps = Object.values(record.steps);
+    if (
+      steps.length === 0 ||
+      REQUIRED_PROVISIONING_STEPS.some(
+        (step) => record.steps[step]?.status !== "succeeded",
+      ) ||
+      steps.some(({ status }) => status !== "succeeded") ||
+      Object.values(record.resources).some(
+        ({ status }) => status !== "succeeded",
+      ) ||
+      Object.values(record.grants).some(({ status }) => status !== "succeeded")
+    ) {
+      throw new Error(
+        "El registro de propiedad no puede marcarse listo con migraciones, fixtures o recursos incompletos/desconocidos.",
+      );
+    }
+    record.state = "ready";
+    record.readyAt = new Date().toISOString();
+    return persist();
+  }
+
+  return Object.freeze({
+    path: filePath,
+    recordStep: (name, operation) => runStep(name, operation),
+    retryStep: (name, operation) =>
+      runStep(name, operation, { retryUnknown: true }),
     markReady,
     snapshot: () => clone(record),
   });

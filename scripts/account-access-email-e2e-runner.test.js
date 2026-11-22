@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   createIntegrationTestEnvironment,
+  dispatchAccountAccessMode,
   executeAccountAccessMode,
   getAccountAccessE2EConfig,
 } from "./account-access-email-e2e-runner.js";
@@ -229,6 +230,41 @@ test("PROVISION requires an explicit non-root provisioner identity and secret", 
   assert.equal(config.provisioner.user, "sigecom_e2e_provisioner");
 });
 
+test("RECOVER requires exact approval for the existing partial RUN_ID", () => {
+  const environment = approvedEnv({
+    SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID: runId,
+  });
+  const config = getAccountAccessE2EConfig("RECOVER", environment);
+
+  assert.equal(config.mode, "RECOVER");
+  assert.equal(config.runId, runId);
+  assert.equal(config.schema, schema);
+  assert.throws(
+    () =>
+      getAccountAccessE2EConfig("RECOVER", {
+        ...environment,
+        SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID:
+          "20261119040002_cccccccc",
+      }),
+    /aprobaci[oó]n.*RECOVER/i,
+  );
+});
+
+test("RECOVER dispatches through the existing integration-test entry point", async () => {
+  const config = getAccountAccessE2EConfig(
+    "RECOVER",
+    approvedEnv({
+      SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID: runId,
+    }),
+  );
+  const result = await dispatchAccountAccessMode(
+    config,
+    async (selectedConfig) => `${selectedConfig.mode}:dispatched`,
+  );
+
+  assert.equal(result, "RECOVER:dispatched");
+});
+
 test("PROVISION forwards only its explicit provisioner credentials to its child", () => {
   const environment = approvedEnv({
     SIGECOM_ACCOUNT_ACCESS_PROVISION_APPROVED_RUN_ID: runId,
@@ -258,6 +294,43 @@ test("PROVISION forwards only its explicit provisioner credentials to its child"
     environment.SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD,
   );
   assert.equal(Object.hasOwn(childEnvironment, "DB_ROOT_PASSWORD"), false);
+  assert.equal(Object.hasOwn(childEnvironment, "MYSQL_PWD"), false);
+});
+
+test("RECOVER forwards only its approved target and isolated recovery credentials", () => {
+  const environment = approvedEnv({
+    SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID: runId,
+  });
+  const config = getAccountAccessE2EConfig("RECOVER", environment);
+  const childEnvironment = createIntegrationTestEnvironment(config, {
+    PATH: "safe-path",
+    NODE_ENV: "test",
+    SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID: runId,
+    SIGECOM_ACCOUNT_ACCESS_PROVISION_APPROVED_RUN_ID: "must-not-forward",
+    MYSQL_PWD: "must-not-forward",
+  });
+
+  assert.equal(childEnvironment.SIGECOM_ACCOUNT_ACCESS_MODE, "RECOVER");
+  assert.equal(childEnvironment.SIGECOM_ACCOUNT_ACCESS_RUN_ID, runId);
+  assert.equal(
+    childEnvironment.SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID,
+    runId,
+  );
+  assert.equal(
+    childEnvironment.SIGECOM_ACCOUNT_ACCESS_MIGRATOR_PASSWORD,
+    environment.SIGECOM_ACCOUNT_ACCESS_MIGRATOR_PASSWORD,
+  );
+  assert.equal(
+    childEnvironment.SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD,
+    environment.SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD,
+  );
+  assert.equal(
+    Object.hasOwn(
+      childEnvironment,
+      "SIGECOM_ACCOUNT_ACCESS_PROVISION_APPROVED_RUN_ID",
+    ),
+    false,
+  );
   assert.equal(Object.hasOwn(childEnvironment, "MYSQL_PWD"), false);
 });
 

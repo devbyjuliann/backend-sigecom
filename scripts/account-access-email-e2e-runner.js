@@ -3,7 +3,13 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const MODES = new Set(["PRE-FLIGHT", "PROVISION", "DDL-CHECK", "RUN"]);
+const MODES = new Set([
+  "PRE-FLIGHT",
+  "PROVISION",
+  "RECOVER",
+  "DDL-CHECK",
+  "RUN",
+]);
 const RUN_ID_PATTERN = /^\d{14}_[a-f0-9]{8}$/;
 const PREFLIGHT_SENTINEL_RUN_ID = "00000000000000_00000000";
 const PREFLIGHT_SENTINEL_SCHEMA = `sigecom_e2e_tmp_${PREFLIGHT_SENTINEL_RUN_ID}`;
@@ -28,6 +34,7 @@ const DDL_AUTHORIZATION_KEYS = [
 ];
 const PROVISION_APPROVAL_KEY =
   "SIGECOM_ACCOUNT_ACCESS_PROVISION_APPROVED_RUN_ID";
+const RECOVERY_APPROVAL_KEY = "SIGECOM_ACCOUNT_ACCESS_RECOVERY_APPROVED_RUN_ID";
 const validatedConfigs = new WeakSet();
 const SAFE_PROCESS_ENV_KEYS = [
   "PATH",
@@ -156,13 +163,13 @@ function requireSecrets(env, mode) {
     appPassword: env.SIGECOM_ACCOUNT_ACCESS_APP_PASSWORD,
     fixturePassword: env.SIGECOM_ACCOUNT_ACCESS_FIXTURE_PASSWORD,
   };
-  if (mode === "PROVISION") {
+  if (mode === "PROVISION" || mode === "RECOVER") {
     credentials.migratorPassword = env.SIGECOM_ACCOUNT_ACCESS_MIGRATOR_PASSWORD;
   }
   requireDistinctSecrets(
     credentials,
-    mode === "PROVISION"
-      ? "aplicación, migraciones y fixtures"
+    mode === "PROVISION" || mode === "RECOVER"
+      ? "aplicación, recuperación de migraciones y fixtures"
       : "aplicación y fixtures",
   );
   return Object.freeze(credentials);
@@ -204,7 +211,7 @@ export function getAccountAccessE2EConfig(mode, env = process.env) {
   const selectedMode = mode ?? environmentMode;
   if (!MODES.has(selectedMode)) {
     throw new Error(
-      "Modo E2E no permitido. Selecciona exactamente PRE-FLIGHT, PROVISION, DDL-CHECK o RUN.",
+      "Modo E2E no permitido. Selecciona exactamente PRE-FLIGHT, PROVISION, RECOVER, DDL-CHECK o RUN.",
     );
   }
 
@@ -223,13 +230,13 @@ export function getAccountAccessE2EConfig(mode, env = process.env) {
   }
 
   if (
-    selectedMode === "PROVISION" &&
+    (selectedMode === "PROVISION" || selectedMode === "RECOVER") &&
     [...RUN_AUTHORIZATION_KEYS, ...DDL_AUTHORIZATION_KEYS].some(
       (key) => env[key] !== undefined,
     )
   ) {
     throw new Error(
-      "Las autorizaciones de RUN/DDL-CHECK no pueden mezclarse con el modo PROVISION.",
+      "Las autorizaciones de RUN/DDL-CHECK no pueden mezclarse con PROVISION ni RECOVER.",
     );
   }
   if (
@@ -238,6 +245,11 @@ export function getAccountAccessE2EConfig(mode, env = process.env) {
   ) {
     throw new Error(
       "La aprobación de PROVISION no puede mezclarse con RUN ni DDL-CHECK.",
+    );
+  }
+  if (selectedMode !== "RECOVER" && env[RECOVERY_APPROVAL_KEY] !== undefined) {
+    throw new Error(
+      "La aprobación de RECOVER no puede mezclarse con otros modos E2E.",
     );
   }
   if (
@@ -276,6 +288,12 @@ export function getAccountAccessE2EConfig(mode, env = process.env) {
         "Falta la aprobación exacta de PROVISION para este RUN_ID.",
       );
     }
+  } else if (selectedMode === "RECOVER") {
+    if (env[RECOVERY_APPROVAL_KEY] !== runId) {
+      throw new Error(
+        "Falta la aprobación exacta de RECOVER para este RUN_ID.",
+      );
+    }
   } else if (
     selectedMode === "RUN" &&
     (env.SIGECOM_ACCOUNT_ACCESS_AUTHORIZED_RUN_ID !== runId ||
@@ -296,17 +314,22 @@ export function getAccountAccessE2EConfig(mode, env = process.env) {
     );
   }
 
-  if (selectedMode === "PROVISION") {
+  if (selectedMode === "PROVISION" || selectedMode === "RECOVER") {
     const provisioner = requireProvisioner(env, credentials);
-    return makeValidatedConfig({
+    const config = {
       mode: selectedMode,
       runId,
       attemptId,
       schema,
       credentials,
       provisioner,
-      provisionApprovedRunId: runId,
-    });
+    };
+    if (selectedMode === "PROVISION") {
+      config.provisionApprovedRunId = runId;
+    } else {
+      config.recoveryApprovedRunId = runId;
+    }
+    return makeValidatedConfig(config);
   }
 
   if (selectedMode === "DDL-CHECK") {
@@ -358,7 +381,7 @@ export function createIntegrationTestEnvironment(
   childEnvironment.SIGECOM_ACCOUNT_ACCESS_RUN_ID = config.runId;
   childEnvironment.SIGECOM_ACCOUNT_ACCESS_ATTEMPT_ID = config.attemptId;
 
-  if (config.mode === "PROVISION") {
+  if (config.mode === "PROVISION" || config.mode === "RECOVER") {
     childEnvironment.SIGECOM_ACCOUNT_ACCESS_APP_PASSWORD =
       config.credentials.appPassword;
     childEnvironment.SIGECOM_ACCOUNT_ACCESS_MIGRATOR_PASSWORD =
@@ -369,7 +392,11 @@ export function createIntegrationTestEnvironment(
       config.provisioner.user;
     childEnvironment.SIGECOM_ACCOUNT_ACCESS_PROVISIONER_PASSWORD =
       config.provisioner.password;
-    childEnvironment[PROVISION_APPROVAL_KEY] = config.provisionApprovedRunId;
+    if (config.mode === "PROVISION") {
+      childEnvironment[PROVISION_APPROVAL_KEY] = config.provisionApprovedRunId;
+    } else {
+      childEnvironment[RECOVERY_APPROVAL_KEY] = config.recoveryApprovedRunId;
+    }
   } else if (config.mode === "RUN") {
     childEnvironment.SIGECOM_ACCOUNT_ACCESS_APP_PASSWORD =
       config.credentials.appPassword;
@@ -432,6 +459,16 @@ function executeIntegrationTest(config) {
   return 0;
 }
 
+export function dispatchAccountAccessMode(config, action) {
+  if (typeof action !== "function") {
+    throw new Error("La acción del runner de integración es obligatoria.");
+  }
+  return executeAccountAccessMode(
+    config,
+    Object.fromEntries([...MODES].map((mode) => [mode, action])),
+  );
+}
+
 function isCliEntryPoint() {
   return process.argv[1]
     ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
@@ -441,12 +478,10 @@ function isCliEntryPoint() {
 if (isCliEntryPoint()) {
   try {
     const config = getAccountAccessE2EConfig(process.argv[2]);
-    const status = await executeAccountAccessMode(config, {
-      "PRE-FLIGHT": executeIntegrationTest,
-      PROVISION: executeIntegrationTest,
-      "DDL-CHECK": executeIntegrationTest,
-      RUN: executeIntegrationTest,
-    });
+    const status = await dispatchAccountAccessMode(
+      config,
+      executeIntegrationTest,
+    );
     process.exitCode = status;
   } catch (error) {
     console.error(error.message);

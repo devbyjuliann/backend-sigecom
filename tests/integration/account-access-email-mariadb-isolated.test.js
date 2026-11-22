@@ -25,9 +25,12 @@ import {
   createResourceOwnershipLedger,
   defaultResourceOwnershipDirectory,
   readResourceOwnershipLedger,
+  resumeResourceOwnershipLedger,
 } from "../../scripts/account-access-email-resource-ledger.js";
+import { normalizeMariaDbGrantScope } from "../support/mariadb-grants.js";
 import {
   assertProvisionerIdentity,
+  grantIsolatedApplicationTablePrivileges,
   provisionIsolatedDatabaseResources,
 } from "../../scripts/account-access-email-provisioning.js";
 import { applyLegacyCompatibleMigrations } from "../support/account-access-migration-plan.js";
@@ -52,6 +55,8 @@ const frontendRequire = createRequire(
 const runnerConfig = getAccountAccessE2EConfig(
   process.env.SIGECOM_ACCOUNT_ACCESS_MODE,
 );
+const directAcceptance =
+  process.env.SIGECOM_ACCOUNT_ACCESS_DIRECT_ACCEPTANCE === "true";
 const { runId, attemptId } = runnerConfig;
 // Vite validates the isolated target even in PRE-FLIGHT; this sentinel is never
 // used as a database connection target.
@@ -1047,13 +1052,14 @@ async function verifyScopedGrants(
 ) {
   const [grantRows] = await connection.query("SHOW GRANTS");
   const grants = grantRows.map((row) => Object.values(row)[0]);
-  const scopedGrants = grants.filter(
-    (grant) => !/^GRANT USAGE ON \*\.\*/i.test(grant),
-  );
+  const scopedGrants = grants
+    .filter((grant) => !/^GRANT USAGE ON \*\.\*/i.test(grant))
+    .map(normalizeMariaDbGrantScope);
+  const escapedGrantSchema = schemaName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   assert.equal(scopedGrants.length, 1 + tablePrivileges.length);
   const schemaGrant = new RegExp(
-    `^GRANT (.+) ON \`${schemaName}\`\\.\\* TO `,
+    `^GRANT (.+) ON \`${escapedGrantSchema}\`\\.\\* TO `,
     "i",
   );
   const schemaGrantText = scopedGrants.find((grant) => schemaGrant.test(grant));
@@ -1067,7 +1073,7 @@ async function verifyScopedGrants(
     .filter((grant) => grant !== schemaGrantText)
     .map((grant) => {
       const match = new RegExp(
-        `^GRANT (.+) ON \`${schemaName}\`\\.\`([a-z0-9_]+)\` TO `,
+        `^GRANT (.+) ON \`${escapedGrantSchema}\`\\.\`([a-z0-9_]+)\` TO `,
         "i",
       ).exec(grant);
       assert.ok(
@@ -1145,7 +1151,7 @@ async function provisionIsolatedResources() {
   if (process.env.NODE_ENV === "production") {
     throw new Error("El runner aislado rechaza NODE_ENV=production.");
   }
-  assert.equal(runnerConfig.mode, "PROVISION");
+  assert.ok(["PROVISION", "RECOVER"].includes(runnerConfig.mode));
   assert.match(schemaName, /^sigecom_e2e_tmp_\d{14}_[a-f0-9]{8}$/);
   assert.doesNotMatch(
     schemaName.toLowerCase(),
@@ -1173,14 +1179,33 @@ async function provisionIsolatedResources() {
   const { chromium } = frontendRequire("@playwright/test");
   await access(chromium.executablePath());
 
-  resourceOwnershipLedger = await createResourceOwnershipLedger({
-    directory: defaultResourceOwnershipDirectory(),
-    runId,
-    attemptId,
-    schema: schemaName,
-    appUser,
-    migratorUser,
-  });
+  const ownershipDirectory = defaultResourceOwnershipDirectory();
+  if (runnerConfig.mode === "RECOVER") {
+    resourceOwnershipRecord = await readResourceOwnershipLedger({
+      directory: ownershipDirectory,
+      runId,
+      attemptId,
+      schema: schemaName,
+      expectedState: "provisioning",
+    });
+    resourceOwnershipLedger = await resumeResourceOwnershipLedger({
+      directory: ownershipDirectory,
+      runId,
+      ownerAttemptId: resourceOwnershipRecord.owner.attemptId,
+      schema: schemaName,
+      appUser,
+      migratorUser,
+    });
+  } else {
+    resourceOwnershipLedger = await createResourceOwnershipLedger({
+      directory: ownershipDirectory,
+      runId,
+      attemptId,
+      schema: schemaName,
+      appUser,
+      migratorUser,
+    });
+  }
 
   try {
     provisionerConnection = await mysql.createConnection({
@@ -1218,6 +1243,36 @@ async function provisionIsolatedResources() {
     assert.match(appUser, /^sgapp_[a-z0-9_]+$/);
     assert.match(migratorUser, /^sgmig_[a-z0-9_]+$/);
 
+    if (runnerConfig.mode === "RECOVER") {
+      const [existingSchemas] = await provisionerConnection.execute(
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+        [schemaName],
+      );
+      const [existingUsers] = await provisionerConnection.execute(
+        "SELECT User FROM mysql.user WHERE User IN (?, ?)",
+        [appUser, migratorUser],
+      );
+      const [existingTables] = await provisionerConnection.execute(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
+        [schemaName],
+      );
+      if (
+        existingSchemas.length !== 1 ||
+        existingUsers.length !== 2 ||
+        existingTables.length !== 0
+      ) {
+        throw new Error(
+          "RECOVER exige el esquema exacto, las dos cuentas derivadas y cero tablas antes de rotar credenciales.",
+        );
+      }
+      await provisionerConnection.query(
+        `ALTER USER '${appUser}'@'localhost' IDENTIFIED BY ${provisionerConnection.escape(appPassword)}`,
+      );
+      await provisionerConnection.query(
+        `ALTER USER '${migratorUser}'@'localhost' IDENTIFIED BY ${provisionerConnection.escape(migratorPassword)}`,
+      );
+    }
+
     await provisionIsolatedDatabaseResources({
       connection: provisionerConnection,
       ledger: resourceOwnershipLedger,
@@ -1227,6 +1282,7 @@ async function provisionIsolatedResources() {
       migratorUser,
       appPassword,
       migratorPassword,
+      resumeExisting: runnerConfig.mode === "RECOVER",
     });
   } catch (error) {
     throw safeSqlError(error, "Preflight/provisión aislada");
@@ -1272,14 +1328,7 @@ async function provisionIsolatedResources() {
   const appConnection = await connectAs(appUser, appPassword);
   try {
     await verifyServerIdentity(appConnection, `${appUser}@localhost`);
-    await verifyScopedGrants(
-      appConnection,
-      ["SELECT", "INSERT", "UPDATE"],
-      [
-        { table: "user_warehouses", privileges: ["DELETE"] },
-        { table: "role_permissions", privileges: ["DELETE"] },
-      ],
-    );
+    await verifyScopedGrants(appConnection, ["SELECT", "INSERT", "UPDATE"]);
     await verifyProtectedSchemasDenied(appConnection);
   } finally {
     await appConnection.end();
@@ -1300,7 +1349,7 @@ async function provisionIsolatedResources() {
         );
         warehouseId = String(warehouse.insertId);
         migrationLegacyUser = await seedUser({
-          email: `migration-legacy.${attemptId}@example.invalid`,
+          email: `migration-legacy.${resourceOwnershipLedger.snapshot().owner.attemptId}@example.invalid`,
           displayName: "Cuenta de prueba existente",
           password: fixturePassword,
           isActive: 1,
@@ -1330,6 +1379,65 @@ async function provisionIsolatedResources() {
   }
 
   await verifyMigration0019Schema();
+  provisionerConnection = await mysql.createConnection({
+    host: HOST,
+    port: PORT,
+    user: provisionerUser,
+    password: provisionerPassword,
+    charset: "utf8mb4",
+    connectTimeout: 5000,
+    multipleStatements: false,
+  });
+  try {
+    const [[identity]] = await provisionerConnection.query(`
+      SELECT VERSION() AS version,
+             @@hostname AS hostname,
+             @@port AS port,
+             @@datadir AS datadir,
+             DATABASE() AS selected_database,
+             CURRENT_USER() AS current_identity
+    `);
+    assert.equal(identity.version, EXPECTED_DATABASE_VERSION);
+    assert.equal(identity.hostname, EXPECTED_HOSTNAME);
+    assert.equal(Number(identity.port), PORT);
+    assert.equal(
+      identity.datadir.toLowerCase(),
+      EXPECTED_DATADIR.toLowerCase(),
+    );
+    assert.equal(identity.selected_database, null);
+    assertProvisionerIdentity(identity.current_identity, provisionerUser);
+    await grantIsolatedApplicationTablePrivileges({
+      connection: provisionerConnection,
+      ledger: resourceOwnershipLedger,
+      runId,
+      schema: schemaName,
+      appUser,
+    });
+  } catch (error) {
+    throw safeSqlError(error, "Grant de tablas para APP");
+  } finally {
+    await provisionerConnection.end().catch(() => {});
+    provisionerConnection = null;
+  }
+
+  const appConnectionAfterMigrations = await connectAs(appUser, appPassword);
+  try {
+    await verifyServerIdentity(
+      appConnectionAfterMigrations,
+      `${appUser}@localhost`,
+    );
+    await verifyScopedGrants(
+      appConnectionAfterMigrations,
+      ["SELECT", "INSERT", "UPDATE"],
+      [
+        { table: "user_warehouses", privileges: ["DELETE"] },
+        { table: "role_permissions", privileges: ["DELETE"] },
+      ],
+    );
+  } finally {
+    await appConnectionAfterMigrations.end();
+  }
+
   await resourceOwnershipLedger.recordStep(
     "fixtures.account-access",
     async () => {},
@@ -1343,19 +1451,62 @@ async function reuseAuthorizedResources() {
     throw new Error("El runner aislado rechaza NODE_ENV=production.");
   }
   assert.equal(runnerConfig.mode, "RUN");
-  resourceOwnershipRecord = await readResourceOwnershipLedger({
-    directory: defaultResourceOwnershipDirectory(),
-    runId,
-    attemptId,
-    schema: schemaName,
-    expectedState: "ready",
-  });
-  resourceOwnershipRecord = await claimResourceOwnershipAttempt({
-    directory: defaultResourceOwnershipDirectory(),
-    runId,
-    attemptId,
-    schema: schemaName,
-  });
+  if (directAcceptance) {
+    resourceOwnershipRecord = await readResourceOwnershipLedger({
+      directory: defaultResourceOwnershipDirectory(),
+      runId,
+      attemptId,
+      schema: schemaName,
+      expectedState: "provisioning",
+    });
+    const ledger = resourceOwnershipRecord;
+    const completedSteps = [
+      "schema.create",
+      "user.app.create",
+      "user.migrator.create",
+      "grant.app",
+      "grant.migrator",
+      "migrations.table",
+      "fixtures.legacy",
+      ...migrationVersions.map((version) => `migration.${version}`),
+    ];
+    assert.notEqual(ledger.owner.attemptId, attemptId);
+    assert.deepEqual(
+      Object.keys(ledger.steps).sort(),
+      [...completedSteps, "grant.app.tables"].sort(),
+    );
+    assert.equal(ledger.steps["grant.app.tables"]?.status, "unknown");
+    assert.equal(
+      ledger.steps["grant.app.tables"]?.errorCode,
+      "ER_TABLEACCESS_DENIED_ERROR",
+    );
+    assert.equal(ledger.steps["fixtures.account-access"], undefined);
+    assert.ok(
+      completedSteps.every(
+        (step) => ledger.steps[step]?.status === "succeeded",
+      ),
+    );
+    assert.equal(ledger.state, "provisioning");
+    assert.equal(ledger.resources.schema.status, "succeeded");
+    assert.equal(ledger.resources.appUser.status, "succeeded");
+    assert.equal(ledger.resources.migratorUser.status, "succeeded");
+    assert.equal(ledger.grants.app.status, "unknown");
+    assert.equal(ledger.grants.migrator.status, "succeeded");
+  } else {
+    resourceOwnershipRecord = await readResourceOwnershipLedger({
+      directory: defaultResourceOwnershipDirectory(),
+      runId,
+      attemptId,
+      schema: schemaName,
+      expectedState: "ready",
+    });
+    resourceOwnershipRecord = await claimResourceOwnershipAttempt({
+      directory: defaultResourceOwnershipDirectory(),
+      runId,
+      attemptId,
+      schema: schemaName,
+    });
+  }
   process.env.NODE_ENV = "test";
   const appConnection = await connectAs(appUser, appPassword);
   try {
@@ -2030,7 +2181,9 @@ async function runBrowserCacheIsolation(page) {
   await page.goto(`${BROWSER_ORIGIN}/usuarios`, {
     waitUntil: "domcontentloaded",
   });
-  await page.getByRole("heading", { name: "Usuarios", exact: true }).waitFor();
+  await page
+    .getByRole("heading", { name: "Usuarios", exact: true, level: 1 })
+    .waitFor();
   const search = page.getByRole("searchbox", {
     name: "Buscar por nombre o correo",
   });
@@ -2066,7 +2219,9 @@ async function runBrowserCacheIsolation(page) {
   await page.waitForURL(`${BROWSER_ORIGIN}/acceso-denegado`, {
     timeout: 20_000,
   });
-  await page.getByRole("heading", { name: "Acceso denegado" }).waitFor();
+  await page
+    .getByRole("heading", { name: "Acceso no autorizado", exact: true })
+    .waitFor();
   const sellerPageText = await page.locator("body").innerText();
   assert.equal(sellerPageText.includes(browserUser.email), false);
   assert.equal(sellerPageText.includes(browserExpiryUser.email), false);
@@ -2100,6 +2255,8 @@ async function runBrowserAcceptance() {
   let consoleErrorCount = 0;
   let expectedAuthProbeConsoleErrorCount = 0;
   let expectedHttpConsoleErrorCount = 0;
+  let expectedApiUnavailableConsoleErrorCount = 0;
+  let apiUnavailableExpected = false;
   const unexpectedConsoleErrorPaths = [];
   const apiResponseStatuses = new Map();
   let authMeStatus = null;
@@ -2130,8 +2287,18 @@ async function runBrowserAcceptance() {
       }
       return;
     }
+    if (
+      apiUnavailableExpected &&
+      pathName === "/api/v1/auth/csrf" &&
+      responseStatus === 502
+    ) {
+      expectedApiUnavailableConsoleErrorCount += 1;
+      return;
+    }
     if (unexpectedConsoleErrorPaths.length < 20) {
-      unexpectedConsoleErrorPaths.push(pathName);
+      unexpectedConsoleErrorPaths.push(
+        `${pathName} (HTTP ${responseStatus ?? "sin respuesta"})`,
+      );
     }
     consoleErrorCount += 1;
   });
@@ -2229,6 +2396,7 @@ async function runBrowserAcceptance() {
   );
   await recoveryEmail.fill(browserUser.email);
 
+  apiUnavailableExpected = true;
   await stopBrowserApiServer();
   await page.getByRole("button", { name: "Enviar instrucciones" }).click();
   const unavailableError = page
@@ -2242,6 +2410,7 @@ async function runBrowserAcceptance() {
   assert.equal(browserMailbox.length, 0);
 
   await startBrowserApiServer();
+  apiUnavailableExpected = false;
   const activeResponsePromise = responseForPost(
     page,
     "/api/v1/auth/password-recovery",
@@ -2683,6 +2852,8 @@ async function runBrowserAcceptance() {
   await waitForRecoveryAuditCount(baselineRecoveryAudits + 4);
   await runBrowserCacheIsolation(page);
 
+  browserDiagnostics.acceptanceExpectedApiUnavailableConsoleErrors =
+    expectedApiUnavailableConsoleErrorCount;
   assert.equal(
     pageErrorCount,
     0,
@@ -2691,7 +2862,9 @@ async function runBrowserAcceptance() {
   assert.equal(
     consoleErrorCount,
     0,
-    "el recorrido del navegador no debe emitir errores de consola",
+    `el recorrido del navegador no debe emitir errores de consola: ${
+      unexpectedConsoleErrorPaths.join(", ") || "ruta desconocida"
+    }`,
   );
   browserDiagnostics.acceptanceExpectedHttpConsoleErrors =
     expectedHttpConsoleErrorCount;
@@ -2821,10 +2994,15 @@ test(
       await context.test(
         runnerConfig.mode === "PROVISION"
           ? "provisión explícita del esquema, permisos, migraciones y fixtures"
-          : "reutilización de esquema autorizado sin provisionar ni migrar",
+          : runnerConfig.mode === "RECOVER"
+            ? "recuperación explícita del esquema parcial y continuación de migraciones"
+            : directAcceptance
+              ? "aceptación directa del esquema parcial existente sin modificar el ledger ni migrar"
+              : "reutilización de esquema autorizado sin provisionar ni migrar",
         async () => {
           await executeAccountAccessMode(runnerConfig, {
             PROVISION: provisionIsolatedResources,
+            RECOVER: provisionIsolatedResources,
             "DDL-CHECK": runAuthorizedDdlChecks,
             RUN: reuseAuthorizedResources,
           });
@@ -2833,7 +3011,12 @@ test(
         },
       );
       if (!prepared) return;
-      if (runnerConfig.mode === "PROVISION") return;
+      if (
+        runnerConfig.mode === "PROVISION" ||
+        runnerConfig.mode === "RECOVER"
+      ) {
+        return;
+      }
 
       await context.test(
         "Login HTTP acepta una cuenta legacy migrada",
@@ -2993,7 +3176,7 @@ test(
       );
 
       await context.test(
-        "repetir solicitudes emite hashes distintos sin revocar sesiones",
+        "repetir solicitudes invalida el enlace previo sin revocar sesiones",
         async () => {
           const harness = createHttpHarness();
           const csrf = await csrfContext(harness.app);
@@ -3031,13 +3214,18 @@ test(
           assert.ok(
             stored.every(({ token_hash }) => !tokens.includes(token_hash)),
           );
+          assert.equal(stored[0].token_hash, hashToken(tokens[1]));
+          assert.equal(stored[0].consumed_at, null);
+          assert.equal(stored[0].revoked_at, null);
+          assert.equal(stored[1].token_hash, hashToken(tokens[0]));
+          assert.equal(stored[1].consumed_at, null);
+          assert.ok(stored[1].revoked_at);
           assert.ok(
             stored.every(
-              ({ seconds_left, consumed_at, revoked_at }) =>
-                Number(seconds_left) >= 1780 &&
-                consumed_at === null &&
-                revoked_at === null,
+              ({ seconds_left }) =>
+                Number(seconds_left) >= 1500 && Number(seconds_left) <= 1800,
             ),
+            "los dos enlaces deben conservar el TTL de 30 minutos",
           );
 
           const [[session]] = await appPool.execute(
@@ -3397,7 +3585,8 @@ test(
           cleanup:
             runnerConfig.mode === "PRE-FLIGHT"
               ? "preflight sin conexión SQL; no se crearon recursos"
-              : runnerConfig.mode === "PROVISION"
+              : runnerConfig.mode === "PROVISION" ||
+                  runnerConfig.mode === "RECOVER"
                 ? "provisión explícita; esquema, cuentas, migraciones y fixtures registrados y retenidos"
                 : runnerConfig.mode === "DDL-CHECK"
                   ? "DDL-CHECK separado; sólo sondas explícitamente aprobadas en esquema existente"

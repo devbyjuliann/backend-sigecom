@@ -291,6 +291,12 @@ test("administrator creates an invitation-only account without returning a passw
   await acceptLatestInvitation(targetEmail, changedTargetPassword);
   const signIn = await login(targetEmail, changedTargetPassword);
   await api("get", "/api/v1/users", undefined, signIn).expect(403);
+  await request(app)
+    .post("/api/v1/auth/logout")
+    .set("Origin", origin)
+    .set("Cookie", signIn.cookies.join("; "))
+    .set("X-CSRF-Token", signIn.csrfToken)
+    .expect(204);
 });
 
 test("administrator resets an active account by email and revokes previous access", async () => {

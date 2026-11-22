@@ -32,6 +32,7 @@ async function completeProvisioningLedger(ledger) {
     "user.app.create",
     "user.migrator.create",
     "grant.app",
+    "grant.app.tables",
     "grant.migrator",
     "migrations.table",
     ...Array.from(
@@ -110,6 +111,47 @@ test("a partially applied stage remains unknown and cannot be marked ready", asy
   assert.equal(persisted.steps["grant.app"].status, "unknown");
   assert.equal(JSON.stringify(persisted).includes("private-secret"), false);
   await assert.rejects(ledger.markReady(), /incomplet|unknown|succeeded/i);
+});
+
+test("resource ownership resumes only the exact partial grant stage", async (t) => {
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "sigecom-resource-ledger-resume-"),
+  );
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const ledger = await createTestLedger(t, directory);
+  for (const step of [
+    "schema.create",
+    "user.app.create",
+    "user.migrator.create",
+  ]) {
+    await ledger.recordStep(step, async () => {});
+  }
+  await assert.rejects(
+    ledger.recordStep("grant.app", async () => {
+      throw new Error("grant denied");
+    }),
+    /grant denied/,
+  );
+
+  const module = await loadLedgerModule();
+  assert.equal(typeof module.resumeResourceOwnershipLedger, "function");
+  const resumed = await module.resumeResourceOwnershipLedger({
+    directory,
+    runId: "20261119040000_aaaaaaaa",
+    ownerAttemptId: "20261119040001_bbbbbbbb",
+    schema: "sigecom_e2e_tmp_20261119040000_aaaaaaaa",
+    appUser: "sgapp_20261119040000_aaaaaaaa",
+    migratorUser: "sgmig_20261119040000_aaaaaaaa",
+  });
+  await resumed.retryStep("grant.app", async () => {});
+  await resumed.recordStep("grant.migrator", async () => {});
+
+  assert.equal(resumed.snapshot().steps["grant.app"].status, "succeeded");
+  assert.equal(resumed.snapshot().steps["grant.migrator"].status, "succeeded");
+  assert.equal(resumed.snapshot().owner.attemptId, "20261119040001_bbbbbbbb");
+  assert.equal(resumed.snapshot().state, "provisioning");
+  await assert.rejects(resumed.markReady(), /incomplet|succeeded/i);
 });
 
 test("resource ownership lookup permits fresh attempts for the same ready RUN_ID", async (t) => {
@@ -282,6 +324,7 @@ test("resource ownership cannot become ready before every migration and fixture 
     "user.app.create",
     "user.migrator.create",
     "grant.app",
+    "grant.app.tables",
     "grant.migrator",
   ]) {
     await ledger.recordStep(step, async () => {});

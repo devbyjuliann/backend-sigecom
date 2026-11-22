@@ -34,11 +34,24 @@ async function makeLedger(t, directory) {
   return ledger;
 }
 
-function createConnectionDouble({ failOn } = {}) {
+function createConnectionDouble({
+  failOn,
+  existingTarget = false,
+  existingTables = [],
+} = {}) {
   const statements = [];
   const connection = {
     async execute(sql, parameters) {
       statements.push({ kind: "execute", sql, parameters });
+      if (existingTarget && sql.includes("information_schema.SCHEMATA")) {
+        return [[{ SCHEMA_NAME: target.schema }], []];
+      }
+      if (existingTarget && sql.includes("FROM mysql.user")) {
+        return [[{ User: target.appUser }, { User: target.migratorUser }], []];
+      }
+      if (existingTarget && sql.includes("information_schema.TABLES")) {
+        return [existingTables.map((TABLE_NAME) => ({ TABLE_NAME })), []];
+      }
       return [[], []];
     },
     async query(sql) {
@@ -72,7 +85,7 @@ test("isolated provisioning scopes every grant to the derived schema", async (t)
   const ddl = statements
     .filter(({ kind }) => kind === "query")
     .map(({ sql }) => sql);
-  assert.equal(ddl.length, 7);
+  assert.equal(ddl.length, 5);
   assert.match(
     ddl[0],
     /^CREATE DATABASE `sigecom_e2e_tmp_20261119040000_aaaaaaaa`/,
@@ -87,25 +100,88 @@ test("isolated provisioning scopes every grant to the derived schema", async (t)
   );
   assert.match(
     ddl[3],
-    /^GRANT SELECT, INSERT, UPDATE ON `sigecom_e2e_tmp_20261119040000_aaaaaaaa`\.\*/,
+    /^GRANT SELECT, INSERT, UPDATE ON `sigecom\\_e2e\\_tmp\\_20261119040000\\_aaaaaaaa`\.\*/,
   );
   assert.match(
     ddl[4],
-    /^GRANT DELETE ON `sigecom_e2e_tmp_20261119040000_aaaaaaaa`\.`user_warehouses`/,
-  );
-  assert.match(
-    ddl[5],
-    /^GRANT DELETE ON `sigecom_e2e_tmp_20261119040000_aaaaaaaa`\.`role_permissions`/,
-  );
-  assert.match(
-    ddl[6],
-    /^GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, TRIGGER ON `sigecom_e2e_tmp_20261119040000_aaaaaaaa`\.\*/,
+    /^GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, TRIGGER ON `sigecom\\_e2e\\_tmp\\_20261119040000\\_aaaaaaaa`\.\*/,
   );
   assert.doesNotMatch(ddl.join("\n"), /\bON\s+\*\.\*|\bWITH GRANT OPTION\b/i);
   assert.match(
     JSON.stringify(ledger.snapshot().steps["grant.migrator"]),
     /"status":"succeeded"/,
   );
+});
+
+test("isolated grants escape wildcard characters in the database scope", async (t) => {
+  const module = await loadProvisioningModule();
+  assert.ok(module, "debe existir el módulo aislado de aprovisionamiento");
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "sigecom-provision-escaped-scope-"),
+  );
+  const ledger = await makeLedger(t, directory);
+  const { connection, statements } = createConnectionDouble();
+
+  await module.provisionIsolatedDatabaseResources({
+    connection,
+    ledger,
+    ...target,
+  });
+
+  const grants = statements
+    .filter(({ kind, sql }) => kind === "query" && sql.startsWith("GRANT "))
+    .map(({ sql }) => sql);
+  assert.equal(grants.length, 2);
+  for (const grant of grants) {
+    assert.match(
+      grant,
+      /ON `sigecom\\_e2e\\_tmp\\_20261119040000\\_aaaaaaaa`\./,
+    );
+  }
+});
+
+test("application table DELETE grants are deferred until both tables exist", async (t) => {
+  const module = await loadProvisioningModule();
+  assert.ok(module, "debe existir el módulo aislado de aprovisionamiento");
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "sigecom-provision-app-table-grants-"),
+  );
+  const ledger = await makeLedger(t, directory);
+  for (const step of [
+    "schema.create",
+    "user.app.create",
+    "user.migrator.create",
+    "grant.app",
+    "grant.migrator",
+  ]) {
+    await ledger.recordStep(step, async () => {});
+  }
+  const { connection, statements } = createConnectionDouble({
+    existingTarget: true,
+    existingTables: ["user_warehouses", "role_permissions"],
+  });
+
+  await module.grantIsolatedApplicationTablePrivileges({
+    connection,
+    ledger,
+    runId: target.runId,
+    schema: target.schema,
+    appUser: target.appUser,
+  });
+
+  const grants = statements
+    .filter(({ kind, sql }) => kind === "query" && sql.startsWith("GRANT "))
+    .map(({ sql }) => sql);
+  assert.equal(grants.length, 2);
+  assert.match(
+    grants[0],
+    /^GRANT DELETE ON `sigecom\\_e2e\\_tmp\\_20261119040000\\_aaaaaaaa`\.`user_warehouses` TO 'sgapp_20261119040000_aaaaaaaa'@'localhost'$/,
+  );
+  assert.match(
+    grants[1],
+    /^GRANT DELETE ON `sigecom\\_e2e\\_tmp\\_20261119040000\\_aaaaaaaa`\.`role_permissions` TO 'sgapp_20261119040000_aaaaaaaa'@'localhost'$/,
+  );
+  assert.equal(ledger.snapshot().steps["grant.app.tables"].status, "succeeded");
 });
 
 test("a privilege denial records the attempted stage as unknown and stops provisioning", async (t) => {
@@ -145,6 +221,59 @@ test("a privilege denial records the attempted stage as unknown and stops provis
     false,
   );
   assert.equal(JSON.stringify(snapshot).includes("private-secret"), false);
+});
+
+test("recovery grants existing accounts without recreating their schema or users", async (t) => {
+  const module = await loadProvisioningModule();
+  assert.ok(module, "debe existir el módulo aislado de aprovisionamiento");
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), "sigecom-provision-resume-"),
+  );
+  const ledger = await makeLedger(t, directory);
+  for (const step of [
+    "schema.create",
+    "user.app.create",
+    "user.migrator.create",
+  ]) {
+    await ledger.recordStep(step, async () => {});
+  }
+  await assert.rejects(
+    ledger.recordStep("grant.app", async () => {
+      throw new Error("initial grant failure");
+    }),
+    /initial grant failure/,
+  );
+  const resumedLedger = await (
+    await import("./account-access-email-resource-ledger.js")
+  ).resumeResourceOwnershipLedger({
+    directory,
+    ...target,
+    ownerAttemptId: target.attemptId,
+  });
+  const { connection, statements } = createConnectionDouble({
+    existingTarget: true,
+  });
+
+  await module.provisionIsolatedDatabaseResources({
+    connection,
+    ledger: resumedLedger,
+    ...target,
+    resumeExisting: true,
+  });
+
+  const writes = statements
+    .filter(({ kind }) => kind === "query")
+    .map(({ sql }) => sql);
+  assert.equal(
+    writes.some((sql) => /^(?:CREATE DATABASE|CREATE USER)/.test(sql)),
+    false,
+  );
+  assert.equal(writes.filter((sql) => sql.startsWith("GRANT ")).length, 2);
+  assert.equal(resumedLedger.snapshot().steps["grant.app"].status, "succeeded");
+  assert.equal(
+    resumedLedger.snapshot().steps["grant.migrator"].status,
+    "succeeded",
+  );
 });
 
 test("existing targets and malformed destinations fail before any write", async (t) => {

@@ -4,7 +4,7 @@
   "description": "API REST de SIGECOM",
   "main": "src/server.js",
   "scripts": {
-    "test": "node --test tests/health.test.js tests/database/*.test.js tests/support/integration-fixtures.test.js tests/reports-purchase-orders-service.test.js scripts/account-access-email-e2e-runner.test.js scripts/account-access-email-provisioning.test.js scripts/account-access-email-resource-ledger.test.js",
+    "test": "node --test tests/health.test.js tests/database/*.test.js tests/support/integration-fixtures.test.js tests/support/mariadb-grants.test.js tests/reports-purchase-orders-service.test.js scripts/account-access-email-e2e-runner.test.js scripts/account-access-email-provisioning.test.js scripts/account-access-email-resource-ledger.test.js",
     "test:integration": "node --env-file=.env tests/support/integration-runner.js",
     "test:account-access-email:isolated": "node scripts/account-access-email-e2e-runner.js PRE-FLIGHT",
     "test:account-access-email:preflight": "node scripts/account-access-email-e2e-runner.js PRE-FLIGHT",
