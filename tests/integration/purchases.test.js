@@ -270,6 +270,7 @@ test("administrator can create, review, confirm and cancel orders without stock 
 
   assert.equal(created.body.status, "draft");
   assert.equal(created.body.total, "3703.50");
+  await get(`/api/v1/purchase-orders/${created.body.id}/pdf`).expect(409);
   const listed = await get(
     `/api/v1/purchase-orders?q=${created.body.number}`,
   ).expect(200);
@@ -304,6 +305,33 @@ test("administrator can create, review, confirm and cancel orders without stock 
   ).expect(200);
   assert.equal(confirmed.body.status, "confirmed");
   assert.equal(confirmed.body.lines[0].unitCost, "1234.50");
+  const [[orderBeforePdf]] = await pool.execute(
+    `SELECT po.version, po.status,
+       (SELECT COUNT(*) FROM purchase_receipts receipt
+         WHERE receipt.purchase_order_id = po.id) AS receipts
+     FROM purchase_orders po WHERE po.id = ?`,
+    [created.body.id],
+  );
+  const orderPdf = await get(
+    `/api/v1/purchase-orders/${created.body.id}/pdf`,
+  ).expect(200);
+  assert.match(orderPdf.headers["content-type"], /application\/pdf/);
+  assert.match(orderPdf.headers["content-disposition"], /attachment/);
+  assert.match(orderPdf.body.toString("latin1"), /Proveedor compras/);
+  assert.match(orderPdf.body.toString("latin1"), /1234\.50 COP/);
+  await get(`/api/v1/purchase-orders/${created.body.id}/pdf`).expect(200);
+  await get(
+    `/api/v1/purchase-orders/${created.body.id}/pdf`,
+    sessions.unassignedAdministrator,
+  ).expect(404);
+  const [[orderAfterPdf]] = await pool.execute(
+    `SELECT po.version, po.status,
+       (SELECT COUNT(*) FROM purchase_receipts receipt
+         WHERE receipt.purchase_order_id = po.id) AS receipts
+     FROM purchase_orders po WHERE po.id = ?`,
+    [created.body.id],
+  );
+  assert.deepEqual(orderAfterPdf, orderBeforePdf);
 
   const unitChange = await mutate(
     "patch",
@@ -848,6 +876,41 @@ test("a confirmed purchase order records a partial receipt through its inventory
   assert.equal(received.body.lines[0].receivedBefore, 0);
   assert.equal(received.body.lines[0].receivedQuantity, 2);
   assert.equal(received.body.lines[0].pendingQuantity, 2);
+  const [[receiptBeforePdf]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_operations
+         WHERE source_type = 'purchase_receipt' AND source_id = ?) AS operations,
+       (SELECT COUNT(*) FROM inventory_movements movement
+         JOIN inventory_operations operation ON operation.id = movement.operation_id
+         WHERE operation.source_type = 'purchase_receipt' AND operation.source_id = ?) AS movements,
+       (SELECT COUNT(*) FROM purchase_receipts
+         WHERE purchase_order_id = ?) AS receipts`,
+    [received.body.id, received.body.id, created.body.id],
+  );
+  const receiptPdfPath = `/api/v1/purchase-orders/${created.body.id}/receipts/${received.body.id}/pdf`;
+  const receiptPdf = await get(receiptPdfPath).expect(200);
+  assert.match(receiptPdf.headers["content-type"], /application\/pdf/);
+  assert.match(receiptPdf.headers["content-disposition"], /attachment/);
+  assert.match(
+    receiptPdf.body.toString("latin1"),
+    /Comprobante de recepción de compra/,
+  );
+  assert.match(receiptPdf.body.toString("latin1"), /100\.25 COP/);
+  assert.match(receiptPdf.body.toString("latin1"), /200\.50 COP/);
+  await get(receiptPdfPath).expect(200);
+  await get(receiptPdfPath, sessions.unassignedAdministrator).expect(404);
+  const [[receiptAfterPdf]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_operations
+         WHERE source_type = 'purchase_receipt' AND source_id = ?) AS operations,
+       (SELECT COUNT(*) FROM inventory_movements movement
+         JOIN inventory_operations operation ON operation.id = movement.operation_id
+         WHERE operation.source_type = 'purchase_receipt' AND operation.source_id = ?) AS movements,
+       (SELECT COUNT(*) FROM purchase_receipts
+         WHERE purchase_order_id = ?) AS receipts`,
+    [received.body.id, received.body.id, created.body.id],
+  );
+  assert.deepEqual(receiptAfterPdf, receiptBeforePdf);
 
   const replay = await mutate(
     "post",

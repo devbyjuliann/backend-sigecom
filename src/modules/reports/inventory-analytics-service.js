@@ -281,6 +281,8 @@ function idValues(ids) {
   return { sql: ids.map(() => "?").join(","), values: ids };
 }
 
+// Keep the indexed equality beside the BINARY check: lookups use
+// (source_type, source_id) without weakening exact identifier matching.
 function expectedDocumentEffectsCte() {
   return `expected_document_effects AS (
     SELECT 'sale_issue' AS operation_type, 'sale' AS source_type,
@@ -292,7 +294,9 @@ function expectedDocumentEffectsCte() {
       JOIN sale_lines sl ON sl.sale_id=s.id
         AND (scope.product_id IS NULL OR scope.product_id=sl.product_id)
       LEFT JOIN inventory_operations io ON io.operation_type='sale_issue'
-        AND io.source_type='sale' AND BINARY io.source_id=BINARY CAST(s.id AS CHAR)
+        AND io.source_type='sale'
+        AND io.source_id=CAST(s.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+        AND BINARY io.source_id=BINARY CAST(s.id AS CHAR)
      WHERE s.confirmed_at IS NOT NULL AND s.status IN ('confirmed','cancelled')
     UNION ALL
     SELECT 'sale_reversal','sale_cancellation',CAST(sc.id AS CHAR),s.warehouse_id,
@@ -305,7 +309,9 @@ function expectedDocumentEffectsCte() {
       JOIN sale_lines sl ON sl.sale_id=s.id
         AND (scope.product_id IS NULL OR scope.product_id=sl.product_id)
       LEFT JOIN inventory_operations io ON io.operation_type='sale_reversal'
-        AND io.source_type='sale_cancellation' AND BINARY io.source_id=BINARY CAST(sc.id AS CHAR)
+        AND io.source_type='sale_cancellation'
+        AND io.source_id=CAST(sc.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+        AND BINARY io.source_id=BINARY CAST(sc.id AS CHAR)
     UNION ALL
     SELECT 'customer_return','customer_return',CAST(cr.id AS CHAR),s.warehouse_id,
            crl.product_id,'IN',crl.quantity_restocked,crl.unit_snapshot,
@@ -318,7 +324,9 @@ function expectedDocumentEffectsCte() {
         AND crl.sale_id=cr.sale_id AND crl.quantity_restocked>0
         AND (scope.product_id IS NULL OR scope.product_id=crl.product_id)
       LEFT JOIN inventory_operations io ON io.operation_type='customer_return'
-        AND io.source_type='customer_return' AND BINARY io.source_id=BINARY CAST(cr.id AS CHAR)
+        AND io.source_type='customer_return'
+        AND io.source_id=CAST(cr.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+        AND BINARY io.source_id=BINARY CAST(cr.id AS CHAR)
     UNION ALL
     SELECT 'purchase_receipt','purchase_receipt',CAST(pr.id AS CHAR),po.warehouse_id,
            pol.product_id,'IN',prl.quantity,pol.unit_snapshot,
@@ -333,7 +341,9 @@ function expectedDocumentEffectsCte() {
         AND pol.purchase_order_id=pr.purchase_order_id
         AND (scope.product_id IS NULL OR scope.product_id=pol.product_id)
       LEFT JOIN inventory_operations io ON io.operation_type='purchase_receipt'
-        AND io.source_type='purchase_receipt' AND BINARY io.source_id=BINARY CAST(pr.id AS CHAR)
+        AND io.source_type='purchase_receipt'
+        AND io.source_id=CAST(pr.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+        AND BINARY io.source_id=BINARY CAST(pr.id AS CHAR)
     UNION ALL
     SELECT 'supplier_return','supplier_return',CAST(sr.id AS CHAR),po.warehouse_id,
            srl.product_id,'OUT',srl.quantity,srl.unit_snapshot,
@@ -347,7 +357,9 @@ function expectedDocumentEffectsCte() {
         AND srl.purchase_receipt_id=sr.purchase_receipt_id
         AND (scope.product_id IS NULL OR scope.product_id=srl.product_id)
       LEFT JOIN inventory_operations io ON io.operation_type='supplier_return'
-        AND io.source_type='supplier_return' AND BINARY io.source_id=BINARY CAST(sr.id AS CHAR)
+        AND io.source_type='supplier_return'
+        AND io.source_id=CAST(sr.id AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+        AND BINARY io.source_id=BINARY CAST(sr.id AS CHAR)
   )`;
 }
 
@@ -357,9 +369,13 @@ function uncreditedDocumentEffectsCte() {
      WHERE NOT EXISTS (
        SELECT 1 FROM inventory_operations io
        JOIN inventory_movements im ON im.operation_id=io.id
-        WHERE BINARY io.operation_type=BINARY e.operation_type
-          AND BINARY io.source_type=BINARY e.source_type
-          AND BINARY io.source_id=BINARY e.source_id AND io.source_warehouse_id=e.warehouse_id
+         WHERE io.operation_type=e.operation_type COLLATE utf8mb4_unicode_ci
+           AND io.source_type=e.source_type COLLATE utf8mb4_unicode_ci
+           AND io.source_id=e.source_id COLLATE utf8mb4_unicode_ci
+           AND BINARY io.operation_type=BINARY e.operation_type
+           AND BINARY io.source_type=BINARY e.source_type
+           AND BINARY io.source_id=BINARY e.source_id
+           AND io.source_warehouse_id=e.warehouse_id
           AND im.product_id=e.product_id AND im.warehouse_id=e.warehouse_id
           AND BINARY im.direction=BINARY e.direction AND im.quantity=e.quantity
           AND BINARY im.unit_snapshot=BINARY e.unit_snapshot
@@ -702,67 +718,76 @@ export function createInventoryReportsService({ dbPool }) {
         productStatus,
       });
       const filteredSql = ctes.sql;
-      const [summaryRows] = await tx.execute(
-        `${filteredSql} SELECT unit, SUM(CASE WHEN verified=1 THEN quantity ELSE 0 END) AS verified_quantity,
-          SUM(verified) AS verified_pairs, SUM(unverified) AS excluded_pairs,
-          SUM(inconsistent) AS inconsistent_pairs,
-          SUM(insufficient) AS insufficient_pairs,
-          SUM(positive) AS positive_pairs, SUM(depleted) AS depleted_pairs,
-          SUM(below_minimum) AS below_minimum_pairs,
-          SUM(verified=1 AND product_active=0) AS inactive_product_pairs,
-          COUNT(*) AS candidate_pairs
-          FROM filtered_eligible GROUP BY unit ORDER BY unit`,
-        ctes.values,
+      // The sentinel preserves a zero-valued grand total for an empty scope.
+      const [reportRows] = await tx.execute(
+        `${filteredSql}, stock_rows AS (
+          SELECT filtered_eligible.*,0 AS is_sentinel FROM filtered_eligible
+          UNION ALL
+          SELECT NULL,NULL,NULL,NULL,'',0,0,0,0,0,0,0,0,0,0,1
+        ), stock_rollup AS (
+          SELECT unit, warehouse_id,
+            CASE WHEN warehouse_id IS NULL THEN NULL ELSE MAX(warehouse_code) END AS warehouse_code,
+            CASE WHEN warehouse_id IS NULL THEN NULL ELSE MAX(warehouse_name) END AS warehouse_name,
+            CASE WHEN warehouse_id IS NULL THEN NULL ELSE MAX(warehouse_active) END AS warehouse_active,
+            SUM(CASE WHEN is_sentinel=0 AND verified=1 THEN quantity ELSE 0 END) AS verified_quantity,
+            COUNT(CASE WHEN is_sentinel=0 THEN 1 END) AS candidate_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN verified ELSE 0 END) AS verified_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN unverified ELSE 0 END) AS excluded_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN inconsistent ELSE 0 END) AS inconsistent_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN insufficient ELSE 0 END) AS insufficient_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN positive ELSE 0 END) AS positive_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN depleted ELSE 0 END) AS depleted_pairs,
+            SUM(CASE WHEN is_sentinel=0 THEN below_minimum ELSE 0 END) AS below_minimum_pairs,
+            SUM(CASE WHEN is_sentinel=0 AND verified=1 AND product_active=0 THEN 1 ELSE 0 END)
+              AS inactive_product_pairs
+            FROM stock_rows
+           GROUP BY unit,warehouse_id WITH ROLLUP
+        ), stock_classified AS (
+          SELECT stock_rollup.*,
+            CASE WHEN unit='' THEN 'sentinel'
+                 WHEN unit IS NULL THEN 'totals'
+                 WHEN warehouse_id IS NULL THEN 'unit'
+                 ELSE 'group' END AS row_type
+            FROM stock_rollup
+        ), stock_ranked AS (
+          SELECT stock_classified.*,
+            CASE WHEN row_type='group' THEN
+              ROW_NUMBER() OVER (
+                PARTITION BY row_type
+                ORDER BY warehouse_name,warehouse_id,unit
+              )
+            END AS group_row_number,
+            COUNT(CASE WHEN row_type='group' THEN 1 END) OVER () AS group_count
+            FROM stock_classified
+        )
+        SELECT row_type,unit,warehouse_id,warehouse_code,warehouse_name,warehouse_active,
+               verified_quantity,candidate_pairs,verified_pairs,excluded_pairs,
+               inconsistent_pairs,insufficient_pairs,positive_pairs,depleted_pairs,
+               below_minimum_pairs,inactive_product_pairs,group_count
+          FROM stock_ranked
+         WHERE row_type<>'sentinel'
+           AND (row_type<>'group' OR (group_row_number>? AND group_row_number<=?))
+         ORDER BY CASE row_type WHEN 'unit' THEN 1 WHEN 'totals' THEN 2 ELSE 3 END,
+                  warehouse_name,warehouse_id,unit`,
+        [...ctes.values, paging.offset, paging.offset + paging.pageSize],
       );
-      const [[totals]] = await tx.execute(
-        `${filteredSql} SELECT COUNT(*) AS candidate_pairs, SUM(verified) AS verified_pairs,
-          SUM(unverified) AS excluded_pairs, SUM(inconsistent) AS inconsistent_pairs,
-          SUM(insufficient) AS insufficient_pairs, SUM(positive) AS positive_pairs,
-          SUM(depleted) AS depleted_pairs, SUM(below_minimum) AS below_minimum_pairs,
-          SUM(verified=1 AND product_active=0) AS inactive_product_pairs
-          FROM filtered_eligible`,
-        ctes.values,
-      );
-      const [[countRow]] = await tx.execute(
-        `${filteredSql} SELECT COUNT(*) AS total FROM (
-           SELECT warehouse_id, unit FROM filtered_eligible GROUP BY warehouse_id, unit
-        ) grouped`,
-        ctes.values,
-      );
-      const [groups] = await tx.execute(
-        `${filteredSql} SELECT warehouse_id, warehouse_code, warehouse_name, warehouse_active,
-          unit, SUM(CASE WHEN verified=1 THEN quantity ELSE 0 END) AS verified_quantity,
-          COUNT(*) AS candidate_pairs,
-          SUM(verified) AS verified_pairs, SUM(unverified) AS excluded_pairs,
-          SUM(inconsistent) AS inconsistent_pairs,
-          SUM(insufficient) AS insufficient_pairs,
-          SUM(positive) AS positive_pairs, SUM(depleted) AS depleted_pairs,
-          SUM(below_minimum) AS below_minimum_pairs,
-          SUM(verified=1 AND product_active=0) AS inactive_product_pairs
-          FROM filtered_eligible GROUP BY warehouse_id,warehouse_code,warehouse_name,warehouse_active,unit
-         ORDER BY warehouse_name,warehouse_id,unit LIMIT ? OFFSET ?`,
-        [...ctes.values, paging.pageSize, paging.offset],
-      );
-      return {
-        summary: {
-          ...Object.fromEntries(
-            Object.entries(totals).map(([key, value]) => [
-              key.replace(/_([a-z])/g, (_, c) => c.toUpperCase()),
-              String(value ?? "0"),
-            ]),
-          ),
-          units: summaryRows.map((row) => ({
-            unit: row.unit,
-            candidatePairs: String(row.candidate_pairs),
-            verifiedPairs: String(row.verified_pairs),
-            quantity: String(row.verified_quantity ?? "0"),
-            excludedPairs: String(row.excluded_pairs),
-            inconsistentPairs: String(row.inconsistent_pairs),
-            insufficientPairs: String(row.insufficient_pairs),
-            inactiveProductPairs: String(row.inactive_product_pairs),
-          })),
-        },
-        groups: groups.map((row) => ({
+      const units = reportRows
+        .filter(({ row_type }) => row_type === "unit")
+        .map((row) => ({
+          unit: row.unit,
+          candidatePairs: String(row.candidate_pairs),
+          verifiedPairs: String(row.verified_pairs),
+          quantity: String(row.verified_quantity ?? "0"),
+          excludedPairs: String(row.excluded_pairs),
+          inconsistentPairs: String(row.inconsistent_pairs),
+          insufficientPairs: String(row.insufficient_pairs),
+          inactiveProductPairs: String(row.inactive_product_pairs),
+        }));
+      const totals =
+        reportRows.find(({ row_type }) => row_type === "totals") ?? {};
+      const groups = reportRows
+        .filter(({ row_type }) => row_type === "group")
+        .map((row) => ({
           warehouseId: String(row.warehouse_id),
           warehouseCode: row.warehouse_code,
           warehouseName: row.warehouse_name,
@@ -778,8 +803,22 @@ export function createInventoryReportsService({ dbPool }) {
           depletedPairs: String(row.depleted_pairs),
           belowMinimumPairs: String(row.below_minimum_pairs),
           inactiveProductPairs: String(row.inactive_product_pairs),
-        })),
-        pagination: pagination(paging.page, paging.pageSize, countRow.total),
+        }));
+      const groupCount = String(reportRows[0]?.group_count ?? "0");
+      return {
+        summary: {
+          ...Object.fromEntries(
+            Object.entries(totals)
+              .filter(([key]) => key.endsWith("_pairs"))
+              .map(([key, value]) => [
+                key.replace(/_([a-z])/g, (_, c) => c.toUpperCase()),
+                String(value ?? "0"),
+              ]),
+          ),
+          units,
+        },
+        groups,
+        pagination: pagination(paging.page, paging.pageSize, groupCount),
         coverage: {
           observation: "product_warehouse_pairs",
           candidateUniverse:

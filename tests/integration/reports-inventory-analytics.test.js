@@ -395,6 +395,30 @@ test("current stock aggregates only authorized, fully verified balance pairs", a
   assert.equal(result.groups[0].unit, "unidad");
 });
 
+test("current stock evaluates its integrity CTE in one SQL statement", async () => {
+  const inventoryQueries = [];
+  const monitoredConnection = {
+    execute: (...args) => {
+      if (String(args[0]).includes("WITH scoped_balances AS")) {
+        inventoryQueries.push(args[0]);
+      }
+      return connection.execute(...args);
+    },
+    query: connection.query.bind(connection),
+  };
+
+  const result = await analytics.currentStock({
+    auth,
+    connection: monitoredConnection,
+    page: 1,
+    pageSize: 20,
+  });
+
+  assert.equal(inventoryQueries.length, 1);
+  assert.equal(result.summary.candidatePairs, "0");
+  assert.deepEqual(result.groups, []);
+});
+
 test("a confirmed sale without its issue movement makes only its product balance unverifiable", async () => {
   await engine.createOperation({
     userId: auth.user.id,

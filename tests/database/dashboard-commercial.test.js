@@ -11,6 +11,8 @@ test("commercial dashboard queries require module and warehouse permissions and 
         return [[{ month: "2026-11", value: "110.00" }]];
       if (sql.includes("dashboard:purchasesReceived"))
         return [[{ value: "80.25" }]];
+      if (sql.includes("dashboard:inventoryValue"))
+        return [[{ value: "825.50" }]];
       if (sql.includes("dashboard:stockedProducts")) return [[{ total: "6" }]];
       if (sql.includes("dashboard:lowStock")) return [[{ total: "2" }]];
       if (sql.includes("dashboard:pendingReceipts")) return [[{ total: "3" }]];
@@ -60,6 +62,7 @@ test("commercial dashboard queries require module and warehouse permissions and 
     "sales.read",
     "purchases.read",
     "inventory.read",
+    "products.read",
     "warehouses.read",
   ]);
 
@@ -77,6 +80,7 @@ test("commercial dashboard queries require module and warehouse permissions and 
     },
     salesNet: { available: true, value: "110.00" },
     purchasesReceived: { available: true, value: "80.25" },
+    inventoryValue: { available: true, value: "825.50" },
     stockedProducts: { available: true, value: 6 },
     lowStockProducts: { available: true, value: 2 },
     pendingReceipts: { available: true, value: 3 },
@@ -128,11 +132,7 @@ test("commercial dashboard queries require module and warehouse permissions and 
     },
   });
   const commercialCalls = calls.filter(({ sql }) => /dashboard:/.test(sql));
-  assert.equal(commercialCalls.length, 8);
-  assert.equal(
-    commercialCalls.some(({ sql }) => sql.includes("inventoryValue")),
-    false,
-  );
+  assert.equal(commercialCalls.length, 9);
   assert.ok(commercialCalls.every(({ sql }) => /user_warehouses/.test(sql)));
   assert.ok(commercialCalls.every(({ values }) => values.includes("17")));
   assert.ok(
@@ -176,6 +176,10 @@ test("commercial metrics remain unavailable and execute no commercial query with
     available: false,
     value: null,
   });
+  assert.deepEqual(summary.commercial.inventoryValue, {
+    available: false,
+    value: null,
+  });
   assert.deepEqual(summary.commercial.salesTrend, {
     available: false,
     items: null,
@@ -205,4 +209,31 @@ test("commercial metrics remain unavailable and execute no commercial query with
     value: null,
   });
   assert.equal(calls, 1);
+});
+
+test("inventory value requires catalog cost permission as well as inventory and warehouse scope", async () => {
+  const calls = [];
+  const service = createDashboardService({
+    dbPool: {
+      async execute(sql, values = []) {
+        calls.push({ sql, values });
+        return [[{ total: "0" }]];
+      },
+    },
+  });
+
+  const summary = await service.getSummary({
+    userId: "17",
+    permissions: new Set(["inventory.read", "warehouses.read"]),
+    now: new Date("2026-11-14T12:00:00.000Z"),
+  });
+
+  assert.deepEqual(summary.commercial.inventoryValue, {
+    available: false,
+    value: null,
+  });
+  assert.equal(
+    calls.some(({ sql }) => sql.includes("dashboard:inventoryValue")),
+    false,
+  );
 });

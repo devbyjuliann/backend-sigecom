@@ -4,6 +4,8 @@ import { authenticate, requirePermission } from "../auth/auth-middleware.js";
 import { HttpError } from "../../shared/http-error.js";
 import { createSaleService } from "./sale-service.js";
 import { createSaleReversalPdf } from "./sale-reversal-pdf.js";
+import { createSaleConfirmationPdf } from "./sale-confirmation-pdf.js";
+import { generateDocumentBestEffort } from "../../shared/document-generation.js";
 
 const idPattern = /^[1-9]\d{0,19}$/;
 const moneyPattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/;
@@ -275,7 +277,38 @@ export function createSaleRouter({ dbPool, authConfig }) {
         request,
         key: idempotencyKey(request),
       });
+      await generateDocumentBestEffort({
+        generate: () => createSaleConfirmationPdf(sale),
+        logger: request.log,
+        entityType: "sale",
+        entityId: sale.id,
+      });
       response.json(sale);
+    },
+  );
+
+  router.get(
+    "/:id/pdf",
+    auth,
+    requirePermission("sales.read"),
+    async (request, response) => {
+      if (!idPattern.test(request.params.id))
+        throw new HttpError(400, "INVALID_SALE_ID", "Indica una venta válida.");
+      const sale = await service.getById(request.params.id, {
+        warehouseIds: [...request.auth.historicalWarehouseIds],
+      });
+      if (!sale.confirmedAt)
+        throw new HttpError(
+          409,
+          "SALE_NOT_CONFIRMED",
+          "El comprobante PDF está disponible después de confirmar la venta.",
+        );
+      const pdf = createSaleConfirmationPdf(sale);
+      response
+        .set("Cache-Control", "no-store")
+        .type("application/pdf")
+        .attachment(`venta-${request.params.id}.pdf`)
+        .send(pdf);
     },
   );
 

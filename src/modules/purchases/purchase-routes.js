@@ -3,6 +3,9 @@ import { z } from "zod";
 import { authenticate, requirePermission } from "../auth/auth-middleware.js";
 import { HttpError } from "../../shared/http-error.js";
 import { createPurchaseService, maxQuantity } from "./purchase-service.js";
+import { generateDocumentBestEffort } from "../../shared/document-generation.js";
+import { createPurchaseOrderPdf } from "./purchase-order-pdf.js";
+import { createPurchaseReceiptPdf } from "./purchase-receipt-pdf.js";
 
 const idPattern = /^[1-9]\d{0,19}$/;
 const moneyPattern = /^(?:0|[1-9]\d{0,12})(?:\.\d{1,2})?$/;
@@ -319,6 +322,19 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
         idempotencyKey: request.idempotencyKey,
         request,
       });
+      await generateDocumentBestEffort({
+        generate: async () => {
+          const document = await service.getReceiptPdfDocument({
+            orderId,
+            receiptId: receipt.id,
+            userId: request.auth.user.id,
+          });
+          return createPurchaseReceiptPdf(document);
+        },
+        logger: request.log,
+        entityType: "purchase_receipt",
+        entityId: receipt.id,
+      });
       response
         .status(receipt.replayed ? 200 : 201)
         .set("Cache-Control", "no-store")
@@ -339,6 +355,27 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
         userId: request.auth.user.id,
       });
       response.set("Cache-Control", "no-store").json(receipt);
+    },
+  );
+
+  router.get(
+    "/:id/receipts/:receiptId/pdf",
+    requireSession,
+    requirePermission("purchases.read"),
+    async (request, response) => {
+      const orderId = parse(idSchema, request.params.id);
+      const receiptId = parse(idSchema, request.params.receiptId);
+      const document = await service.getReceiptPdfDocument({
+        orderId,
+        receiptId,
+        userId: request.auth.user.id,
+      });
+      const pdf = createPurchaseReceiptPdf(document);
+      response
+        .set("Cache-Control", "no-store")
+        .type("application/pdf")
+        .attachment(`recepcion-compra-${receiptId}.pdf`)
+        .send(pdf);
     },
   );
 
@@ -369,6 +406,28 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
         request,
       });
       response.status(201).set("Cache-Control", "no-store").json(order);
+    },
+  );
+
+  router.get(
+    "/:id/pdf",
+    requireSession,
+    requirePermission("purchases.read"),
+    async (request, response) => {
+      const id = parse(idSchema, request.params.id);
+      const order = await service.getById(id, request.auth.user.id);
+      if (!order.confirmedAt)
+        throw new HttpError(
+          409,
+          "PURCHASE_ORDER_NOT_CONFIRMED",
+          "El documento PDF está disponible después de confirmar la orden.",
+        );
+      const pdf = createPurchaseOrderPdf(order);
+      response
+        .set("Cache-Control", "no-store")
+        .type("application/pdf")
+        .attachment(`orden-compra-${id}.pdf`)
+        .send(pdf);
     },
   );
 
@@ -429,6 +488,12 @@ export function createPurchaseRouter({ dbPool, authConfig }) {
         input: parse(confirmSchema, request.body),
         userId: request.auth.user.id,
         request,
+      });
+      await generateDocumentBestEffort({
+        generate: () => createPurchaseOrderPdf(order),
+        logger: request.log,
+        entityType: "purchase_order",
+        entityId: order.id,
       });
       response.set("Cache-Control", "no-store").json(order);
     },

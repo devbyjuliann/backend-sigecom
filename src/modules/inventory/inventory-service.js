@@ -1,4 +1,5 @@
 import { HttpError } from "../../shared/http-error.js";
+import { LOW_STOCK_SQL, isLowStock } from "./stock-criteria.js";
 
 const balanceSortColumns = {
   sku: "p.sku",
@@ -54,7 +55,7 @@ function balanceFromRow(row) {
     hasBalance,
     quantity,
     minimumStock,
-    isLowStock: hasBalance && minimumStock > 0 && quantity < minimumStock,
+    isLowStock: isLowStock({ hasBalance, quantity, minimumStock }),
     updatedAt: row.balance_updated_at,
   };
 }
@@ -171,9 +172,7 @@ export function createInventoryService({ dbPool }) {
       values.push(term, term);
     }
     if (stockStatus === "low") {
-      clauses.push(
-        "ib.id IS NOT NULL AND p.minimum_stock > 0 AND ib.quantity < p.minimum_stock",
-      );
+      clauses.push(LOW_STOCK_SQL);
     } else if (stockStatus === "zero") {
       clauses.push("ib.id IS NOT NULL AND ib.quantity = 0");
     } else if (stockStatus === "unregistered") {
@@ -236,7 +235,7 @@ export function createInventoryService({ dbPool }) {
       WHERE ${where}`;
     const having =
       stockStatus === "low"
-        ? "HAVING SUM(ib.id IS NOT NULL AND p.minimum_stock > 0 AND ib.quantity < p.minimum_stock) > 0"
+        ? `HAVING SUM(${LOW_STOCK_SQL}) > 0`
         : stockStatus === "zero"
           ? "HAVING SUM(ib.id IS NOT NULL AND ib.quantity = 0) > 0"
           : stockStatus === "unregistered"
@@ -256,7 +255,7 @@ export function createInventoryService({ dbPool }) {
               COUNT(w.id) AS authorized_warehouse_count,
               COUNT(ib.id) AS registered_balance_count,
               COALESCE(SUM(ib.quantity), 0) AS total_quantity,
-              SUM(ib.id IS NOT NULL AND p.minimum_stock > 0 AND ib.quantity < p.minimum_stock) AS low_stock_warehouse_count,
+              SUM(${LOW_STOCK_SQL}) AS low_stock_warehouse_count,
               SUM(ib.id IS NOT NULL AND ib.quantity = 0) AS zero_balance_count
        ${from}
        GROUP BY p.id, p.sku, p.name, p.category_id, c.name, p.unit,

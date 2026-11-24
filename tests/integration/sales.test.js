@@ -364,6 +364,42 @@ test("confirms a persisted draft atomically, discounts exact stock, and replays 
   assert.ok(confirmed.body.confirmedAt);
   assert.equal(confirmed.body.total, created.body.total);
   assert.deepEqual(confirmed.body.lines, created.body.lines);
+  const [[beforePdfReads]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_operations
+         WHERE source_type = 'sale' AND source_id = ?) AS operations,
+       (SELECT COUNT(*) FROM inventory_movements movement
+         JOIN inventory_operations operation ON operation.id = movement.operation_id
+         WHERE operation.source_type = 'sale' AND operation.source_id = ?) AS movements,
+       (SELECT COUNT(*) FROM audit_events
+         WHERE module = 'sales' AND entity_id = ?) AS audit_events`,
+    [created.body.id, created.body.id, created.body.id],
+  );
+  const salePdf = await get(`/api/v1/sales/${created.body.id}/pdf`).expect(200);
+  assert.match(salePdf.headers["content-type"], /application\/pdf/);
+  assert.match(salePdf.headers["content-disposition"], /attachment/);
+  assert.match(
+    salePdf.body.toString("latin1"),
+    /Comprobante de venta confirmada/,
+  );
+  assert.match(salePdf.body.toString("latin1"), /1234\.50 COP/);
+  await get(`/api/v1/sales/${created.body.id}/pdf`).expect(200);
+  await get(
+    `/api/v1/sales/${created.body.id}/pdf`,
+    sessions.unassignedAdmin,
+  ).expect(404);
+  const [[afterPdfReads]] = await pool.execute(
+    `SELECT
+       (SELECT COUNT(*) FROM inventory_operations
+         WHERE source_type = 'sale' AND source_id = ?) AS operations,
+       (SELECT COUNT(*) FROM inventory_movements movement
+         JOIN inventory_operations operation ON operation.id = movement.operation_id
+         WHERE operation.source_type = 'sale' AND operation.source_id = ?) AS movements,
+       (SELECT COUNT(*) FROM audit_events
+         WHERE module = 'sales' AND entity_id = ?) AS audit_events`,
+    [created.body.id, created.body.id, created.body.id],
+  );
+  assert.deepEqual(afterPdfReads, beforePdfReads);
   await mutate(
     "patch",
     `/api/v1/sales/${created.body.id}`,
@@ -443,6 +479,7 @@ test("insufficient stock and catalog changes reject confirmation without partial
     sessions.administrator,
     `shortage-create-${suffix}`,
   ).expect(201);
+  await get(`/api/v1/sales/${shortage.body.id}/pdf`).expect(409);
   const [[before]] = await pool.execute(
     `SELECT quantity, CAST(version AS CHAR) AS version FROM inventory_balances
      WHERE product_id = ? AND warehouse_id = ?`,

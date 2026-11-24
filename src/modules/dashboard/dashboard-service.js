@@ -1,4 +1,5 @@
 import { bogotaUtcBoundaries } from "../reports/sales-activity-service.js";
+import { LOW_STOCK_SQL } from "../inventory/stock-criteria.js";
 
 function unavailableIndicator() {
   return { available: false, value: null };
@@ -82,6 +83,7 @@ export function createDashboardService({ dbPool }) {
       },
       salesNet: unavailableIndicator(),
       purchasesReceived: unavailableIndicator(),
+      inventoryValue: unavailableIndicator(),
       stockedProducts: unavailableIndicator(),
       lowStockProducts: unavailableIndicator(),
       pendingReceipts: unavailableIndicator(),
@@ -98,6 +100,8 @@ export function createDashboardService({ dbPool }) {
       permissions.has("purchases.read") && permissions.has("warehouses.read");
     const hasInventoryScope =
       permissions.has("inventory.read") && permissions.has("warehouses.read");
+    const hasInventoryValueScope =
+      hasInventoryScope && permissions.has("products.read");
 
     if (hasSalesScope) {
       const salesPeriods = recentBogotaPeriods(now);
@@ -297,6 +301,26 @@ export function createDashboardService({ dbPool }) {
     }
 
     if (hasInventoryScope) {
+      if (hasInventoryValueScope) {
+        queries.push(
+          firstRow(
+            dbPool,
+            `/* dashboard:inventoryValue */
+             SELECT CAST(COALESCE(SUM(ib.quantity * p.purchase_price), 0) AS CHAR) AS value
+               FROM inventory_balances ib
+               JOIN products p ON p.id = ib.product_id
+              WHERE ib.warehouse_id IN (
+                SELECT uw.warehouse_id FROM user_warehouses uw WHERE uw.user_id = ?
+              )`,
+            [userId],
+          ).then((row) => {
+            commercial.inventoryValue = {
+              available: true,
+              value: decimalText(decimalCents(row.value ?? "0")),
+            };
+          }),
+        );
+      }
       queries.push(
         firstRow(
           dbPool,
@@ -319,12 +343,12 @@ export function createDashboardService({ dbPool }) {
           dbPool,
           `/* dashboard:lowStock */
            SELECT COUNT(*) AS total
-             FROM products product
-            WHERE product.is_active = 1 AND EXISTS (
+             FROM products p
+            WHERE p.is_active = 1 AND EXISTS (
               SELECT 1 FROM user_warehouses uw
-              LEFT JOIN inventory_balances ib
-                ON ib.warehouse_id = uw.warehouse_id AND ib.product_id = product.id
-              WHERE uw.user_id = ? AND COALESCE(ib.quantity, 0) <= product.minimum_stock
+              JOIN inventory_balances ib
+                ON ib.warehouse_id = uw.warehouse_id AND ib.product_id = p.id
+              WHERE uw.user_id = ? AND ${LOW_STOCK_SQL}
             )`,
           [userId],
         ).then((row) => {

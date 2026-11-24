@@ -35,6 +35,7 @@ let roleIds = {};
 let warehouseIds = {};
 let migrator;
 const fixtures = new IntegrationFixtures({ suite: "dashboard" });
+const stockFixturePrefix = `DASH-${suffix}-STOCK-`;
 
 async function signIn(email) {
   const csrf = await request(app).get("/api/v1/auth/csrf").expect(200);
@@ -185,6 +186,93 @@ before(async () => {
     ],
   );
 
+  const [stockCategory] = await pool.execute(
+    "INSERT INTO categories (name, description) VALUES (?, ?)",
+    [
+      `Dashboard stock ${suffix}`,
+      "Productos para verificar stock y valoración.",
+    ],
+  );
+  const stockCases = [
+    {
+      code: "MIN0-POSITIVE",
+      minimum: 0,
+      quantity: 3,
+      price: "11.00",
+      warehouse: "A",
+    },
+    {
+      code: "MIN0-ZERO",
+      minimum: 0,
+      quantity: 0,
+      price: "50.00",
+      warehouse: "A",
+    },
+    {
+      code: "MIN5-NO-BALANCE",
+      minimum: 5,
+      quantity: null,
+      price: "500.00",
+      warehouse: "A",
+    },
+    {
+      code: "MIN5-EXHAUSTED",
+      minimum: 5,
+      quantity: 0,
+      price: "10.00",
+      warehouse: "A",
+    },
+    {
+      code: "MIN5-LOW",
+      minimum: 5,
+      quantity: 4,
+      price: "3.25",
+      warehouse: "A",
+    },
+    {
+      code: "MIN5-AT",
+      minimum: 5,
+      quantity: 5,
+      price: "7.00",
+      warehouse: "A",
+    },
+    {
+      code: "MIN5-ABOVE",
+      minimum: 5,
+      quantity: 6,
+      price: "2.00",
+      warehouse: "A",
+    },
+    {
+      code: "UNASSIGNED-LOW",
+      minimum: 5,
+      quantity: 4,
+      price: "99.00",
+      warehouse: "U",
+    },
+  ];
+  for (const item of stockCases) {
+    const [product] = await pool.execute(
+      `INSERT INTO products
+        (sku, name, category_id, unit, purchase_price, sale_price, minimum_stock)
+       VALUES (?, ?, ?, 'unidad', ?, 100.00, ?)`,
+      [
+        `${stockFixturePrefix}${item.code}`,
+        `Dashboard stock ${item.code} ${suffix}`,
+        stockCategory.insertId,
+        item.price,
+        item.minimum,
+      ],
+    );
+    if (item.quantity !== null) {
+      await pool.execute(
+        `INSERT INTO inventory_balances (product_id, warehouse_id, quantity)
+         VALUES (?, ?, ?)`,
+        [product.insertId, warehouseIds[item.warehouse], item.quantity],
+      );
+    }
+  }
+
   for (const [roleCode, email] of Object.entries(emails)) {
     sessions[roleCode] = await signIn(email);
   }
@@ -199,6 +287,12 @@ after(async () => {
       "SELECT DATABASE() AS name",
     );
     assert.equal(database.name, "sigecom_test");
+    await cleanupConnection.execute(
+      `DELETE balance FROM inventory_balances balance
+       JOIN products product ON product.id = balance.product_id
+       WHERE product.sku LIKE ?`,
+      [`${stockFixturePrefix}%`],
+    );
     await cleanupConnection.execute("DELETE FROM products WHERE sku LIKE ?", [
       `DASH-${suffix}-%`,
     ]);
@@ -308,6 +402,55 @@ test("dashboard returns real authorized counts and category aggregation", async 
       !Object.hasOwn(response.body, "inventoryValue") &&
       !Object.hasOwn(response.body, "recentActivity"),
   );
+});
+
+test("dashboard stock and cost indicators distinguish threshold edge cases and honor each user's warehouse scope", async () => {
+  const administrator = await getDashboard(sessions.administrator).expect(200);
+  const [[fixtureLowStock]] = await pool.execute(
+    `SELECT COUNT(DISTINCT product.id) AS total
+     FROM products product
+     JOIN inventory_balances balance ON balance.product_id = product.id
+     JOIN user_warehouses access ON access.warehouse_id = balance.warehouse_id
+     WHERE product.sku LIKE ? AND access.user_id = ?
+       AND product.is_active = 1 AND product.minimum_stock > 0
+       AND balance.quantity < product.minimum_stock`,
+    [`${stockFixturePrefix}%`, users.administrator],
+  );
+  const [[expectedAdministratorLowStock]] = await pool.execute(
+    `SELECT COUNT(DISTINCT product.id) AS total
+     FROM products product
+     JOIN inventory_balances balance ON balance.product_id = product.id
+     JOIN user_warehouses access ON access.warehouse_id = balance.warehouse_id
+     WHERE access.user_id = ? AND product.is_active = 1
+       AND product.minimum_stock > 0 AND balance.quantity < product.minimum_stock`,
+    [users.administrator],
+  );
+  const [[expectedAdministratorValue]] = await pool.execute(
+    `SELECT CAST(COALESCE(SUM(balance.quantity * product.purchase_price), 0) AS CHAR) AS value
+     FROM inventory_balances balance
+     JOIN products product ON product.id = balance.product_id
+     JOIN user_warehouses access ON access.warehouse_id = balance.warehouse_id
+     WHERE access.user_id = ?`,
+    [users.administrator],
+  );
+
+  assert.equal(Number(fixtureLowStock.total), 2);
+  assert.deepEqual(administrator.body.commercial.lowStockProducts, {
+    available: true,
+    value: Number(expectedAdministratorLowStock.total),
+  });
+  assert.equal(Number(administrator.body.commercial.inventoryValue.value), 93);
+  assert.equal(
+    Number(administrator.body.commercial.inventoryValue.value),
+    Number(expectedAdministratorValue.value),
+  );
+
+  const warehouse = await getDashboard(sessions.warehouse).expect(200);
+  assert.deepEqual(warehouse.body.commercial.lowStockProducts, {
+    available: true,
+    value: 1,
+  });
+  assert.equal(Number(warehouse.body.commercial.inventoryValue.value), 396);
 });
 
 test("dashboard requires an active authenticated session and dashboard.read", async () => {

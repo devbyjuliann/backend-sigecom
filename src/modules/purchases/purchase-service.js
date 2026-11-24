@@ -633,6 +633,55 @@ export function createPurchaseService({ dbPool }) {
     return readReceipt(dbPool, receiptId);
   }
 
+  async function getReceiptPdfDocument({ orderId, receiptId, userId }) {
+    const receipt = await getReceiptById({ orderId, receiptId, userId });
+    const [[header]] = await dbPool.execute(
+      `SELECT DATE_FORMAT(po.order_date, '%Y-%m-%d') AS order_date,
+              po.reference AS purchase_order_reference,
+              supplier.business_name AS supplier_name,
+              supplier.identification_number AS supplier_identification
+       FROM purchase_orders po
+       JOIN suppliers supplier ON supplier.id = po.supplier_id
+       WHERE po.id = ? LIMIT 1`,
+      [orderId],
+    );
+    const [costRows] = await dbPool.execute(
+      `SELECT receipt_line.purchase_order_line_id, order_line.unit_cost
+       FROM purchase_receipt_lines receipt_line
+       JOIN purchase_order_lines order_line
+         ON order_line.id = receipt_line.purchase_order_line_id
+        AND order_line.purchase_order_id = receipt_line.purchase_order_id
+       WHERE receipt_line.purchase_receipt_id = ?
+       ORDER BY order_line.position, order_line.id`,
+      [receiptId],
+    );
+    const costsByOrderLine = new Map(
+      costRows.map((line) => [
+        String(line.purchase_order_line_id),
+        String(line.unit_cost),
+      ]),
+    );
+    return {
+      ...receipt,
+      orderDate: header.order_date,
+      purchaseOrderReference: header.purchase_order_reference,
+      supplierName: header.supplier_name,
+      supplierIdentification: header.supplier_identification,
+      lines: receipt.lines.map((line) => {
+        const unitCost = costsByOrderLine.get(line.purchaseOrderLineId);
+        if (unitCost === undefined)
+          throw new Error(
+            "No se encontró el costo histórico de una recepción.",
+          );
+        return {
+          ...line,
+          unitCost,
+          lineTotal: money(toCents(unitCost) * BigInt(line.quantity)),
+        };
+      }),
+    };
+  }
+
   async function readSupplierReturn(connection, returnId, replayed = false) {
     const [headers] = await connection.execute(
       `SELECT sr.*, po.commercial_code, po.warehouse_id, w.name AS warehouse_name,
@@ -1739,6 +1788,7 @@ export function createPurchaseService({ dbPool }) {
     cancel,
     listReceipts,
     getReceiptById,
+    getReceiptPdfDocument,
     createSupplierReturn,
     listSupplierReturns,
     getSupplierReturn,
