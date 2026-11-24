@@ -157,7 +157,7 @@ export function getAuthConfig(env = process.env) {
     cookieName: "sigecom_session",
     csrfCookieName: "sigecom_csrf",
     cookieSecure: env.COOKIE_SECURE === "true",
-    cookieSameSite: "strict",
+    cookieSameSite: production ? "none" : "strict",
     cookiePath: "/api/v1",
     allowedOrigins,
     publicAppOrigin,

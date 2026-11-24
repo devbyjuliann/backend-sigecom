@@ -61,6 +61,17 @@ test("production requires an explicit remote-capable target, separate SQL users 
   );
 });
 
+test("production APP configuration does not require MIGRATOR credentials", () => {
+  const env = productionEnv();
+  delete env.SIGECOM_PROD_MIGRATOR_USER;
+  delete env.SIGECOM_PROD_MIGRATOR_PASSWORD;
+
+  const config = getDatabaseConfig("production", env, "APP");
+
+  assert.equal(config.user, "sigecom_app");
+  assert.equal(config.password, "a".repeat(40));
+});
+
 test("production refuses missing runtime selection, weak secrets, protected schemas and incomplete TLS", () => {
   assert.throws(() => resolveRuntimeDatabaseTarget({}), /NODE_ENV explícito/i);
   assert.throws(
@@ -83,7 +94,6 @@ test("production refuses missing runtime selection, weak secrets, protected sche
       { SIGECOM_PROD_APP_PASSWORD: `${"x".repeat(31)}\n` },
       /no incluir controles/i,
     ],
-    [{ SIGECOM_PROD_MIGRATOR_USER: "sigecom_app" }, /cuentas.*distintas/i],
     [{ SIGECOM_PROD_DATABASE: "sigecom_test" }, /esquema.*protegido/i],
     [{ SIGECOM_PROD_DB_HOST: "https://db.example.internal" }, /host.*válido/i],
     [{ SIGECOM_PROD_DB_PORT: "0" }, /puerto.*válido/i],
@@ -96,6 +106,16 @@ test("production refuses missing runtime selection, weak secrets, protected sche
       error,
     );
   }
+
+  assert.throws(
+    () =>
+      getDatabaseConfig(
+        "production",
+        { ...productionEnv(), SIGECOM_PROD_MIGRATOR_USER: "sigecom_app" },
+        "MIGRATOR",
+      ),
+    /cuentas.*distintas/i,
+  );
 });
 
 test("production migrator configuration requires its own strong credential", () => {

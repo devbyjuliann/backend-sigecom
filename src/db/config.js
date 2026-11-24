@@ -120,8 +120,8 @@ function productionDatabaseConfig(env, role) {
     typeof value === "string" && /^[A-Za-z0-9_]{1,32}$/.test(value);
   if (
     !validUser(appUser) ||
-    !validUser(migratorUser) ||
-    appUser === migratorUser
+    (role === "MIGRATOR" &&
+      (!validUser(migratorUser) || appUser === migratorUser))
   ) {
     throw new Error(
       "Las cuentas SQL production APP y MIGRATOR deben ser válidas y distintas.",

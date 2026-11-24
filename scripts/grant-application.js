@@ -1,4 +1,5 @@
 import { createConnection } from "mysql2/promise";
+import { grantApplicationTablePrivileges } from "../src/db/application-grants.js";
 
 const targets = {
   development: { database: "sigecom_dev", slug: "dev" },
@@ -34,29 +35,10 @@ try {
   if (!database)
     throw new Error(`La base ${target.database} todavía no existe.`);
 
-  const applicationTables = [
-    "users",
-    "user_sessions",
-    "warehouses",
-    "user_warehouses",
-    "categories",
-    "products",
-    "customers",
-    "suppliers",
-    "purchase_orders",
-    "purchase_order_lines",
-    "purchase_receipts",
-    "purchase_receipt_lines",
-    "supplier_returns",
-    "supplier_return_lines",
-    "customer_returns",
-  ];
-
-  for (const table of applicationTables) {
-    await connection.query(
-      `GRANT SELECT, INSERT, UPDATE ON \`${target.database}\`.\`${table}\` TO '${appUser}'@'127.0.0.1'`,
-    );
-  }
+  await grantApplicationTablePrivileges(connection, {
+    database: target.database,
+    appUser,
+  });
 
   for (const [table, revoke, grant] of [
     ["roles", "INSERT, DELETE", "SELECT, UPDATE"],

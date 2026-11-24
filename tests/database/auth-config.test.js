@@ -71,6 +71,18 @@ test("requires secure session cookies in production", () => {
     }).cookieSecure,
     true,
   );
+  assert.equal(
+    getAuthConfig({
+      ...validEnvironment,
+      NODE_ENV: "production",
+      COOKIE_SECURE: "true",
+      FRONTEND_ORIGIN: "https://app.example.com",
+      PUBLIC_APP_ORIGIN: "https://app.example.com",
+      JWT_ISSUER: "sigecom-production",
+      JWT_AUDIENCE: "sigecom-api-production",
+    }).cookieSameSite,
+    "none",
+  );
 });
 
 test("production authentication requires HTTPS origins for credentialed cookies", () => {

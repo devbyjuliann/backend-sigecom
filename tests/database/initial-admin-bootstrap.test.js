@@ -11,6 +11,7 @@ function createHarness({ warehouses = [{ id: "3" }] } = {}) {
     lock: false,
     lockOwner: null,
     nextId: 1,
+    nextWarehouseId: 50,
   };
   let nextConnectionId = 0;
   function createConnection() {
@@ -61,9 +62,28 @@ function createHarness({ warehouses = [{ id: "3" }] } = {}) {
           return [[{ id: 1 }]];
         }
         if (
-          normalized.startsWith("SELECT id FROM warehouses WHERE is_active = 1")
+          normalized.startsWith(
+            "SELECT id, is_active FROM warehouses ORDER BY id",
+          )
         ) {
-          return [state.warehouses.map(({ id }) => ({ id }))];
+          return [
+            state.warehouses.map(({ id, is_active = 1 }) => ({
+              id,
+              is_active,
+            })),
+          ];
+        }
+        if (normalized.startsWith("INSERT INTO warehouses")) {
+          const [code, name, location] = params;
+          const id = String(state.nextWarehouseId++);
+          state.warehouses.push({
+            id,
+            code,
+            name,
+            location,
+            is_active: 1,
+          });
+          return [{ insertId: id, affectedRows: 1 }];
         }
         if (normalized.startsWith("INSERT INTO users")) {
           const [roleId, email, displayName, passwordHash] = params;
@@ -84,7 +104,7 @@ function createHarness({ warehouses = [{ id: "3" }] } = {}) {
           state.assignments.push({
             user_id: String(userId),
             warehouse_id: String(warehouseId),
-            assigned_by: assignedBy,
+            assigned_by: assignedBy ?? null,
           });
           return [{ affectedRows: 1 }];
         }
@@ -154,6 +174,73 @@ test("bootstrap refuses to create an administrator without an active warehouse",
   assert.equal(state.users.length, 0);
   assert.equal(state.audits.length, 0);
   assert.equal(state.lock, false);
+});
+
+test("initial bootstrap atomically creates the first warehouse and administrator", async () => {
+  const { state, dbPool } = createHarness({ warehouses: [] });
+
+  const created = await createInitialAdmin({
+    dbPool,
+    email: "admin@sigecom.co",
+    displayName: "Administradora inicial",
+    passwordHash: "$2b$12$hash",
+    initialWarehouse: {
+      code: "CENTRAL",
+      name: "Bodega Principal",
+      location: "Bogotá",
+    },
+  });
+
+  assert.equal(state.warehouses.length, 1);
+  assert.equal(state.warehouses[0].code, "CENTRAL");
+  assert.equal(state.warehouses[0].name, "Bodega Principal");
+  assert.deepEqual(created.warehouseIds, [state.warehouses[0].id]);
+  assert.deepEqual(state.assignments, [
+    {
+      user_id: created.id,
+      warehouse_id: state.warehouses[0].id,
+      assigned_by: null,
+    },
+  ]);
+  assert.equal(state.users.length, 1);
+  assert.equal(state.audits.length, 2);
+});
+
+test("initial bootstrap refuses to create a second warehouse", async () => {
+  const { state, dbPool } = createHarness();
+
+  await assert.rejects(
+    createInitialAdmin({
+      dbPool,
+      email: "admin@sigecom.co",
+      displayName: "Administradora inicial",
+      passwordHash: "$2b$12$hash",
+      initialWarehouse: { code: "CENTRAL", name: "Bodega Principal" },
+    }),
+    /Ya existen bodegas/,
+  );
+
+  assert.equal(state.warehouses.length, 1);
+  assert.equal(state.users.length, 0);
+  assert.equal(state.audits.length, 0);
+  assert.equal(state.lock, false);
+});
+
+test("initial bootstrap validates first-warehouse fields before connecting", async () => {
+  await assert.rejects(
+    createInitialAdmin({
+      dbPool: {
+        async getConnection() {
+          throw new Error("database connection should not be attempted");
+        },
+      },
+      email: "admin@sigecom.co",
+      displayName: "Administradora inicial",
+      passwordHash: "$2b$12$hash",
+      initialWarehouse: { code: "../unsafe", name: "" },
+    }),
+    /primera bodega.*válidos/i,
+  );
 });
 
 test("concurrent initial-admin bootstraps can create only one administrator", async () => {

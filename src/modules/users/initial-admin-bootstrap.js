@@ -3,6 +3,7 @@ export async function createInitialAdmin({
   email,
   displayName,
   passwordHash,
+  initialWarehouse,
   lockName = "sigecom:initial-admin:sigecom_dev",
 }) {
   const normalizedName = String(displayName || "").trim();
@@ -14,6 +15,30 @@ export async function createInitialAdmin({
   if (typeof passwordHash !== "string" || !passwordHash) {
     throw new Error(
       "La contraseña inicial debe recibirse únicamente como hash.",
+    );
+  }
+  const normalizedWarehouse = initialWarehouse
+    ? {
+        code: String(initialWarehouse.code || "")
+          .trim()
+          .toUpperCase(),
+        name: String(initialWarehouse.name || "").trim(),
+        location:
+          typeof initialWarehouse.location === "string"
+            ? initialWarehouse.location.trim() || null
+            : null,
+      }
+    : null;
+  if (
+    normalizedWarehouse &&
+    (!/^[A-Z0-9][A-Z0-9_-]{0,39}$/.test(normalizedWarehouse.code) ||
+      !normalizedWarehouse.name ||
+      normalizedWarehouse.name.length > 120 ||
+      (normalizedWarehouse.location &&
+        normalizedWarehouse.location.length > 255))
+  ) {
+    throw new Error(
+      "La primera bodega requiere un código, nombre y ubicación válidos.",
     );
   }
 
@@ -61,11 +86,34 @@ export async function createInitialAdmin({
       );
     }
 
-    const [warehouses] = await connection.execute(
-      `SELECT id FROM warehouses
-       WHERE is_active = 1 ORDER BY id FOR UPDATE`,
+    const [warehouseRows] = await connection.execute(
+      "SELECT id, is_active FROM warehouses ORDER BY id FOR UPDATE",
     );
-    if (!warehouses.length) {
+    const warehouses = warehouseRows.filter((warehouse) =>
+      Boolean(warehouse.is_active),
+    );
+    let createdWarehouse;
+    if (normalizedWarehouse) {
+      if (warehouseRows.length) {
+        throw new Error(
+          "Ya existen bodegas; no se creó una primera bodega adicional.",
+        );
+      }
+      const [result] = await connection.execute(
+        `INSERT INTO warehouses (code, name, location)
+         VALUES (?, ?, ?)`,
+        [
+          normalizedWarehouse.code,
+          normalizedWarehouse.name,
+          normalizedWarehouse.location,
+        ],
+      );
+      createdWarehouse = {
+        id: String(result.insertId),
+        ...normalizedWarehouse,
+      };
+      warehouses.push({ id: createdWarehouse.id });
+    } else if (!warehouses.length) {
       throw new Error(
         "Debe existir al menos una bodega activa antes de crear el Administrador inicial.",
       );
@@ -100,6 +148,23 @@ export async function createInitialAdmin({
         }),
       ],
     );
+    if (createdWarehouse) {
+      await connection.execute(
+        `INSERT INTO audit_events
+          (user_id, action, module, entity_type, entity_id, details)
+         VALUES (?, 'warehouses.created', 'warehouses', 'warehouse', ?, ?)`,
+        [
+          userId,
+          createdWarehouse.id,
+          JSON.stringify({
+            code: createdWarehouse.code,
+            name: createdWarehouse.name,
+            location: createdWarehouse.location,
+            source: "initial_bootstrap",
+          }),
+        ],
+      );
+    }
 
     await connection.commit();
     transactionStarted = false;

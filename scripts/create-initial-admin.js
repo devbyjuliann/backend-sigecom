@@ -57,8 +57,26 @@ function parseEmailArgument() {
 
 const prompt = createInterface({ input: stdin, output: stdout });
 let pool;
+const productionBootstrap = process.argv.includes("--production");
 
 try {
+  if (productionBootstrap && process.env.NODE_ENV !== "production") {
+    throw new Error("--production requiere NODE_ENV=production.");
+  }
+  if (!productionBootstrap && process.env.NODE_ENV === "production") {
+    throw new Error(
+      "El entorno production requiere la opción explícita --production.",
+    );
+  }
+  if (productionBootstrap) {
+    const confirmation = await prompt.question(
+      "Escribe PRODUCCION para confirmar el alta inicial en Railway: ",
+    );
+    if (confirmation.trim() !== "PRODUCCION") {
+      throw new Error("Alta de producción cancelada.");
+    }
+  }
+
   const emailInput =
     parseEmailArgument() ||
     (await prompt.question("Correo del administrador: "));
@@ -68,6 +86,14 @@ try {
   ).trim();
   if (!displayName || displayName.length > 120) {
     throw new Error("El nombre debe tener entre 1 y 120 caracteres.");
+  }
+  let initialWarehouse;
+  if (productionBootstrap) {
+    initialWarehouse = {
+      code: await prompt.question("Código de la primera bodega: "),
+      name: await prompt.question("Nombre de la primera bodega: "),
+      location: await prompt.question("Ubicación (opcional): "),
+    };
   }
   prompt.close();
 
@@ -80,15 +106,25 @@ try {
   validateTemporaryPassword(temporaryPassword, confirmation);
   const passwordHash = await hashTemporaryPassword(temporaryPassword);
 
-  pool = createDatabasePool("development");
+  const databaseTarget = productionBootstrap ? "production" : "development";
+  pool = createDatabasePool(databaseTarget);
   const created = await createInitialAdmin({
     dbPool: pool,
     email,
     displayName,
     passwordHash,
+    ...(productionBootstrap
+      ? {
+          initialWarehouse,
+          lockName: `sigecom:initial-admin:${process.env.SIGECOM_PROD_DATABASE}`,
+        }
+      : {}),
   });
+  const warehouseMessage = productionBootstrap
+    ? ` La primera bodega ${initialWarehouse.code.trim().toUpperCase()} fue creada.`
+    : "";
   console.log(
-    `Administrador ${created.email} creado con acceso a ${created.warehouseIds.length} bodega(s) activa(s). La contraseña inicial no se mostró ni se guardó en texto plano; el cambio será obligatorio en el primer acceso.`,
+    `Administrador ${created.email} creado con acceso a ${created.warehouseIds.length} bodega(s) activa(s).${warehouseMessage} La contraseña inicial no se mostró ni se guardó en texto plano; el cambio será obligatorio en el primer acceso.`,
   );
 } catch (error) {
   prompt.close();

@@ -19,6 +19,7 @@
     "db:grant:migrator:test": "node --env-file=.env scripts/grant-migrator.js test",
     "db:grant:migrator:dev": "node --env-file=.env scripts/grant-migrator.js development",
     "db:admin:create": "node --env-file=.env scripts/create-initial-admin.js",
+    "db:admin:create:production": "node scripts/create-initial-admin.js --production",
     "db:verify-h2c7-residues": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-h2-7-2c.ps1 -VerifyOnly",
     "db:credential:provision-h2-7-2c": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/provision-h2-runner-credential.ps1",
     "test:integration:h2-7-2c": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/run-h2-7-2c.ps1",
