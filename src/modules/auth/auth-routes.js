@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { createHash } from "node:crypto";
-import { ipKeyGenerator, rateLimit } from "express-rate-limit";
+import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
 import { createAuthService } from "./auth-service.js";
 import { createCsrfToken, readCookie, setCsrfCookie } from "./csrf.js";
@@ -85,15 +85,19 @@ export function createAuthRouter({
       },
     });
   };
-  const loginOriginLimiter = rateLimit({
+  // Each process owns an aggregate ceiling; no request-supplied IP is trusted.
+  const loginGlobalLimiter = rateLimit({
     windowMs: authConfig.loginWindowMs,
-    limit: authConfig.loginAttemptLimit,
+    limit: authConfig.loginGlobalAttemptLimit,
     skipSuccessfulRequests: true,
+    requestWasSuccessful: (_request, response) =>
+      response.statusCode < 400 || response.statusCode === 429,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: () => "sigecom-login-global",
     handler: loginRateLimitResponse,
   });
-  const loginAccountOriginLimiter = rateLimit({
+  const loginAccountLimiter = rateLimit({
     windowMs: authConfig.loginWindowMs,
     limit: authConfig.loginAccountAttemptLimit,
     skipSuccessfulRequests: true,
@@ -105,20 +109,23 @@ export function createAuthRouter({
           ? request.body.email.trim().toLowerCase().slice(0, 254)
           : "<missing-account>";
       const accountHash = createHash("sha256").update(account).digest("hex");
-      return `${ipKeyGenerator(request.ip)}:${accountHash}`;
+      return accountHash;
     },
     handler: loginRateLimitResponse,
   });
-  const recoveryIpLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 20,
+  const recoveryGlobalLimiter = rateLimit({
+    windowMs: authConfig.passwordRecoveryWindowMs,
+    limit: authConfig.passwordRecoveryGlobalAttemptLimit,
+    skipSuccessfulRequests: true,
+    requestWasSuccessful: (_request, response) => response.statusCode === 429,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: () => "sigecom-password-recovery-global",
     handler: recoveryRateLimitResponse,
   });
   const recoveryAccountLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000,
-    limit: 3,
+    windowMs: authConfig.passwordRecoveryAccountWindowMs,
+    limit: authConfig.passwordRecoveryAccountAttemptLimit,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (request) => {
@@ -130,11 +137,29 @@ export function createAuthRouter({
     },
     handler: recoveryRateLimitResponse,
   });
-  const recoveryCompletionIpLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    limit: 10,
+  const recoveryCompletionGlobalLimiter = rateLimit({
+    windowMs: authConfig.passwordRecoveryCompletionWindowMs,
+    limit: authConfig.passwordRecoveryCompletionGlobalAttemptLimit,
+    skipSuccessfulRequests: true,
+    requestWasSuccessful: (_request, response) => response.statusCode === 429,
     standardHeaders: true,
     legacyHeaders: false,
+    keyGenerator: () => "sigecom-password-recovery-completion-global",
+    handler: recoveryRateLimitResponse,
+  });
+  const recoveryCompletionTokenLimiter = rateLimit({
+    windowMs: authConfig.passwordRecoveryCompletionWindowMs,
+    limit: authConfig.passwordRecoveryCompletionTokenAttemptLimit,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (request) => {
+      const token =
+        typeof request.body?.token === "string" &&
+        /^[A-Za-z0-9_-]{43}$/.test(request.body.token)
+          ? request.body.token
+          : "<invalid-token>";
+      return createHash("sha256").update(token).digest("hex");
+    },
     handler: recoveryRateLimitResponse,
   });
 
@@ -147,8 +172,8 @@ export function createAuthRouter({
 
   router.post(
     "/login",
-    loginOriginLimiter,
-    loginAccountOriginLimiter,
+    loginGlobalLimiter,
+    loginAccountLimiter,
     async (request, response) => {
       const parsed = loginSchema.safeParse(request.body);
       if (!parsed.success) {
@@ -174,7 +199,7 @@ export function createAuthRouter({
 
   router.post(
     "/password-recovery",
-    recoveryIpLimiter,
+    recoveryGlobalLimiter,
     recoveryAccountLimiter,
     (request, response) => {
       const parsed = recoveryEmailSchema.safeParse(request.body);
@@ -206,7 +231,8 @@ export function createAuthRouter({
 
   router.post(
     "/password-recovery/complete",
-    recoveryCompletionIpLimiter,
+    recoveryCompletionGlobalLimiter,
+    recoveryCompletionTokenLimiter,
     async (request, response) => {
       const parsed = passwordRecoveryCompletionSchema.safeParse(request.body);
       if (!parsed.success) {
@@ -243,7 +269,8 @@ export function createAuthRouter({
 
   router.post(
     "/invitations/complete",
-    recoveryCompletionIpLimiter,
+    recoveryCompletionGlobalLimiter,
+    recoveryCompletionTokenLimiter,
     async (request, response) => {
       const parsed = passwordRecoveryCompletionSchema.safeParse(request.body);
       if (!parsed.success) {
@@ -280,7 +307,8 @@ export function createAuthRouter({
 
   router.post(
     "/admin-password-reset/complete",
-    recoveryCompletionIpLimiter,
+    recoveryCompletionGlobalLimiter,
+    recoveryCompletionTokenLimiter,
     async (request, response) => {
       const parsed = passwordRecoveryCompletionSchema.safeParse(request.body);
       if (!parsed.success) {

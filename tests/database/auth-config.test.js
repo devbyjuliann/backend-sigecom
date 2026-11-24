@@ -16,9 +16,13 @@ test("builds local auth configuration with a non-secure loopback cookie", () => 
   assert.equal(config.allowedOrigins[0], "http://127.0.0.1:5173");
   assert.equal(config.publicAppOrigin, "http://127.0.0.1:5173");
   assert.equal(config.loginAccountAttemptLimit, 5);
+  assert.equal(config.loginGlobalAttemptLimit, 100);
+  assert.equal(config.passwordRecoveryGlobalAttemptLimit, 60);
+  assert.equal(config.passwordRecoveryCompletionGlobalAttemptLimit, 60);
+  assert.equal(config.passwordRecoveryCompletionTokenAttemptLimit, 10);
 });
 
-test("validates the failed-login budget per account and origin", () => {
+test("validates the failed-login budget per account", () => {
   assert.equal(
     getAuthConfig({
       ...validEnvironment,
@@ -34,6 +38,34 @@ test("validates the failed-login budget per account and origin", () => {
       }),
     /AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX/,
   );
+});
+
+test("uses the legacy login rate-limit setting as a per-account fallback", () => {
+  assert.equal(
+    getAuthConfig({
+      ...validEnvironment,
+      AUTH_RATE_LIMIT_MAX: "2",
+    }).loginAccountAttemptLimit,
+    2,
+  );
+});
+
+test("validates global and token-specific authentication rate limits", () => {
+  for (const [name, value] of [
+    ["AUTH_LOGIN_GLOBAL_RATE_LIMIT_MAX", "0"],
+    ["AUTH_PASSWORD_RECOVERY_GLOBAL_RATE_LIMIT_MAX", "10001"],
+    ["AUTH_PASSWORD_RECOVERY_COMPLETION_GLOBAL_RATE_LIMIT_MAX", "-1"],
+    ["AUTH_PASSWORD_RECOVERY_COMPLETION_TOKEN_RATE_LIMIT_MAX", "1.5"],
+  ]) {
+    assert.throws(
+      () =>
+        getAuthConfig({
+          ...validEnvironment,
+          [name]: value,
+        }),
+      new RegExp(name),
+    );
+  }
 });
 
 test("rejects missing or weak JWT secrets", () => {

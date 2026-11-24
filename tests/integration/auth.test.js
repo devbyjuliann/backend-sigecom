@@ -489,7 +489,7 @@ test("login rate limiting returns 429 after the configured failed attempts", asy
 
   for (
     let attempt = 0;
-    attempt < authConfig.loginAttemptLimit + 1;
+    attempt < authConfig.loginAccountAttemptLimit + 1;
     attempt += 1
   ) {
     const response = await submitLogin(
@@ -501,7 +501,7 @@ test("login rate limiting returns 429 after the configured failed attempts", asy
   }
 
   assert.deepEqual(statuses, [
-    ...Array(authConfig.loginAttemptLimit).fill(401),
+    ...Array(authConfig.loginAccountAttemptLimit).fill(401),
     429,
   ]);
 });
@@ -522,7 +522,7 @@ test("successful logins do not consume the failed-attempt rate-limit budget", as
   await submitLogin(limitedApp, csrf, "incorrecta-tercera").expect(429);
 });
 
-test("failed attempts are limited per account and origin without blocking another account", async () => {
+test("failed attempts are limited per account without blocking another account", async () => {
   const limitedConfig = getAuthConfig({
     JWT_SECRET: randomBytes(48).toString("base64url"),
     FRONTEND_ORIGIN: origin,

@@ -807,7 +807,7 @@ test("malformed credential requests are not cached before JSON parsing", async (
   assert.equal(response.headers["cache-control"], "no-store");
 });
 
-test("recovery requests are rate limited by address and normalized account", async () => {
+test("recovery requests are rate limited by normalized account", async () => {
   const harness = createHarness();
   const app = createApp({
     dbPool: harness.dbPool,

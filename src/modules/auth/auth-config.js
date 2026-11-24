@@ -37,6 +37,14 @@ function readOrigins(value) {
   ];
 }
 
+function readRateLimit(env, name, fallback, maximum = 10_000) {
+  const value = Number(env[name] ?? fallback);
+  if (!Number.isInteger(value) || value < 1 || value > maximum) {
+    throw new Error(`${name} debe estar entre 1 y ${maximum}.`);
+  }
+  return value;
+}
+
 function readPublicAppOrigin(value, allowedOrigins, production) {
   const candidate =
     typeof value === "string" && value.trim()
@@ -112,17 +120,17 @@ export function getAuthConfig(env = process.env) {
     throw new Error("JWT_TTL_SECONDS debe estar entre 60 y 28800.");
   }
 
-  const loginAttemptLimit = Number(env.AUTH_RATE_LIMIT_MAX || 5);
+  const legacyLoginAttemptLimit = Number(env.AUTH_RATE_LIMIT_MAX || 5);
   if (
-    !Number.isInteger(loginAttemptLimit) ||
-    loginAttemptLimit < 1 ||
-    loginAttemptLimit > 20
+    !Number.isInteger(legacyLoginAttemptLimit) ||
+    legacyLoginAttemptLimit < 1 ||
+    legacyLoginAttemptLimit > 20
   ) {
     throw new Error("AUTH_RATE_LIMIT_MAX debe estar entre 1 y 20.");
   }
 
   const loginAccountAttemptLimit = Number(
-    env.AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX || 5,
+    env.AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX || legacyLoginAttemptLimit,
   );
   if (
     !Number.isInteger(loginAccountAttemptLimit) ||
@@ -133,6 +141,27 @@ export function getAuthConfig(env = process.env) {
       "AUTH_LOGIN_ACCOUNT_RATE_LIMIT_MAX debe estar entre 1 y 20.",
     );
   }
+
+  const loginGlobalAttemptLimit = readRateLimit(
+    env,
+    "AUTH_LOGIN_GLOBAL_RATE_LIMIT_MAX",
+    100,
+  );
+  const passwordRecoveryGlobalAttemptLimit = readRateLimit(
+    env,
+    "AUTH_PASSWORD_RECOVERY_GLOBAL_RATE_LIMIT_MAX",
+    60,
+  );
+  const passwordRecoveryCompletionGlobalAttemptLimit = readRateLimit(
+    env,
+    "AUTH_PASSWORD_RECOVERY_COMPLETION_GLOBAL_RATE_LIMIT_MAX",
+    60,
+  );
+  const passwordRecoveryCompletionTokenAttemptLimit = readRateLimit(
+    env,
+    "AUTH_PASSWORD_RECOVERY_COMPLETION_TOKEN_RATE_LIMIT_MAX",
+    10,
+  );
 
   const allowedOrigins = readOrigins(env.FRONTEND_ORIGIN);
   if (
@@ -161,8 +190,15 @@ export function getAuthConfig(env = process.env) {
     cookiePath: "/api/v1",
     allowedOrigins,
     publicAppOrigin,
-    loginAttemptLimit,
     loginAccountAttemptLimit,
+    loginGlobalAttemptLimit,
     loginWindowMs: 15 * 60 * 1000,
+    passwordRecoveryGlobalAttemptLimit,
+    passwordRecoveryWindowMs: 15 * 60 * 1000,
+    passwordRecoveryAccountAttemptLimit: 3,
+    passwordRecoveryAccountWindowMs: 60 * 60 * 1000,
+    passwordRecoveryCompletionGlobalAttemptLimit,
+    passwordRecoveryCompletionTokenAttemptLimit,
+    passwordRecoveryCompletionWindowMs: 15 * 60 * 1000,
   };
 }
