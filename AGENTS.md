@@ -10,5 +10,6 @@
 
 ## Estado de publicación
 
-- El servicio backend y MariaDB existentes se conservaron sin cambios ni despliegues.
-- La versión `v1.0.0` no se ha publicado; su etiqueta y Release quedan pendientes de verificar el inicio de sesión exitoso del frontend con una cuenta de prueba autorizada.
+- El despliegue backend `c12dbba9-7222-4588-801e-8a7a64e9d22d` permanece en estado `SUCCESS`; su revisión fuente era `f6a47a212c11b70013999b3dd5a08c9eb60031cc`. Railway no incluye el SHA en los metadatos del despliegue CLI.
+- El flujo productivo de CSRF, login, sesión y Dashboard se verificó correctamente. No se modificaron el backend ni MariaDB durante este cierre.
+- La etiqueta anotada `v1.0.0` apunta a `99cfa42ec7ccc370ed04f86115eef8d8b27d28f4`. Release: https://github.com/devbyjuliann/backend-sigecom/releases/tag/v1.0.0
